@@ -1,0 +1,19 @@
+# Python cache and local notebooks
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Local virtual environment
+.venv/
+.vscode/
+.claude/
+.env
+
+# Local data and benchmark artifacts
+datasets/
+input/
+output/
+logs/
+
+# Local notes
+meeting-minutes/
