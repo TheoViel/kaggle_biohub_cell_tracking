@@ -20,13 +20,9 @@ def sigmoid(x):
     return 1.0 / (1.0 + np.exp(-x))
 
 
-def load_model(checkpoint_path, device='cuda', features=(32, 64, 128, 256, 256)):
-    model = CellSegNet(features=features)
+def load_model(checkpoint_path, in_channels=1, device='cuda', features=(32, 64, 128, 256, 256)):
+    model = CellSegNet(features=features, in_channels=in_channels)
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    # Support checkpoints that store args
-    if 'args' in ckpt and 'features' in ckpt['args']:
-        features = tuple(int(x) for x in ckpt['args']['features'].split(','))
-        model = CellSegNet(features=features)
     model.load_state_dict(ckpt['model_state_dict'])
     return model.to(device).eval()
 
@@ -42,7 +38,7 @@ def _pad_to_multiple(x, multiple=16):
 
 
 @torch.no_grad()
-def predict_volume(model, img_array, device='cuda'):
+def predict_volume(model, data, use_cellpose=False, device='cuda'):
     """
     Run inference on a single 3D image array.
 
@@ -52,11 +48,19 @@ def predict_volume(model, img_array, device='cuda'):
 
     Returns dict with keys: fg_logits, heatmap_logits, offsets — all numpy (D, H, W) / (3, D, H, W).
     """
-    img = img_array.astype(np.float32)
+    img = data['img'].astype(np.float32)
     if img.max() > 1.0:
         img /= 65535.0
 
-    x = torch.from_numpy(img[None, None]).to(device)   # (1, 1, D, H, W)
+    if use_cellpose:
+        flows = data['flows']
+        probas = data['probas']
+        # img = np.stack([img, probas], axis=0)
+        img = probas[None]
+    else:
+        img = img[None]
+
+    x = torch.from_numpy(img[None]).to(device)   # (1, c, D, H, W)
     x_padded, orig_shape = _pad_to_multiple(x)
 
     with torch.amp.autocast('cuda'):

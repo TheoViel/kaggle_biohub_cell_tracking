@@ -3,8 +3,151 @@ from scipy.spatial import cKDTree
 
 import numpy as np
 
+import numpy as np
+from scipy import ndimage as ndi
+
 
 def compute_all_targets(
+    masks: np.ndarray,
+    sigma: float = 3.0,
+    truncate: float = 4.0,
+):
+    """
+    Fast target generation from a 3D instance-label volume.
+
+    masks:
+        (D, H, W), integer labels, 0 = background.
+
+    Returns
+    -------
+    heatmap:
+        (D, H, W) float32
+
+    offsets:
+        (3, D, H, W) float32 [dz, dy, dx]
+
+    centroid_map:
+        dict[label] -> (cz, cy, cx)
+
+    Notes
+    -----
+    Heatmap centers are placed at the nearest integer voxel to each
+    floating-point centroid. Offsets use the exact floating-point centroids.
+    """
+    masks = np.asarray(masks)
+
+    if masks.ndim != 3:
+        raise ValueError(f"Expected 3D masks, got {masks.shape}")
+
+    if not np.issubdtype(masks.dtype, np.integer):
+        raise TypeError("masks must contain integer labels")
+
+    if sigma <= 0:
+        raise ValueError("sigma must be > 0")
+
+    D, H, W = masks.shape
+
+    # ------------------------------------------------------------
+    # 1. Compute ALL instance centroids in essentially one pass.
+    # ------------------------------------------------------------
+
+    labels = np.unique(masks)
+    labels = labels[labels != 0]
+
+    if len(labels) == 0:
+        return (
+            np.zeros((D, H, W), dtype=np.float32),
+            np.zeros((3, D, H, W), dtype=np.float32),
+            {},
+        )
+
+    # center_of_mass returns z,y,x for every requested label.
+    centroids = np.asarray(
+        ndi.center_of_mass(
+            np.ones(masks.shape, dtype=np.uint8),
+            labels=masks,
+            index=labels,
+        ),
+        dtype=np.float32,
+    )
+
+    centroid_map = {
+        int(label): tuple(map(float, centroid))
+        for label, centroid in zip(labels, centroids)
+    }
+
+    # ------------------------------------------------------------
+    # 2. Create lookup table:
+    #
+    # centroid_z[label] -> z centroid of that instance
+    # ------------------------------------------------------------
+
+    max_label = int(labels.max())
+
+    cz_lookup = np.zeros(max_label + 1, dtype=np.float32)
+    cy_lookup = np.zeros(max_label + 1, dtype=np.float32)
+    cx_lookup = np.zeros(max_label + 1, dtype=np.float32)
+
+    cz_lookup[labels] = centroids[:, 0]
+    cy_lookup[labels] = centroids[:, 1]
+    cx_lookup[labels] = centroids[:, 2]
+
+    # ------------------------------------------------------------
+    # 3. Vectorized offsets.
+    #
+    # No loop over cells.
+    # ------------------------------------------------------------
+
+    fg = masks != 0
+
+    offsets = np.zeros((3, D, H, W), dtype=np.float32)
+
+    # np.ogrid avoids allocating full coordinate grids.
+    zz, yy, xx = np.ogrid[:D, :H, :W]
+
+    offsets[0] = cz_lookup[masks] - zz
+    offsets[1] = cy_lookup[masks] - yy
+    offsets[2] = cx_lookup[masks] - xx
+
+    # Background offsets should be exactly zero.
+    offsets[:, ~fg] = 0
+
+    # ------------------------------------------------------------
+    # 4. Heatmap.
+    #
+    # max Gaussian over centers == Gaussian of distance to nearest center.
+    # ------------------------------------------------------------
+
+    center_mask = np.zeros((D, H, W), dtype=bool)
+
+    centers_int = np.rint(centroids).astype(np.int32)
+
+    centers_int[:, 0] = np.clip(centers_int[:, 0], 0, D - 1)
+    centers_int[:, 1] = np.clip(centers_int[:, 1], 0, H - 1)
+    centers_int[:, 2] = np.clip(centers_int[:, 2], 0, W - 1)
+
+    center_mask[
+        centers_int[:, 0],
+        centers_int[:, 1],
+        centers_int[:, 2],
+    ] = True
+
+    # EDT computes distance to nearest zero, hence invert center_mask.
+    distance = ndi.distance_transform_edt(~center_mask)
+
+    radius = truncate * sigma
+
+    heatmap = np.exp(
+        -(distance * distance) / (2.0 * sigma * sigma)
+    ).astype(np.float32)
+
+    # Match your original truncated Gaussian support.
+    heatmap[distance > radius] = 0.0
+
+    return heatmap, offsets, centroid_map
+
+
+def compute_all_targets_old(
     masks: np.ndarray,
     sigma: float = 3.0,
     truncate: float = 4.0,

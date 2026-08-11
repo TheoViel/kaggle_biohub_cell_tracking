@@ -1,7 +1,11 @@
-import numpy as np
+import os
 import torch
-from torch.utils.data import Dataset
+import numpy as np
+
+from tqdm import tqdm
 from pathlib import Path
+from torch.utils.data import Dataset
+from joblib import Parallel, delayed
 
 from .targets import compute_all_targets
 
@@ -23,7 +27,9 @@ class CellSegDataset(Dataset):
     """
 
     def __init__(self, data_dir, sigma=3.0, augment=True, patch_size=None, use_cellpose=False):
-        self.files = sorted(Path(data_dir).glob('*.npz'))
+        self.files = [
+            str(file) for file in sorted(Path(data_dir).glob('*.npz')) if "targets" not in str(file)
+        ]
         if not self.files:
             raise FileNotFoundError(f"No *.npz files found in {data_dir}")
         self.sigma = sigma
@@ -34,28 +40,65 @@ class CellSegDataset(Dataset):
     def __len__(self):
         return len(self.files)
 
+    def precompute_targets(self):
+        self.targets = {}
+        def _compute_target_for_file(path, sigma):
+            if os.path.exists(path[:-4] + "_targets.npz"):
+                return
+            heatmap, offsets, centroid_map = compute_all_targets(
+                np.load(path)["masks"], sigma=sigma
+            )
+            np.savez_compressed(
+                path[:-4] + "_targets.npz",
+                heatmap=np.array(heatmap),
+                offsets=np.array(offsets),
+                centroid_map_keys=np.array(list(centroid_map.keys())),
+                centroid_map_values=np.array(list(centroid_map.values())),
+            )
+            return
+
+        Parallel(n_jobs=8, backend="loky")(
+            delayed(_compute_target_for_file)(file, self.sigma)
+            for file in tqdm(self.files)
+        )
+
     def __getitem__(self, idx):
         data = np.load(self.files[idx])
 
         img = data['img'].astype(np.float32) / 65535.0
         masks = data['masks']
-        
+
+        sigmoid = lambda x: 1.0 / (1.0 + np.exp(-x))
         if self.use_cellpose:
-            probas = data['probas']
-            flows = data['flows'].transpose(3, 0, 1, 2)
-            flows = (flows / 255).astype(np.float32)
+            probas = sigmoid(data['probas'])
+            # flows = data['flows'].transpose(3, 0, 1, 2)
+            # flows = (flows / 255).astype(np.float32)
 
-        fg_target = (masks > 0).astype(np.float32)
-
-        heatmap, offsets, _ = compute_all_targets(
-            masks, sigma=self.sigma,
-        )
-        fg_mask = (masks > 0)
-
-        if self.use_cellpose:
-            img = np.stack([img, probas], axis=0)
+            # img = np.stack([img, probas], axis=0)
+            img = probas[None]  # cellpose probas
+            fg_mask = (probas > 0.4)
         else:
             img = img[None]
+            fg_mask = (masks > 0)
+
+        fg_target = fg_mask.astype(np.float32)
+
+        try:
+            targets = np.load(self.files[idx][:-4] + "_targets.npz")
+            heatmap = targets["heatmap"]
+            offsets = targets["offsets"]
+            # centroid_map = {k: v for k, v in zip(targets["centroid_map_keys"], targets["centroid_map_values"])}
+        except FileNotFoundError:
+            heatmap, offsets, centroid_map = compute_all_targets(
+                masks, sigma=self.sigma,
+            )
+            np.savez_compressed(
+                self.files[idx][:-4] + "_targets.npz",
+                heatmap=np.array(heatmap),
+                offsets=np.array(offsets),
+                centroid_map_keys=np.array(list(centroid_map.keys())),
+                centroid_map_values=np.array(list(centroid_map.values())),
+            )
 
         if self.patch_size is not None:
             img, fg_target, heatmap, offsets, fg_mask = self._random_crop(
