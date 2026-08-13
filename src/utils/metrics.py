@@ -39,16 +39,9 @@ def match_frame_nodes(
     """
     pred_graph = _build_frame_graph(seeds.astype(float), t)
     gt_graph = _build_frame_graph(truth, t)
+
     if pred_graph.num_nodes() == 0 or gt_graph.num_nodes() == 0:
-        return pl.DataFrame(
-            schema={
-                "pred_idx": pl.Int64,
-                "gt_z": pl.Float64,
-                "gt_y": pl.Float64,
-                "gt_x": pl.Float64,
-                "distance": pl.Float64,
-            }
-        )
+        return [], [], truth
 
     # print(pred_graph.num_nodes(), gt_graph.num_nodes())
 
@@ -106,15 +99,7 @@ def match_frame_nodes(
 
     scale_arr = np.asarray(scale, dtype=float)
     if len(matched) == 0:
-        return pl.DataFrame(
-            schema={
-                "pred_idx": pl.Int64,
-                "gt_z": pl.Float64,
-                "gt_y": pl.Float64,
-                "gt_x": pl.Float64,
-                "distance": pl.Float64,
-            }
-        )
+        return [], [], truth
 
     pred_xyz = matched.select(["z", "y", "x"]).to_numpy() * scale_arr
     gt_xyz = matched.select(["gt_z", "gt_y", "gt_x"]).to_numpy() * scale_arr

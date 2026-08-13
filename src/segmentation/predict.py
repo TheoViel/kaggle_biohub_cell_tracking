@@ -1,5 +1,5 @@
 """
-Inference + post-processing for CellSegNet.
+Inference + post-processing for the 3D cell segmentation model.
 
 Post-processing pipeline:
 1. Threshold sigmoid(fg_logits) → foreground binary mask
@@ -12,17 +12,33 @@ import torch
 from pathlib import Path
 from scipy.ndimage import gaussian_filter, maximum_filter, label as scipy_label
 
-from .model import CellSegNet
-from .post_process import postprocess
+from segmentation.post_process import postprocess
+from model_zoo.models_seg import CELL_SEG_HEADS, define_model
 
 
 def sigmoid(x):
     return 1.0 / (1.0 + np.exp(-x))
 
 
-def load_model(checkpoint_path, in_channels=1, device='cuda', features=(32, 64, 128, 256, 256)):
-    model = CellSegNet(features=features, in_channels=in_channels)
+def load_model(
+    checkpoint_path,
+    in_channels=1,
+    device='cuda',
+    decoder_name='Unet',
+    encoder_name='resnet18',
+):
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+    # Checkpoints written by train.py carry the architecture they were built with
+    config = ckpt.get('model_config', {})
+    model = define_model(
+        decoder_name=config.get('decoder_name', decoder_name),
+        encoder_name=config.get('encoder_name', encoder_name),
+        n_channels=config.get('in_channels', in_channels),
+        pretrained=False,
+        heads=CELL_SEG_HEADS,
+        use_3d=True,
+    )
     model.load_state_dict(ckpt['model_state_dict'])
     return model.to(device).eval()
 
@@ -54,11 +70,13 @@ def predict_volume(model, data, use_cellpose=False, device='cuda'):
 
     if use_cellpose:
         flows = data['flows']
-        probas = data['probas']
+        probas = sigmoid(data['probas'])
         # img = np.stack([img, probas], axis=0)
         img = probas[None]
     else:
         img = img[None]
+
+    print(img.min(), img.max())
 
     x = torch.from_numpy(img[None]).to(device)   # (1, c, D, H, W)
     x_padded, orig_shape = _pad_to_multiple(x)

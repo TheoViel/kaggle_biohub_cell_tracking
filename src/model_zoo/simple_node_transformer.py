@@ -53,10 +53,24 @@ class CrossAttentionBlock(nn.Module):
             True = real position, False = padding (will be ignored).
         """
         key_padding_mask = ~kv_mask if kv_mask is not None else None
+        empty_rows = None
+        if key_padding_mask is not None:
+            # A sample with zero real kv positions has an all-True padding
+            # mask; MultiheadAttention softmaxes over an all -inf row for
+            # such rows and returns NaN. Temporarily unmask one dummy
+            # position for those rows so the softmax stays finite, then
+            # zero their output below (they're unused downstream anyway,
+            # since detect_and_match already produced 0 detections there).
+            empty_rows = key_padding_mask.all(dim=1)
+            if empty_rows.any():
+                key_padding_mask = key_padding_mask.clone()
+                key_padding_mask[empty_rows, 0] = False
         attn_out, _ = self.cross_attn(
             self.norm1(q), self.norm1(kv), self.norm1(kv),
             key_padding_mask=key_padding_mask,
         )
+        if empty_rows is not None and empty_rows.any():
+            attn_out = attn_out * (~empty_rows).view(-1, 1, 1)
         q = q + attn_out
         q = q + self.mlp(self.norm2(q))
         return q

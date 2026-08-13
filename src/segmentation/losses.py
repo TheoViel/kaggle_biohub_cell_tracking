@@ -32,7 +32,7 @@ def focal_loss(pred_logits, target, alpha=0.25, gamma=2.0):
 
 class CellSegLoss(nn.Module):
     """
-    Three-term loss matching the output heads of CellSegNet:
+    Three-term loss matching the output heads of the segmentation model:
 
         L = λ_fg     · (Dice + BCE)       on foreground probability
           + λ_center · FocalLoss           on cell-centre heatmap

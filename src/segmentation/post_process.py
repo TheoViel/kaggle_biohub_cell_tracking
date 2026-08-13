@@ -8,6 +8,7 @@ from scipy.spatial import cKDTree
 
 
 def sigmoid(x):
+    x = np.clip(x, -10, 10)
     return 1.0 / (1.0 + np.exp(-x))
 
 
@@ -20,6 +21,7 @@ def postprocess(
     vote_thresh_rel=0.05,
     min_support=10,
     max_vote_distance=None,
+    fg_prob=None,
 ):
     """
     Convert foreground and centroid-offset predictions into 3D instances.
@@ -83,7 +85,9 @@ def postprocess(
             f"(3, D, H, W), got {offsets.shape}"
         )
 
-    fg_prob = sigmoid(fg_logits)
+    if fg_prob is None:
+        fg_prob = sigmoid(fg_logits)
+
     fg_mask = fg_prob >= fg_thresh
 
     depth, height, width = fg_mask.shape

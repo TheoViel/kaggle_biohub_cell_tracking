@@ -55,6 +55,16 @@ def init_distributed(backend=None):
     )
 
 
+def broadcast_object(obj, device=None, src=0):
+    """Share a picklable object from rank src with every other rank."""
+    if not (dist.is_available() and dist.is_initialized()):
+        return obj
+
+    holder = [obj]
+    dist.broadcast_object_list(holder, src=src, device=device)
+    return holder[0]
+
+
 def cleanup_distributed():
     if dist.is_available() and dist.is_initialized():
         dist.barrier()

@@ -248,6 +248,8 @@ class UnetDecoder(nn.Module):
             skip_connection = skip_connections[i] if i < len(skip_connections) else None
             x = decoder_block(x, spatial_shapes[i + 1], skip_connection=skip_connection)
 
+            # print(f"block {i+1}: {x.shape}")
+
         return x
 
 

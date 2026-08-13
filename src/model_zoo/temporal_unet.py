@@ -16,6 +16,15 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _grad_ckpt
 
 
+def _to_3tuple(v) -> tuple[int, int, int]:
+    if isinstance(v, int):
+        return (v, v, v)
+    t = tuple(v)
+    if len(t) != 3:
+        raise ValueError(f"Expected a 3-element sequence, got {t}")
+    return t
+
+
 def _conv_block(in_channels: int, out_channels: int) -> nn.Sequential:
     return nn.Sequential(
         nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
@@ -30,6 +39,10 @@ def _conv_block(in_channels: int, out_channels: int) -> nn.Sequential:
 class _TemporalAttention(nn.Module):
     """Per-voxel multi-head self-attention across time."""
 
+    # Flash / mem-efficient SDPA CUDA kernels reject batch dims >= 65536
+    # (grid.z overflow). Per-voxel reshape uses batch = B * Z * Y * X.
+    _SDPA_MAX_BATCH = 65535
+
     def __init__(self, channels: int, n_heads: int = 4) -> None:
         super().__init__()
         self.norm = nn.LayerNorm(channels)
@@ -43,7 +56,16 @@ class _TemporalAttention(nn.Module):
 
         h = x.reshape(B, T, C, S).permute(0, 3, 1, 2).reshape(B * S, T, C)
         h = self.norm(h)
-        h, _ = self.attn(h, h, h, need_weights=False)
+        if h.shape[0] <= self._SDPA_MAX_BATCH:
+            h, _ = self.attn(h, h, h, need_weights=False)
+        else:
+            # Chunk spatial batch so Flash/mem-efficient SDPA can launch.
+            chunks = []
+            for i in range(0, h.shape[0], self._SDPA_MAX_BATCH):
+                chunk = h[i : i + self._SDPA_MAX_BATCH]
+                out, _ = self.attn(chunk, chunk, chunk, need_weights=False)
+                chunks.append(out)
+            h = torch.cat(chunks, dim=0)
         h = h.reshape(B, S, T, C).permute(0, 2, 3, 1).reshape(B, T, C, *spatial)
         return x + h
 
@@ -59,8 +81,8 @@ class TemporalUNet3D(nn.Module):
         Output feature channels per frame.
     layers : sequence of int
         Encoder channel widths, shallow to deep. Number of stages equals
-        ``len(layers)``; spatial size is halved before every stage except
-        the first.
+        ``len(layers)``; spatial size is divided by ``pool_stride`` before
+        every stage except the first.
     gradient_checkpointing : bool
         If True (default), wrap encoder/decoder conv blocks with
         ``torch.utils.checkpoint`` during training to reduce activation
@@ -68,10 +90,17 @@ class TemporalUNet3D(nn.Module):
         pass.
     skip_fullres_temporal : bool
         If True (default), replace the temporal-attention block at the
-        full-resolution (first) encoder stage with an Identity. Per-voxel
-        attention at full res dominates both memory and runtime; skipping
-        it gives ~3x speedup and ~30% less memory with negligible quality
-        loss in practice.
+        full-resolution (first) encoder stage with an Identity.
+    pool_stride : int or (int, int, int)
+        Stride of the encoder MaxPool and decoder Upsample at each level.
+        Use ``(1, 2, 2)`` to pool only in Y/X (keeping Z at full
+        resolution) so that full-scale 3D images can be fed while the
+        output stays at ``(Z, Y//(2**n), X//(2**n))``.
+    n_decode_steps : int or None
+        Number of decoder upsample stages to apply.  Defaults to
+        ``len(layers) - 1`` (fully symmetric U-Net).  Set to 0 to skip
+        the decoder entirely — the head then operates on the bottleneck
+        features, producing output at the encoder's lowest resolution.
     """
 
     def __init__(
@@ -79,8 +108,11 @@ class TemporalUNet3D(nn.Module):
         in_channels: int = 1,
         out_channels: int = 32,
         layers: Sequence[int] = (32, 64, 128),
-        gradient_checkpointing: bool = True,
+        gradient_checkpointing: bool = False,
         skip_fullres_temporal: bool = True,
+        pool_stride: int | tuple[int, int, int] = 2,
+        n_decode_steps: int | None = None,
+        verbose: int = 0,
     ) -> None:
         super().__init__()
         layers = list(layers)
@@ -88,6 +120,16 @@ class TemporalUNet3D(nn.Module):
             raise ValueError("layers must contain at least two stages")
 
         self.gradient_checkpointing = gradient_checkpointing
+
+        pool_stride_t = _to_3tuple(pool_stride)
+        # scale_factor for Upsample must be a float or sequence of floats
+        up_scale = tuple(float(s) for s in pool_stride_t)
+
+        n_full_decode = len(layers) - 1
+
+        if n_decode_steps is None:
+            n_decode_steps = n_full_decode
+        n_decode_steps = max(0, min(n_decode_steps, n_full_decode))
 
         self.encoder_blocks = nn.ModuleList()
         self.temporal_blocks = nn.ModuleList()
@@ -99,17 +141,20 @@ class TemporalUNet3D(nn.Module):
             else:
                 self.temporal_blocks.append(_TemporalAttention(ch))
             prev = ch
-        self.pool = nn.MaxPool3d(kernel_size=2, stride=2)
+        self.pool = nn.MaxPool3d(kernel_size=pool_stride_t, stride=pool_stride_t)
 
         self.upsamples = nn.ModuleList()
         self.decoder_blocks = nn.ModuleList()
-        for i in range(len(layers) - 1, 0, -1):
+        for i in range(n_full_decode, n_full_decode - n_decode_steps, -1):
             self.upsamples.append(
-                nn.Upsample(scale_factor=2, mode="trilinear", align_corners=False)
+                nn.Upsample(scale_factor=up_scale, mode="trilinear", align_corners=False)
             )
             self.decoder_blocks.append(_conv_block(layers[i] + layers[i - 1], layers[i - 1]))
 
-        self.head = nn.Conv3d(layers[0], out_channels, kernel_size=1)
+        # Head input channels: bottleneck level when n_decode_steps == 0
+        head_in = layers[n_full_decode - n_decode_steps]
+        self.head = nn.Conv3d(head_in, out_channels, kernel_size=1)
+        self.verbose = verbose
 
     def _run(self, block: nn.Module, x: torch.Tensor) -> torch.Tensor:
         if self.gradient_checkpointing and self.training:
@@ -123,15 +168,27 @@ class TemporalUNet3D(nn.Module):
 
         skips: list[torch.Tensor] = []
         for i, (block, temporal) in enumerate(zip(self.encoder_blocks, self.temporal_blocks)):
+
+            if self.verbose >= 1:
+                print(f"TemporalUNet3D - Encoder Block {i} - Input shape: {x.shape}")
+
             if i > 0:
                 x = self.pool(x)
+
             x = self._run(block, x)
             x = temporal(x.reshape(B, T, *x.shape[1:])).reshape(B * T, *x.shape[1:])
             if i < len(self.encoder_blocks) - 1:
                 skips.append(x)
 
-        for up, block, skip in zip(self.upsamples, self.decoder_blocks, skips[::-1]):
+        if self.verbose >= 1:
+            print(f"TemporalUNet3D - Encoder output shape: {x.shape}")
+
+        for i, (up, block, skip) in enumerate(zip(self.upsamples, self.decoder_blocks, skips[::-1])):
             x = up(x)
+
+            if self.verbose >= 1:
+                print(f"TemporalUNet3D - Decoder Block {i} upsampled shape: {x.shape} - skip shape: {skip.shape if skip is not None else None}")
+
             if x.shape[2:] != skip.shape[2:]:
                 x = F.interpolate(x, size=skip.shape[2:], mode="trilinear", align_corners=False)
             x = torch.cat([x, skip], dim=1)

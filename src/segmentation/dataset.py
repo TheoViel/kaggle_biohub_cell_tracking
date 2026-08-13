@@ -8,6 +8,7 @@ from torch.utils.data import Dataset
 from joblib import Parallel, delayed
 
 from .targets import compute_all_targets
+from data.transforms import augment_seg, random_crop_seg
 
 
 class CellSegDataset(Dataset):
@@ -101,12 +102,12 @@ class CellSegDataset(Dataset):
             )
 
         if self.patch_size is not None:
-            img, fg_target, heatmap, offsets, fg_mask = self._random_crop(
-                img, fg_target, heatmap, offsets, fg_mask
+            img, fg_target, heatmap, offsets, fg_mask = random_crop_seg(
+                img, fg_target, heatmap, offsets, fg_mask, self.patch_size
             )
 
         if self.augment:
-            img, fg_target, heatmap, offsets, fg_mask = self._augment(
+            img, fg_target, heatmap, offsets, fg_mask = augment_seg(
                 img, fg_target, heatmap, offsets, fg_mask
             )
 
@@ -117,35 +118,3 @@ class CellSegDataset(Dataset):
             'offsets': torch.from_numpy(offsets),           # (3, D, H, W)
             'fg_mask': torch.from_numpy(fg_mask),           # (D, H, W) bool
         }
-
-    def _random_crop(self, img, fg, heatmap, offsets, fg_mask):
-        D, H, W = img.shape[-3:]
-        pd, ph, pw = self.patch_size
-        z0 = np.random.randint(0, max(1, D - pd))
-        y0 = np.random.randint(0, max(1, H - ph))
-        x0 = np.random.randint(0, max(1, W - pw))
-        s = np.s_[z0:z0+pd, y0:y0+ph, x0:x0+pw]
-        return (
-            img[(slice(None),) + s], fg[s], heatmap[s],
-            offsets[:, z0:z0+pd, y0:y0+ph, x0:x0+pw],
-            fg_mask[s],
-        )
-
-    def _augment(self, img, fg, heatmap, offsets, fg_mask):
-        # Random flips along each spatial axis
-        for axis in range(3):
-            if np.random.random() > 0.5:
-                img = np.flip(img, axis=axis + 1).copy()
-                fg = np.flip(fg, axis=axis).copy()
-                heatmap = np.flip(heatmap, axis=axis).copy()
-                offsets = np.flip(offsets, axis=axis + 1).copy()
-                fg_mask = np.flip(fg_mask, axis=axis).copy()
-                # Flipping spatial axis flips that offset component's sign
-                offsets[axis] = -offsets[axis]
-
-        # Intensity jitter: multiplicative scale + additive shift
-        scale = 1.0 + 0.15 * np.random.randn()
-        shift = 0.05 * np.random.randn()
-        img = np.clip(img * scale + shift, 0.0, 1.0)
-
-        return img, fg, heatmap, offsets, fg_mask

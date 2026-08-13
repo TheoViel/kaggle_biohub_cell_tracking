@@ -3,12 +3,15 @@ import torch
 import torch.nn as nn
 import segmentation_models_pytorch
 
-from timm.models.layers import Conv2dSame
-from model_zoo.conv3d_same import Conv3dSame
+from timm.layers import Conv2dSame
+# from model_zoo.conv3d_same import Conv3dSame
 from model_zoo.unet import Unet
 
 
 DECODERS = {"Unet": Unet}
+
+# Output layout of the 3D cell segmentation pipeline, as name -> channel count.
+CELL_SEG_HEADS = {"fg_logits": 1, "heatmap_logits": 1, "offsets": 3}
 
 
 def define_model(
@@ -23,6 +26,7 @@ def define_model(
     n_channels=3,
     pretrained_weights=None,
     use_3d=False,
+    heads=None,
     verbose=0,
 ):
     """
@@ -40,6 +44,9 @@ def define_model(
         n_channels (int, optional): Number of input channels. Default is 3.
         pretrained_weights (str, optional): Path to pretrained model weights. Default is None.
         use_3d (bool, optional): Flag to use a 3D model. Default is False.
+        heads (dict, optional): name -> channel count. When given, the model returns a
+            dict of logits split along the channel axis instead of (masks, labels),
+            and num_classes is set to the total. Default is None.
         verbose (int, optional): Verbosity level. Default is 0.
 
     Returns:
@@ -49,6 +56,9 @@ def define_model(
         AssertionError: If the decoder name is not supported.
     """
     assert decoder_name in DECODERS, "Decoder name not supported"
+
+    if heads is not None:
+        num_classes = sum(heads.values())
 
     decoder = DECODERS[decoder_name]
     model = decoder(
@@ -63,7 +73,7 @@ def define_model(
     model.decoder_channels = (256, 128, 64, 32, 16)
     model.num_classes = num_classes
 
-    model = SegWrapper(model)
+    model = SegWrapper(model, heads=heads)
 
     if increase_stride:
         model.increase_stride()
@@ -87,20 +97,24 @@ class SegWrapper(nn.Module):
     Attributes:
         model (nn.Module): The underlying segmentation model.
         num_classes (int): The number of classes in the model.
+        heads (dict): Optional name -> channel count used to split the output.
     """
 
-    def __init__(self, model):
+    def __init__(self, model, heads=None):
         """
         Constructor.
 
         Args:
             model (nn.Module): The underlying segmentation model.
+            heads (dict, optional): name -> channel count. When given, forward returns
+                a dict of logits instead of (masks, labels). Default is None.
         """
         super().__init__()
 
         self.model = model
         self.name = model.name
         self.num_classes = model.num_classes
+        self.heads = heads
 
         self._is_transformer_style = model.encoder._is_transformer_style
         self.model.encoder._is_transformer_style = False
@@ -127,23 +141,6 @@ class SegWrapper(nn.Module):
             )
         )
 
-    def dists_to_center(self, size, device="cuda"):
-        """
-        Compute normalized distances to center for spatial encoding.
-
-        Args:
-            size (int): Size of the spatial dimension.
-            device (str, optional): Device to create tensors on. Defaults to "cuda".
-
-        Returns:
-            torch.Tensor: X-coordinate distances normalized by size.
-            torch.Tensor: Y-coordinate distances normalized by size.
-        """
-        enc = torch.arange(size).to(device) - size // 2
-        x = enc.unsqueeze(0).repeat(size, 1) / size
-        y = enc.unsqueeze(1).repeat(1, size) / size
-        return x, y
-
     def forward(self, x):
         """
         Forward pass of the segmentation model.
@@ -152,21 +149,10 @@ class SegWrapper(nn.Module):
             x (torch.Tensor): Input data as a tensor.
 
         Returns:
-            torch.Tensor: Segmentation masks.
-            torch.Tensor: Labels.
+            dict: Logits per head, if the model was built with `heads`.
+            torch.Tensor: Segmentation masks, otherwise.
+            torch.Tensor: Labels, otherwise.
         """
-        if self.model.n_channels == 3:
-            with torch.no_grad():
-                size = x.size(-1)
-                x_enc, y_enc = self.dists_to_center(size, device=x.device)
-                # h x w -> bs x 1 x 1 x h x w
-                x_enc = x_enc.view(1, 1, 1, size, size).repeat(
-                    x.size(0), 1, x.size(2), 1, 1
-                )
-                y_enc = y_enc.view(1, 1, 1, size, size).repeat(
-                    x.size(0), 1, x.size(2), 1, 1
-                )
-                x = torch.cat([x_enc, x, y_enc], 1)
 
         features = self.model.encoder(x)
 
@@ -185,12 +171,23 @@ class SegWrapper(nn.Module):
 
         masks = self.model.segmentation_head(decoder_output)
 
-        if self.model.classification_head is not None:
-            labels = self.model.classification_head(features[-1])
+        heads = {}
+        if self.heads is not None:
+            start = 0
+            for name, channels in self.heads.items():
+                heads[name] = masks[:, start : start + channels]
+                start += channels
         else:
-            labels = torch.zeros(x.size(0), 1).to(x.device)
+            heads["masks"] = masks
 
-        return masks, labels
+        if self.model.classification_head is not None:
+            heads["labels"] = self.model.classification_head(features[-1])
+
+        return heads
+
+    def count_parameters(self):
+        """Number of trainable parameters."""
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
 def convert_3d(module):
@@ -224,19 +221,20 @@ def convert_3d(module):
             module_output.qconfig = module.qconfig
 
     elif isinstance(module, Conv2dSame):
-        module_output = Conv3dSame(
-            in_channels=module.in_channels,
-            out_channels=module.out_channels,
-            kernel_size=module.kernel_size[0],
-            stride=module.stride[0],
-            padding=module.padding[0],
-            dilation=module.dilation[0],
-            groups=module.groups,
-            bias=module.bias is not None,
-        )
-        module_output.weight = torch.nn.Parameter(
-            module.weight.unsqueeze(-1).repeat(1, 1, 1, 1, module.kernel_size[0])
-        )
+        raise NotImplementedError("Conv3dSame is not implemented")
+        # module_output = Conv3dSame(
+        #     in_channels=module.in_channels,
+        #     out_channels=module.out_channels,
+        #     kernel_size=module.kernel_size[0],
+        #     stride=module.stride[0],
+        #     padding=module.padding[0],
+        #     dilation=module.dilation[0],
+        #     groups=module.groups,
+        #     bias=module.bias is not None,
+        # )
+        # module_output.weight = torch.nn.Parameter(
+        #     module.weight.unsqueeze(-1).repeat(1, 1, 1, 1, module.kernel_size[0])
+        # )
 
     elif isinstance(module, torch.nn.Conv2d):
         module_output = torch.nn.Conv3d(
