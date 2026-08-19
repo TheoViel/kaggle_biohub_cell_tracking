@@ -103,5 +103,11 @@ def worker_init_fn(worker_id):
 
     Workers inherit the parent numpy state on fork, so without this every worker
     of a rank would emit identical crops and flips.
+
+    Also pins each worker to a single torch thread. Workers inherit the
+    parent's thread count (one per core), and on a per-sample workload the
+    resulting contention is a net loss even before ranks x workers oversubscribe
+    the machine — the normalisation step alone is ~2x slower multi-threaded.
     """
+    torch.set_num_threads(1)
     np.random.seed(torch.initial_seed() % (2**32))

@@ -125,6 +125,67 @@ class Mix(nn.Module):
         """
         raise NotImplementedError
 
+    def mix_track(self, imgs, coords, masks, targets, weak_pos=None):
+        """
+        Mixes tracking windows, keeping the union of their cells.
+
+        The image is mixed by the subclass's mix_x, but the node sets are
+        concatenated rather than mixed: a coordinate has no meaningful
+        interpolation, and every cell of both windows really is present in the
+        mixed image. Node padding therefore doubles, M -> 2M.
+
+        Edge targets become block-diagonal — a cell can only be linked to a cell
+        of the window it came from — so the tracker learns to follow one cell
+        through a field of distractors that move independently of it.
+
+        Args:
+            imgs (torch.Tensor [BS, W, Z, Y, X]): Window images.
+            coords (torch.Tensor [BS, W, M, 3]): Padded GT cell coordinates.
+            masks (torch.Tensor [BS, W, M]): Which coords are real cells.
+            targets (torch.Tensor [BS, W - 1, M, M]): GT transition matrices.
+            weak_pos (torch.Tensor [BS, W, N, 3], optional): Weak positives,
+                -1 padded. Defaults to None.
+
+        Returns:
+            tuple: (imgs, coords, masks, targets, weak_pos), node dims doubled.
+        """
+        bs = imgs.shape[0]
+        perm, coeffs = self.get_perm_and_coefs(imgs)
+
+        # Samples the permutation happens to leave in place (either p skipped
+        # them or the shuffle was a fixed point) must not have their node set
+        # doubled: a union with itself would list every cell twice, and the edge
+        # target would then hold two equally-correct parents for each child.
+        mixed = (perm != torch.arange(bs, device=perm.device)).view(bs, 1, 1)
+
+        imgs = self._mix_x(imgs, perm, coeffs)
+        coords = torch.cat([coords, coords[perm]], dim=2)
+        masks = torch.cat([masks, masks[perm] & mixed], dim=2)
+
+        zeros = torch.zeros_like(targets)
+        other = targets[perm] * mixed.unsqueeze(-1)
+        targets = torch.cat(
+            [
+                torch.cat([targets, zeros], dim=-1),
+                torch.cat([zeros, other], dim=-1),
+            ],
+            dim=-2,
+        )
+
+        if weak_pos is not None:
+            weak_pos = torch.cat(
+                [
+                    weak_pos,
+                    torch.where(
+                        mixed.unsqueeze(-1),
+                        weak_pos[perm],
+                        torch.full_like(weak_pos, -1.0),
+                    ),
+                ],
+                dim=2,
+            )
+        return imgs, coords, masks, targets, weak_pos
+
     def mix_batch(self, batch, perm=None, coeffs=None):
         """
         Mixes a batch dict of dense tensors that all share the same spatial dims.

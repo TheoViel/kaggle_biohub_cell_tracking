@@ -9,9 +9,19 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, DistributedSampler
 
+from data.mix import Mixup
 from tracking.losses import TrackingLoss
 from tracking.targets import detect_and_match, build_matched_edge_targets
 from tracking.eval import evaluate
+from tracking.fit_utils import (
+    collate_frame_det,
+    encode_nodes,
+    fts_cache_dir,
+    load_fts_cache,
+    loader_without_images,
+    save_fts_cache,
+    split_frame_det,
+)
 
 from training.optim import define_optimizer, define_scheduler
 from training.distributed import all_reduce_mean, unwrap_model
@@ -35,9 +45,6 @@ def fit(
 
     device = ctx.device
     use_amp = args.fp16 and device.type == "cuda"
-    # bf16 has the same exponent range as fp32, so unlike fp16 it can't
-    # overflow to inf inside the model's own forward pass (e.g. from a
-    # large-but-legitimate edge-loss gradient spike) — no loss scaling needed.
     use_bf16 = use_amp and torch.cuda.is_bf16_supported()
     amp_dtype = torch.bfloat16 if use_bf16 else torch.float16
     core_model: UNetNodeTransformer = unwrap_model(model)
@@ -45,12 +52,49 @@ def fit(
     # Loss
     criterion = TrackingLoss(**args.loss_config)
 
+    # Transformer-only mode
+    transformer_only = getattr(args, "transformer_only", False)
+    fts_cache: dict[str, list] = {}
+    val_fts_cache: dict[str, list] = {}
+    cache_dir = fts_cache_dir(args, getattr(args, "fold", 0))
+    # Set explicitly rather than only when freezing: an earlier stage may have
+    # left its own parameters frozen, and this stage owns the decision.
+    if transformer_only:
+        for name, param in core_model.named_parameters():
+            param.requires_grad_(name.startswith("transformer."))
+        log("- Transformer-only: UNet + detect head frozen, node features cached")
+        # Both UNets are frozen, so features computed by an earlier run against
+        # the same weights and detection config are still exact.
+        fts_cache = load_fts_cache(cache_dir, "train", args, ctx, device)
+        val_fts_cache = load_fts_cache(cache_dir, "val", args, ctx, device)
+        if fts_cache or val_fts_cache:
+            log(f"- Loaded node features from {cache_dir} "
+                f"({len(fts_cache)} train, {len(val_fts_cache)} val windows)")
+    else:
+        for param in core_model.parameters():
+            param.requires_grad_(True)
+
+    # Mixup
+    mix_config = getattr(args, "mixup", None) or {}
+    mixer = None
+    if mix_config.get("p", 0.0) > 0:
+        mixer = Mixup(p=mix_config["p"], alpha=mix_config.get("alpha", 4.0))
+        # log(f"- Mixup: p={mix_config['p']}, alpha={mix_config.get('alpha', 4.0)}")
+
     # Optimizer
+    lr = args.optimizer_config["lr"]
+    lr_unet = args.optimizer_config.get("lr_unet", lr)
+    lr_transformer = args.optimizer_config.get("lr_transformer", lr)
     optimizer = define_optimizer(
         model,
         args.optimizer_config["name"],
-        lr=args.optimizer_config["lr"],
-        lr_encoder=args.optimizer_config.get("lr_encoder", args.optimizer_config["lr"]),
+        lr=lr,
+        lr_encoder=args.optimizer_config.get("lr_encoder", lr),
+        lr_by_name={
+            "transformer": lr_transformer,
+            "unet": lr_unet,
+            "detect_head": lr_unet,
+        },
         betas=args.optimizer_config["betas"],
         weight_decay=args.optimizer_config["weight_decay"],
     )
@@ -70,15 +114,33 @@ def fit(
     interval_steps = 0
     interval_start = time.time()
 
-    log("\n-> Starting tracking training...\n")
     global_step = 0
     best_score = 0.0
+    val_cache_saved = bool(val_fts_cache)
     total_steps = args.epochs * len(train_loader)
 
     for epoch in range(args.epochs):
         model.train()
 
-        if train_sampler is not None:
+        # Once the cache covers every window this rank will ever be given, the
+        # volumes are dead weight. Verified rather than assumed: a sampler that
+        # re-partitions across epochs (DistributedSampler with shuffle=True)
+        # would hand this rank windows it never encoded, and they would reach
+        # the UNet as empty placeholders. Checked every epoch, so a cache loaded
+        # from disk skips image loading from the very first one.
+        if transformer_only and train_loader.dataset.load_images:
+            n_shard = len(train_loader.sampler or train_loader.dataset)
+            if len(fts_cache) >= n_shard:
+                train_loader = loader_without_images(train_loader)
+                path = save_fts_cache(fts_cache, cache_dir, "train", args, ctx)
+                log(f"- Transformer-only: {len(fts_cache)} windows cached, "
+                    f"image loading disabled, saved to {path}")
+            elif epoch == 1:
+                log(f"- Transformer-only: only {len(fts_cache)}/{n_shard} windows "
+                    "cached after one epoch, keeping image loading on")
+
+        # SubsetRandomSampler (the stable-shard path) reshuffles on its own.
+        if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
             train_sampler.set_epoch(epoch)
 
         for batch in train_loader:
@@ -86,43 +148,54 @@ def fit(
             coords = batch["coords"].to(device, non_blocking=True)
             masks = batch["masks"].to(device, non_blocking=True)
             targets = batch["targets"].to(device, non_blocking=True)
+            weak_pos = batch.get("weak_positives")
+            if weak_pos is not None:
+                weak_pos = weak_pos.to(device, non_blocking=True)
             image_shape = tuple(batch["image_shape"][0].tolist())
             voxel_size = tuple(batch["voxel_size"][0].tolist())
 
+            if mixer is not None:
+                imgs, coords, masks, targets, weak_pos = mixer.mix_track(
+                    imgs, coords, masks, targets, weak_pos
+                )
+
             bs, window_size, d, h, w = imgs.shape
 
+            progress = global_step / max(total_steps, 1)
+            teacher_forcing = progress < getattr(args, "teacher_forcing_prop", 0.0)
+            edges_enabled = transformer_only or (global_step / total_steps > args.det_warmup_prop)
+
             with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                unet_out, det_logits = core_model.encode(imgs)
-
-                d_out, h_out, w_out = unet_out.shape[-3:]
-                unet_scaling = (d // d_out, h // h_out, w // w_out)
-
-                frame_det = []
-                for i in range(window_size):
-                    det_coords, det_pos_embed, det_mask, matches = detect_and_match(
-                        det_logits[i].sigmoid(),
-                        coords[:, i],
-                        masks[:, i],
+                if transformer_only:
+                    names = batch["name"]
+                    if any(name not in fts_cache for name in names):
+                        with torch.no_grad():
+                            fresh, _, _ = encode_nodes(
+                                core_model, imgs, coords, masks, image_shape,
+                                voxel_size, args,
+                            )
+                        for b, name in enumerate(names):
+                            fts_cache[name] = split_frame_det(fresh, b)
+                    frame_det = collate_frame_det([fts_cache[n] for n in names])
+                    det_logits, unet_scaling = [], None
+                else:
+                    frame_det, det_logits, unet_scaling = encode_nodes(
+                        core_model,
+                        imgs,
+                        coords,
+                        masks,
                         image_shape,
-                        voxel_size=voxel_size,
-                        unet_scaling=unet_scaling,
-                        pool_kernel_um=args.pool_kernel_um,
-                        frame_index=i,
-                        window_size=window_size,
-                        det_threshold=args.detect_and_match_threshold,
-                        max_dets_per_sample=args.max_dets_per_sample,
+                        voxel_size,
+                        args,
+                        teacher_forcing=teacher_forcing,
+                        detect=edges_enabled,
                     )
-
-                    unet_feat = core_model._index_features(
-                        unet_out[:, i], det_coords, det_mask,
-                    )
-                    frame_det.append((det_coords, det_pos_embed, det_mask, matches, unet_feat))
 
                 edge_logits_list = []
                 edge_targets_list = []
                 det_mask_pairs = []
 
-                if global_step / total_steps > args.det_warmup_prop:
+                if edges_enabled:
                     for i in range(window_size - 1):
                         ns = frame_det[i][0].shape[1]  # number of source nodes
                         nt = frame_det[i + 1][0].shape[1]  # number of target nodes
@@ -157,8 +230,11 @@ def fit(
                     edge_logits_list,
                     edge_targets_list,
                     det_mask_pairs,
-                    imgs_per_frame=[imgs[:, i] for i in range(window_size)],
                     unet_scaling=unet_scaling,
+                    weak_pos_per_frame=(
+                        [weak_pos[:, i] for i in range(window_size)]
+                        if weak_pos is not None else None
+                    ),
                 )
 
             scaler.scale(loss).backward()
@@ -185,41 +261,60 @@ def fit(
                 interval_losses[k] += breakdown[k]
             interval_steps += 1
 
-            if global_step % args.log_every == 0:
+            is_last_step = global_step >= total_steps
+
+            if global_step % args.log_every == 0 or is_last_step:
                 avg = all_reduce_mean(
                     {k: v / interval_steps for k, v in interval_losses.items()},
                     device,
                 )
-                elapsed = time.time() - interval_start
-                lr = optimizer.param_groups[0]["lr"]
-                message = (
-                    f"epoch {epoch + 1:02d}/{args.epochs:02d}  (step {global_step:04d})  "
-                    f"lr={lr:.1e}   loss={avg['total']:.4f}  "
-                    f"det={avg['det']:.4f}  edge={avg['edge']:.4f}  t={elapsed:.0f}s"
-                )
+                lrs = sorted({g["lr"] for g in optimizer.param_groups})
+                lr_str = "/".join(f"{v:.1e}" for v in lrs)
+
+                # Evaluate
+                val_message = ""
                 if (
                     getattr(args, "eval_every", 0) > 0
-                    and global_step % args.eval_every == 0
+                    and (global_step % args.eval_every == 0 or is_last_step)
                     and val_loader is not None
                 ):
-                    val_loss, val_acc, val_recall = evaluate(
-                        core_model, val_loader, args, device=device,
+                    val_loss, val_edge_jaccard, val_node_recall = evaluate(
+                        core_model,
+                        val_loader,
+                        args,
+                        device=device,
+                        eval_edges=edges_enabled,
+                        transformer_only=transformer_only,
+                        fts_cache=val_fts_cache,
                     )
+                    # evaluate() walks the whole loader, so one pass fills the
+                    # val cache completely.
+                    if transformer_only and not val_cache_saved:
+                        save_fts_cache(val_fts_cache, cache_dir, "val", args, ctx)
+                        val_cache_saved = True
                     if ctx.is_main:
-                        score = val_acc * val_recall
-                        message += (
+                        val_message = (
                             f"   val_loss={val_loss:.4f}  "
-                            f"val_acc={val_acc:.3f}  val_recall={val_recall:.3f}"
+                            f"val_node_recall={val_node_recall:.3f}  "
+                            f"val_edge_jaccard={val_edge_jaccard:.3f}"
                         )
-                        if score > best_score:
-                            best_score = score
+                        if val_edge_jaccard > best_score:
+                            best_score = val_edge_jaccard
                             torch.save(
                                 {"model_state_dict": core_model.state_dict(),
                                  "model_config": _model_config(args)},
                                 output_dir / "ckpt_best.pt",
                             )
                     model.train()
-                log(message)
+
+                # After the evaluation, so its cost shows up in the timing.
+                elapsed = time.time() - interval_start
+                log(
+                    f"epoch {epoch + 1:02d}/{args.epochs:02d}  (step {global_step:05d})  "
+                    f"lr={lr_str}   loss={avg['total']:.4f}  "
+                    f"det={avg['det']:.4f}  edge={avg['edge']:.4f}  t={elapsed:.0f}s"
+                    + val_message
+                )
                 interval_losses = {"det": 0.0, "edge": 0.0, "total": 0.0}
                 interval_steps = 0
                 interval_start = time.time()
@@ -230,7 +325,7 @@ def fit(
                     output_dir / f"ckpt_{global_step:05d}.pt",
                 )
 
-    if ctx.is_main:
+    if ctx.is_main and args.save_every > -1:
         torch.save(
             {"model_state_dict": core_model.state_dict(),
              "model_config": _model_config(args)},
@@ -249,8 +344,21 @@ def _model_config(args) -> dict:
         "transformer_hidden": args.transformer_hidden,
         "transformer_heads": args.transformer_heads,
         "transformer_blocks": args.transformer_blocks,
+        "pos_feat_dim": getattr(args, "pos_feat_dim", 0),
+        "edge_knn_k": getattr(args, "edge_knn_k", None),
+        "edge_geom_feats": getattr(args, "edge_geom_feats", True),
+        # Inference has to rebuild the same node-feature stack, which means
+        # knowing whether the embedding UNet exists and how wide it is.
+        "unet_features": list(getattr(args, "unet_features", ["detection"]) or []),
+        "contrastive": {
+            k: (getattr(args, "contrastive", None) or {}).get(k)
+            for k in ("embed_dim", "unet_out_channels", "unet_layers")
+        },
         "pool_kernel_um": args.pool_kernel_um,
         "detect_and_match_threshold": args.detect_and_match_threshold,
         "max_dets_per_sample": args.max_dets_per_sample,
+        "nms": getattr(args, "nms", "greedy"),
+        "nms_radius_um": getattr(args, "nms_radius_um", 7.0),
+        "downscale_factor": getattr(args, "downscale_factor", 1),
         "window_size": args.window_size,
     }

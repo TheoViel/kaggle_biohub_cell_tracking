@@ -8,8 +8,6 @@ import torch.nn as nn
 from model_zoo.simple_node_transformer import SimpleNodeTransformer
 from model_zoo.temporal_unet import TemporalUNet3D
 
-_POS_EMBED_DIM = 8  # per axis; total = 4 axes × _POS_EMBED_DIM = 32
-
 
 class UNetNodeTransformer(nn.Module):
     """TemporalUNet3D encoder + detection head + SimpleNodeTransformer edge predictor.
@@ -25,25 +23,66 @@ class UNetNodeTransformer(nn.Module):
         self,
         unet: TemporalUNet3D,
         unet_out_channels: int,
-        pos_feat_dim: int,
+        pos_feat_dim: int = 0,
         hidden_dim: int = 128,
         n_heads: int = 4,
         n_blocks: int = 4,
         dropout: float = 0.3,
+        edge_knn_k: int | None = None,
+        edge_geom_feats: bool = True,
+        embed_unet: TemporalUNet3D | None = None,
+        embed_unet_out_channels: int = 32,
+        embed_dim: int = 32,
+        unet_features: tuple[str, ...] = ("detection",),
         verbose: int = 0,
     ):
         super().__init__()
         self.unet = unet
         self.unet_out_channels = unet_out_channels
 
-        self.detect_head = nn.Conv3d(unet_out_channels, 1, kernel_size=1)
+        self.detect_head = nn.Sequential(
+            nn.Conv3d(unet_out_channels, unet_out_channels, kernel_size=1),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Conv3d(unet_out_channels, 1, kernel_size=1),
+        )
 
+        # Second, independent UNet trained purely to tell cells apart. The
+        # detection UNet cannot do that job: its loss asks only "is a cell
+        # here", so two look-alike neighbours *should* map to the same feature.
+        self.embed_unet = embed_unet
+        self.embed_dim = embed_dim
+        if embed_unet is not None:
+            self.embed_head = nn.Sequential(
+                nn.Conv3d(embed_unet_out_channels, embed_unet_out_channels, kernel_size=1),
+                nn.GELU(),
+                nn.Conv3d(embed_unet_out_channels, embed_dim, kernel_size=1),
+            )
+
+        # Which feature maps the node vectors are read from, in this order. An
+        # empty list leaves the transformer with geometry alone — the pair MLP
+        # still gets the relative offset and edge_geom_feats, and every node
+        # token becomes the same learned constant.
+        self.unet_features = tuple(unet_features)
+        widths = {"detection": unet_out_channels, "contrastive": embed_dim}
+        unknown = set(self.unet_features) - set(widths)
+        if unknown:
+            raise ValueError(
+                f"unknown unet_features {sorted(unknown)}, expected 'detection' / 'contrastive'"
+            )
+        if "contrastive" in self.unet_features and embed_unet is None:
+            raise ValueError("unet_features asks for 'contrastive' but no embed_unet was built")
+        node_feat_dim = sum(widths[name] for name in self.unet_features)
+
+        self.use_pos_embed = pos_feat_dim > 0
         self.transformer = SimpleNodeTransformer(
-            feat_dim=unet_out_channels + pos_feat_dim,
+            feat_dim=node_feat_dim + pos_feat_dim,
             hidden_dim=hidden_dim,
             n_heads=n_heads,
             n_blocks=n_blocks,
             dropout=dropout,
+            knn_k=edge_knn_k,
+            use_geom_feats=edge_geom_feats,
         )
 
         self.verbose = verbose
@@ -98,6 +137,27 @@ class UNetNodeTransformer(nn.Module):
 
         return unet_out, det_logits
 
+    def encode_embed(
+        self,
+        imgs: torch.Tensor,  # (B, W, *spatial)
+    ) -> torch.Tensor:
+        """Run the contrastive UNet, returning L2-normalised node embeddings.
+
+        Normalising here means every downstream similarity is a cosine, so the
+        contrastive temperature is the only thing setting the logit scale.
+
+        Returns
+        -------
+        (B, W, embed_dim, *spatial)
+        """
+        if self.embed_unet is None:
+            raise RuntimeError("encode_embed called on a model with no embed_unet")
+
+        out = self.embed_unet(imgs.unsqueeze(2))     # (B, W, C, *spatial)
+        W = out.shape[1]
+        embed = torch.stack([self.embed_head(out[:, i]) for i in range(W)], dim=1)
+        return torch.nn.functional.normalize(embed, dim=2)
+
     def predict_edges(
         self,
         unet_feat_src: torch.Tensor,  # (B, N_src, C_feat) pre-indexed
@@ -110,8 +170,13 @@ class UNetNodeTransformer(nn.Module):
         mask_tgt: torch.Tensor,       # (B, N_tgt) bool
     ) -> torch.Tensor:
         """Run cross-attention edge predictor on pre-indexed UNet features."""
-        feat_src = torch.cat([unet_feat_src, pos_feat_src], dim=-1)
-        feat_tgt = torch.cat([unet_feat_tgt, pos_feat_tgt], dim=-1)
+        if self.use_pos_embed:
+            feat_src = torch.cat([unet_feat_src, pos_feat_src], dim=-1)
+            feat_tgt = torch.cat([unet_feat_tgt, pos_feat_tgt], dim=-1)
+        else:
+            feat_src = unet_feat_src
+            feat_tgt = unet_feat_tgt
+
         return self.transformer(feat_src, feat_tgt, coords_src, coords_tgt, mask_src, mask_tgt)
 
     def count_parameters(self) -> int:
@@ -126,8 +191,13 @@ def define_track_model(
     transformer_hidden: int = 128,
     transformer_heads: int = 4,
     transformer_blocks: int = 4,
+    edge_knn_k: int | None = None,
+    edge_geom_feats: bool = True,
+    pos_feat_dim: int = 0,
     transformer_dropout: float = 0.3,
-    gradient_checkpointing: bool = True,
+    gradient_checkpointing: bool = False,
+    contrastive: dict | None = None,
+    unet_features: tuple[str, ...] = ("detection",),
     verbose: int = 0,
 ) -> UNetNodeTransformer:
     """Build the full tracking model (UNet + detect head + transformer).
@@ -148,8 +218,6 @@ def define_track_model(
     if unet_layers is None:
         unet_layers = [32, 64, 128]
 
-    pos_feat_dim = 4 * _POS_EMBED_DIM  # 32
-
     unet = TemporalUNet3D(
         in_channels=1,
         out_channels=unet_out_channels,
@@ -160,6 +228,24 @@ def define_track_model(
         verbose=verbose,
     )
 
+    # The embedding UNet keeps the detection UNet's output stride, so node
+    # coordinates index both feature maps identically. It exists only if the
+    # transformer is asked for its features — leaving "contrastive" out of
+    # unet_features is how the whole branch, and its training stage, is turned
+    # off.
+    contrastive = contrastive or {}
+    embed_unet = None
+    if "contrastive" in unet_features:
+        embed_unet = TemporalUNet3D(
+            in_channels=1,
+            out_channels=contrastive.get("unet_out_channels", 32),
+            layers=list(contrastive.get("unet_layers", unet_layers)),
+            gradient_checkpointing=gradient_checkpointing,
+            pool_stride=unet_pool_stride,
+            n_decode_steps=unet_n_decode_steps,
+            verbose=verbose,
+        )
+
     return UNetNodeTransformer(
         unet=unet,
         unet_out_channels=unet_out_channels,
@@ -167,6 +253,12 @@ def define_track_model(
         hidden_dim=transformer_hidden,
         n_heads=transformer_heads,
         n_blocks=transformer_blocks,
+        edge_knn_k=edge_knn_k,
+        edge_geom_feats=edge_geom_feats,
+        embed_unet=embed_unet,
+        embed_unet_out_channels=contrastive.get("unet_out_channels", 32),
+        embed_dim=contrastive.get("embed_dim", 32),
+        unet_features=unet_features,
         dropout=transformer_dropout,
         verbose=verbose,
     )

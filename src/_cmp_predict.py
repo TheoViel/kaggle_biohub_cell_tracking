@@ -25,7 +25,7 @@ cfg = PredictConfig(
     max_children_per_node=2,
 )
 
-coords, edges = predict_video(
+coords, edges, _ = predict_video(
     model,
     Path(TRAIN_DIR) / SAMPLE,
     device=device,

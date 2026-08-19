@@ -127,7 +127,13 @@ class Lookahead(Optimizer):
 
 
 def define_optimizer(
-    model, name, lr=1e-3, lr_encoder=1e-3, weight_decay=0, betas=(0.9, 0.999)
+    model,
+    name,
+    lr=1e-3,
+    lr_encoder=1e-3,
+    lr_by_name=None,
+    weight_decay=0,
+    betas=(0.9, 0.999),
 ):
     """
     Defines an optimizer for the given model based on the specified name.
@@ -138,6 +144,8 @@ def define_optimizer(
         name (str): The name of the optimizer.
         lr (float, optional): The learning rate. Defaults to 1e-3.
         lr_encoder (float, optional): The learning rate for encoder layers. Defaults to 1e-3.
+        lr_by_name (dict, optional): Maps a parameter-name substring to its lr.
+            Takes precedence over lr_encoder; first match wins. Defaults to None.
         weight_decay (float, optional): The weight decay. Defaults to 0.
         betas (tuple, optional): Optimizer betas. Defaults to (0.9, 0.999).
 
@@ -147,19 +155,32 @@ def define_optimizer(
     Returns:
         torch.optim.Optimizer: The defined optimizer.
     """
-    if weight_decay or lr != lr_encoder:
+    lr_by_name = lr_by_name or {}
+    if weight_decay or lr != lr_encoder or lr_by_name:
         no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
-        opt_params = []
+        # One group per (name, lr, wd) combination instead of one per tensor,
+        # so the scheduler and the training logs stay readable.
+        groups = {}
         for n, p in model.named_parameters():
             wd = 0 if any(nd in n for nd in no_decay) else weight_decay
-            lr_ = lr_encoder if "encoder" in n else lr
-            opt_params.append(
-                {
-                    "params": [p],
-                    "weight_decay": wd,
+            group_name, lr_ = "", lr
+            for key, key_lr in lr_by_name.items():
+                if key in n:
+                    group_name, lr_ = key, key_lr
+                    break
+            else:
+                if "encoder" in n:
+                    group_name, lr_ = "encoder", lr_encoder
+            key = (group_name, lr_, wd)
+            if key not in groups:
+                groups[key] = {
+                    "params": [],
+                    "name": group_name,
                     "lr": lr_,
+                    "weight_decay": wd,
                 }
-            )
+            groups[key]["params"].append(p)
+        opt_params = list(groups.values())
     else:
         opt_params = model.parameters()
 

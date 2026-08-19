@@ -118,7 +118,7 @@ def link_frames(
     return np.stack([parents, children], axis=1), travelled
 
 
-def build_graph(
+def build_graph_from_nodes(
     nodes_by_time,
     max_distance=7.0,
     flow_neighbours=40,
@@ -167,6 +167,7 @@ def build_graph(
     # Registered up front so that reading the attribute works even on a graph
     # that ends up with no edges at all.
     graph.add_edge_attr_key("distance", pl.Float64, 0.0)
+    graph.add_edge_attr_key("edge_prob", pl.Float64, 0.0)
 
     times = sorted(nodes_by_time)
     coords, node_ids = {}, {}
@@ -217,6 +218,7 @@ def build_graph(
                         "source_id": int(node_ids[t][parent]),
                         "target_id": int(node_ids[later][child]),
                         "distance": float(distance),
+                        "edge_prob": 1.0,
                     }
                 )
 

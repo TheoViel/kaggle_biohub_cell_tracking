@@ -7,14 +7,16 @@ import matplotlib.pyplot as plt
 
 
 # Show the two frames in the window after downsampling and normalisation
-def plot_sample(sample, t_start=0):
+def plot_sample(sample, t_start=0, tol=2, z=None):
     imgs = sample["imgs"].float().numpy()   # (W, Z_ds, Y_ds, X_ds)
     coords = sample["coords"].numpy()   # (W, max_nodes, 3)
+    weak = sample["weak_positives"].numpy()    # (W, Z_ds, Y_ds, X_ds) uint8
     masks  = sample["masks"].numpy()    # (W, max_nodes) bool
 
     W, Z_ds, Y_ds, X_ds = imgs.shape
 
-    z = int(coords[0, 0, 0])
+    if z is None:
+        z = int(coords[0, 0, 0])
     fig, axes = plt.subplots(1, W, figsize=(7 * W, 6))
     if W == 1:
         axes = [axes]
@@ -24,11 +26,17 @@ def plot_sample(sample, t_start=0):
         # GT nodes near this z slice
         n_real = int(masks[i].sum())
         c = coords[i, :n_real]   # (N, 3) in downsampled space
-        near = np.abs(c[:, 0] - z) <= 2
+        near = np.abs(c[:, 0] - z) <= tol
         if near.any():
-            ax.scatter(c[near, 2], c[near, 1], c="cyan", s=80,
-                    edgecolors="white", linewidths=0.8, zorder=5)
-        ax.set_title(f"t={t_start + i}  -  z={z}  -  {n_real} GT cell(s)")
+            ax.scatter(c[near, 2], c[near, 1], c="cyan", s=50, edgecolors="white", linewidths=0.8, zorder=5)
+
+        n_weak = int(weak[i].sum())
+        c = weak[i, :n_weak]   # (N, 3) in downsampled space
+        near = np.abs(c[:, 0] - z) <= tol
+        if near.any():
+            ax.scatter(c[near, 2], c[near, 1], c="red", s=50, edgecolors="white", linewidths=0.8, zorder=5)
+            
+        ax.set_title(f"t={t_start + i}  -  z={z}  -  {n_real} GT cell(s)  -  {n_weak} weak cell(s)")
         ax.axis("off")
 
     plt.tight_layout()

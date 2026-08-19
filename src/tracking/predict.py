@@ -1,19 +1,3 @@
-"""Inference utilities for the cell tracking model.
-
-Mirrors the training pipeline (tracking/dataset.py, tracking/train.py,
-tracking/targets.py): images are loaded at full resolution and normalised
-the same way; all spatial downsampling happens inside the model
-(``unet_pool_stride`` / ``unet_n_decode_steps``), so the detection grid
-scale (``unet_scaling``) is measured from the model's own output shape
-rather than assumed externally. Detected coordinates and positional
-embeddings stay in that detection-grid space throughout — matching what
-the edge scorer was trained on — and are only rescaled to original-image
-resolution in the final returned array.
-"""
-
-from __future__ import annotations
-
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -27,41 +11,97 @@ from tracking.targets import pos_embed_numpy
 from tracking_cellmot.io import open_dataset
 
 
-@dataclass
+
 class PredictConfig:
-    """Hyperparameters that affect prediction quality.
+    """Inference hyper-parameters.
 
-    Detection
-    ---------
-    det_threshold : float
-        Minimum sigmoid probability for a local-max peak to be kept.
-    det_tta : bool
-        Average detection logits over Y/X flips. Z is excluded because the
-        data is anisotropic (Z is ~4x coarser), so Z-flips are out of
-        distribution.
-    pool_kernel_um : float
-        Max-pool NMS kernel size in microns.
-
-    Edge filtering
-    --------------
-    edge_activation : str
-        ``"softmax"`` (normalised over parents) or ``"sigmoid"``.
-    edge_threshold : float
-        Minimum edge probability to consider a link.
-    max_parents_per_node : int or None
-        Maximum incoming edges per node (1 = no merges).
-    max_children_per_node : int or None
-        Maximum outgoing edges per node (2 = divisions allowed).
+    Node selection should mirror what training and validation used — the model
+    was fitted against the node sets those settings produce.
     """
 
-    det_threshold: float = 0.5
-    det_tta: bool = True
-    pool_kernel_um: float = 3.0
+    det_tta = False
 
-    edge_activation: str = "softmax"
-    edge_threshold: float = 0.5
-    max_parents_per_node: int | None = 1
-    max_children_per_node: int | None = 2
+    # --- Nodes ---
+    nms = "greedy"           # "greedy" (exact radius) or "maxpool" (grid-quantised)
+    nms_radius_um = 7.0      # greedy only
+    pool_kernel_um = 5.0     # maxpool only
+    det_threshold = 0.25
+
+    # --- Edges ---
+    edge_activation = "softmax"
+    edge_selection = "argmax"
+    edge_threshold = 0.0
+
+    max_parents_per_node = 1
+    max_children_per_node = 2
+
+
+def _select_edges(
+    probs: np.ndarray,        # (n_src, n_tgt) parent x child probabilities
+    cfg,
+) -> list[tuple[float, int, int]]:
+    """Pick (prob, src_idx, tgt_idx) links subject to the capacity limits.
+
+    ``argmax`` walks children in descending confidence and gives each one its
+    best parent that still has capacity, falling back down that child's parent
+    ranking rather than dropping the child entirely.
+    """
+    n_src, n_tgt = probs.shape
+    if n_src == 0 or n_tgt == 0:
+        return []
+
+    children_count: dict[int, int] = {}
+    parents_count: dict[int, int] = {}
+    edges: list[tuple[float, int, int]] = []
+
+    def _take(i: int, j: int, p: float) -> bool:
+        if (
+            cfg.max_children_per_node is not None
+            and children_count.get(i, 0) >= cfg.max_children_per_node
+        ):
+            return False
+        if (
+            cfg.max_parents_per_node is not None
+            and parents_count.get(j, 0) >= cfg.max_parents_per_node
+        ):
+            return False
+        edges.append((p, i, j))
+        children_count[i] = children_count.get(i, 0) + 1
+        parents_count[j] = parents_count.get(j, 0) + 1
+        return True
+
+    if cfg.edge_selection == "argmax":
+        ranked = np.argsort(-probs, axis=0)                  # parents, best first per child
+        best = probs[ranked[0], np.arange(n_tgt)]            # (n_tgt,)
+        for j in np.argsort(-best):                          # most confident child first
+            j = int(j)
+            for rank in range(n_src):
+                if (
+                    cfg.max_parents_per_node is not None
+                    and parents_count.get(j, 0) >= cfg.max_parents_per_node
+                ):
+                    break
+                i = int(ranked[rank, j])
+                p = float(probs[i, j])
+                # p == 0 means kNN-gated (softmax of -inf): never link these,
+                # even if every plausible parent is already at capacity.
+                if p <= 0.0 or p < cfg.edge_threshold:
+                    break                                    # rest of the column is worse
+                _take(i, j, p)
+        return edges
+
+    candidates = sorted(
+        (
+            (float(probs[i, j]), i, j)
+            for i in range(n_src)
+            for j in range(n_tgt)
+            if probs[i, j] > cfg.edge_threshold
+        ),
+        reverse=True,
+    )
+    for p, i, j in candidates:
+        _take(i, j, p)
+    return edges
 
 
 def load_track_model(
@@ -77,6 +117,9 @@ def load_track_model(
 
     cfg = ckpt.get("model_config", {})
     unet_pool_stride = cfg.get("unet_pool_stride")
+    # unet_features decides whether the contrastive branch is built at all, so
+    # it has to come from the checkpoint — building it differently here would
+    # give the transformer a different input width than it was trained with.
     model = define_track_model(
         unet_out_channels=cfg.get("unet_out_channels", 32),
         unet_layers=cfg.get("unet_layers", [32, 64, 128]),
@@ -85,6 +128,11 @@ def load_track_model(
         transformer_hidden=cfg.get("transformer_hidden", 128),
         transformer_heads=cfg.get("transformer_heads", 4),
         transformer_blocks=cfg.get("transformer_blocks", 4),
+        pos_feat_dim=cfg.get("pos_feat_dim", 0),
+        edge_knn_k=cfg.get("edge_knn_k"),
+        edge_geom_feats=cfg.get("edge_geom_feats", True),
+        unet_features=tuple(cfg.get("unet_features", ("detection",)) or ()),
+        contrastive=cfg.get("contrastive"),
         gradient_checkpointing=False,
     )
 
@@ -107,10 +155,11 @@ def predict_video(
     model: UNetNodeTransformer,
     ds_path: str | Path,
     device: str | torch.device = "cuda",
-    cfg: PredictConfig | None = None,
+    cfg: dict | None = None,
     window_size: int = 2,
     max_frames: int | None = None,
     progress: bool = True,
+    downscale_factor: int = 1,
 ) -> tuple[np.ndarray, list[tuple[int, int, float, float]]]:
     """Run inference on a single video using sliding windows of W frames.
 
@@ -164,6 +213,7 @@ def predict_video(
         if not window_starts or last != window_starts[-1]:
             window_starts.append(last)
 
+    det_logits_list: list[torch.Tensor] = []
     for ws in tqdm(window_starts, desc="windows", leave=False, disable=not progress):
         frame_indices = list(range(ws, ws + W))
 
@@ -173,16 +223,32 @@ def predict_video(
         )  # (W, Z, Y, X)
         # Quantile normalisation (0.1%-99.9%), matching tracking/dataset.py.
         imgs = ((imgs - q_low) / (q_high - q_low + 1e-6)).clamp(0.0, 4.0)
+
+        if downscale_factor > 1:
+            imgs = imgs[:, ::downscale_factor, ::downscale_factor, ::downscale_factor]
+            image_shape = (T,) + tuple(imgs.shape[1:])
+
         imgs = imgs.unsqueeze(0).to(device)  # (1, W, Z, Y, X)
 
         unet_out, det_logits = model.encode(imgs)
+        det_logits_list.append(torch.stack(det_logits, 0).detach().cpu())
+
+        # The maps the edge transformer reads its node features from, in the
+        # order the model was trained with. Empty when unet_features is empty,
+        # i.e. a geometry-only tracker.
+        node_feat_maps = [
+            unet_out if source == "detection" else model.encode_embed(imgs)
+            for source in model.unet_features
+        ]
 
         if unet_scaling is None:
             d, h, w = imgs.shape[-3:]
             d_out, h_out, w_out = unet_out.shape[-3:]
             unet_scaling = (d // d_out, h // h_out, w // w_out)
             out_shape = tuple(s // u for s, u in zip(image_shape[-3:], unet_scaling))
-            voxel_size_out = tuple(s * u for s, u in zip(ds.scale, unet_scaling))
+            voxel_size_out = tuple(
+                s * downscale_factor * u for s, u in zip(ds.scale, unet_scaling)
+            )
             pool_k = pool_kernel_from_um(cfg.pool_kernel_um, voxel_size_out)
 
         # Detection TTA: average logits over Y/X flips.
@@ -196,7 +262,8 @@ def predict_video(
             for f in range(W):
                 det_logits[f] = det_logits[f] / 4
 
-        del imgs
+        # imgs is needed until the edge pass below when a contrastive branch
+        # exists, so it is freed at the end of the window instead of here.
 
         # --- Detect cells in each frame (dedup across windows) ---
         # Coordinates come out in detection-grid space (same grid as
@@ -208,7 +275,10 @@ def predict_video(
                 det_logits[f_idx][0],
                 t,
                 cfg.det_threshold,
-                pool_k,
+                nms=cfg.nms,
+                pool_kernel=pool_k,
+                voxel_size=voxel_size_out,
+                nms_radius_um=cfg.nms_radius_um,
             )
             coord_offset[t] = (global_node_count, global_node_count + len(arr))
             global_node_count += len(arr)
@@ -275,16 +345,22 @@ def predict_video(
             p_mask_src = torch.ones(1, n_src, dtype=torch.bool, device=device)
             p_mask_tgt = torch.ones(1, n_tgt, dtype=torch.bool, device=device)
 
-            unet_feat_src = model._index_features(
-                unet_out[:, f_idx],
-                p_coords_src,
-                p_mask_src,
-            )
-            unet_feat_tgt = model._index_features(
-                unet_out[:, f_idx + 1],
-                p_coords_tgt,
-                p_mask_tgt,
-            )
+            # Same node-feature stack as training: every map named in
+            # unet_features, concatenated in that order.
+            unet_feat_src = torch.cat(
+                [
+                    model._index_features(maps[:, f_idx], p_coords_src, p_mask_src)
+                    for maps in node_feat_maps
+                ],
+                dim=-1,
+            ) if node_feat_maps else p_coords_src.new_zeros((1, n_src, 0))
+            unet_feat_tgt = torch.cat(
+                [
+                    model._index_features(maps[:, f_idx + 1], p_coords_tgt, p_mask_tgt)
+                    for maps in node_feat_maps
+                ],
+                dim=-1,
+            ) if node_feat_maps else p_coords_tgt.new_zeros((1, n_tgt, 0))
             edge_logits_pair = model.predict_edges(
                 unet_feat_src,
                 unet_feat_tgt,
@@ -302,33 +378,7 @@ def predict_video(
             else:
                 probs = torch.sigmoid(raw).cpu().numpy()
 
-            candidates = sorted(
-                [
-                    (probs[i, j], i, j)
-                    for i in range(n_src)
-                    for j in range(n_tgt)
-                    if probs[i, j] > cfg.edge_threshold
-                ],
-                reverse=True,
-            )
-
-            children_count: dict[int, int] = {}
-            parents_count: dict[int, int] = {}
-
-            for prob, i, j in candidates:
-                n_ch = children_count.get(i, 0)
-                n_pa = parents_count.get(j, 0)
-                if (
-                    cfg.max_children_per_node is not None
-                    and n_ch >= cfg.max_children_per_node
-                ):
-                    continue
-                if (
-                    cfg.max_parents_per_node is not None
-                    and n_pa >= cfg.max_parents_per_node
-                ):
-                    continue
-
+            for prob, i, j in _select_edges(probs, cfg):
                 gi, gj = int(idx_src[i]), int(idx_tgt[j])
                 dist = float(
                     np.linalg.norm(
@@ -336,9 +386,7 @@ def predict_video(
                         - coords_so_far[gj, 1:].astype(np.float32)
                     )
                 )
-                all_edges.append((gi, gj, float(prob), dist))
-                children_count[i] = n_ch + 1
-                parents_count[j] = n_pa + 1
+                all_edges.append((gi, gj, prob, dist))
 
         del unet_out
 
@@ -349,4 +397,8 @@ def predict_video(
     coords = coords.astype(np.float32)
     if unet_scaling is not None:
         coords[:, 1:] *= np.array(unet_scaling, dtype=np.float32)
-    return coords.astype(np.int16), all_edges
+    if downscale_factor > 1:
+        coords[:, 1:] *= downscale_factor
+
+    det_logits = torch.stack(det_logits_list)
+    return coords.astype(np.int16), all_edges, det_logits

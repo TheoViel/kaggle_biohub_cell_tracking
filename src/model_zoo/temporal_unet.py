@@ -25,9 +25,9 @@ def _to_3tuple(v) -> tuple[int, int, int]:
     return t
 
 
-def _conv_block(in_channels: int, out_channels: int) -> nn.Sequential:
+def _conv_block(in_channels: int, out_channels: int, stride: int | tuple[int, int, int] = 1) -> nn.Sequential:
     return nn.Sequential(
-        nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+        nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1, stride=stride, bias=False),
         nn.BatchNorm3d(out_channels),
         nn.ReLU(inplace=True),
         nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
@@ -120,10 +120,11 @@ class TemporalUNet3D(nn.Module):
             raise ValueError("layers must contain at least two stages")
 
         self.gradient_checkpointing = gradient_checkpointing
+        self.verbose = verbose
 
         pool_stride_t = _to_3tuple(pool_stride)
         # scale_factor for Upsample must be a float or sequence of floats
-        up_scale = tuple(float(s) for s in pool_stride_t)
+        up_scale = 2  #  tuple(float(s) for s in pool_stride_t)
 
         n_full_decode = len(layers) - 1
 
@@ -135,13 +136,14 @@ class TemporalUNet3D(nn.Module):
         self.temporal_blocks = nn.ModuleList()
         prev = in_channels
         for i, ch in enumerate(layers):
-            self.encoder_blocks.append(_conv_block(prev, ch))
+            self.encoder_blocks.append(_conv_block(prev, ch, stride=pool_stride_t if i == 0 else 1))
             if skip_fullres_temporal and i == 0:
                 self.temporal_blocks.append(nn.Identity())
             else:
                 self.temporal_blocks.append(_TemporalAttention(ch))
             prev = ch
         self.pool = nn.MaxPool3d(kernel_size=pool_stride_t, stride=pool_stride_t)
+        self.pool_anisotropic = nn.MaxPool3d(kernel_size=max(pool_stride_t), stride=max(pool_stride_t))
 
         self.upsamples = nn.ModuleList()
         self.decoder_blocks = nn.ModuleList()
@@ -154,7 +156,7 @@ class TemporalUNet3D(nn.Module):
         # Head input channels: bottleneck level when n_decode_steps == 0
         head_in = layers[n_full_decode - n_decode_steps]
         self.head = nn.Conv3d(head_in, out_channels, kernel_size=1)
-        self.verbose = verbose
+        
 
     def _run(self, block: nn.Module, x: torch.Tensor) -> torch.Tensor:
         if self.gradient_checkpointing and self.training:
@@ -166,6 +168,8 @@ class TemporalUNet3D(nn.Module):
         B, T = x.shape[:2]
         x = x.reshape(B * T, *x.shape[2:])
 
+        Z, Y, X = x.shape[-3:]
+
         skips: list[torch.Tensor] = []
         for i, (block, temporal) in enumerate(zip(self.encoder_blocks, self.temporal_blocks)):
 
@@ -173,7 +177,12 @@ class TemporalUNet3D(nn.Module):
                 print(f"TemporalUNet3D - Encoder Block {i} - Input shape: {x.shape}")
 
             if i > 0:
-                x = self.pool(x)
+                if x.shape[-1] == X // 4:  # already downsampled twice
+                    x = self.pool_anisotropic(x)
+                    # print(f"Downsampled anisotropic: {x.shape}")
+                else:
+                    x = self.pool(x)
+                    # print(f"Downsampled isotropic: {x.shape}")
 
             x = self._run(block, x)
             x = temporal(x.reshape(B, T, *x.shape[1:])).reshape(B * T, *x.shape[1:])

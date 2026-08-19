@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import polars as pl
 import torch
 import torch.nn.functional as F
 import tracksdata as td
+
+from tracking.weak_positives import greedy_nms
 
 
 def pool_kernel_from_um(
@@ -15,15 +19,25 @@ def pool_kernel_from_um(
 ) -> tuple[int, ...]:
     """Convert a physical suppression distance (microns) to a per-axis voxel kernel.
 
-    Each axis gets ``round(um / voxel_size_axis)`` voxels, forced to odd (for
-    symmetric padding) and at least 1.
+    Symmetric padding needs an odd kernel, so each axis gets the odd voxel
+    count whose physical width ``k * voxel_size_axis`` is *nearest* to ``um``.
+
+    Rounding up to the next odd instead — which is what taking round() and
+    adding one to even results does — costs up to a factor of two on a coarse
+    grid. At a 3.25 um grid a 5 um request is 1.54 voxels: rounding up gives a
+    9.75 um kernel, which suppresses every cell pair closer than that.
+
+    Ties go to the narrower kernel. The two failure modes are not symmetric —
+    an over-wide kernel merges distinct cells into one peak and the extra cells
+    cannot be recovered, while a narrow one only leaves duplicate peaks for the
+    matching step to sort out.
     """
     kernel = []
     for size in voxel_size:
-        k = max(1, round(um / size))
-        if k % 2 == 0:
-            k += 1
-        kernel.append(k)
+        # k = 2n + 1 voxels; pick the n nearest to (um / size - 1) / 2.
+        half = (um / size - 1.0) / 2.0
+        n = math.ceil(half - 0.5)          # ceil(x - 0.5) rounds ties down
+        kernel.append(2 * max(0, n) + 1)
     return tuple(kernel)
 
 
@@ -54,13 +68,65 @@ def detect_peaks(
     return torch.nonzero(is_peak[0, 0])   # (N, 3)
 
 
+def detect_peaks_greedy(
+    det_logit: torch.Tensor,              # (Z, Y, X) raw detection logits
+    voxel_size: tuple[float, float, float],
+    radius_um: float = 2.5,
+    threshold: float = 0.5,
+    max_candidates: int = 50_000,
+) -> torch.Tensor:
+    """Detect peaks by greedy NMS over the above-threshold voxels.
+
+    Alternative to the max-pool path, which has two grid artefacts this avoids:
+
+    * The max-pool kernel is an odd voxel count, so on a coarse grid the
+      achievable suppression widths are far apart — at a 3.25 um grid only
+      3.25, 9.75, 16.25 um exist, and a 5 um request cannot be expressed.
+      ``radius_um`` here is exact and continuous.
+    * ``logits == pooled`` marks every voxel of a plateau, so one flat blob
+      yields a cluster of detections. Greedy NMS emits one point per
+      ``radius_um`` ball instead — but only once the radius exceeds the grid
+      spacing. On a 3.25 um grid a 2x2x2 plateau collapses to 8/4/2/1 points
+      at radii of 2.5/3.5/5.0/5.7 um, since the block's own diagonal is
+      5.63 um. Set the radius from the cell size, not from the voxel size.
+
+    The cost is a Python loop of one round per output peak (see ``greedy_nms``),
+    so it is slower than a single max-pool and is meant for inference.
+    ``max_candidates`` caps the input by score to bound that.
+
+    Returns
+    -------
+    torch.Tensor  shape (N, 3) int64 — detected voxel coordinates (z, y, x)
+                  in the same (downsampled) grid as the input.
+    """
+    above = torch.sigmoid(det_logit) > threshold
+    points = torch.nonzero(above)                       # (n, 3)
+    if points.shape[0] == 0:
+        return points
+    scores = det_logit[above]
+
+    if points.shape[0] > max_candidates:
+        keep = scores.topk(max_candidates).indices
+        points, scores = points[keep], scores[keep]
+
+    vs = torch.as_tensor(voxel_size, dtype=torch.float32, device=det_logit.device)
+    return points[greedy_nms(points, scores, vs, radius_um)]
+
+
 def detect_cells_pooled(
     det_logit: torch.Tensor,   # (1, Z, Y, X) or (Z, Y, X) raw logits
     t: int,
     det_threshold: float = 0.5,
-    pool_kernel: tuple[int, ...] = (3, 3, 3),
+    nms: str = "maxpool",
+    pool_kernel: tuple[int, ...] | None = None,
+    voxel_size: tuple[float, float, float] | None = None,
+    nms_radius_um: float | None = None,
 ) -> np.ndarray:
-    """Extract cell coordinates via max-pool local-max, prefixed with time.
+    """Extract cell coordinates via local-max suppression, prefixed with time.
+
+    ``nms="maxpool"`` uses the stride-1 max-pool kernel; ``nms="greedy"`` runs
+    greedy NMS at an exact ``nms_radius_um`` instead, which needs
+    ``voxel_size`` for the detection grid.
 
     Returns
     -------
@@ -69,9 +135,24 @@ def detect_cells_pooled(
     if det_logit.dim() == 4:
         det_logit = det_logit[0]
 
-    peak_idx = detect_peaks(
-        det_logit, threshold=det_threshold, pool_kernel=pool_kernel,
-    )
+    if nms == "greedy":
+        if voxel_size is None or nms_radius_um is None:
+            raise ValueError("nms='greedy' needs voxel_size and nms_radius_um")
+        peak_idx = detect_peaks_greedy(
+            det_logit,
+            voxel_size=voxel_size,
+            radius_um=nms_radius_um,
+            threshold=det_threshold,
+        )
+    elif nms == "maxpool":
+        if pool_kernel is None:
+            raise ValueError("nms='maxpool' needs pool_kernel")
+        peak_idx = detect_peaks(
+            det_logit, threshold=det_threshold, pool_kernel=pool_kernel,
+        )
+    else:
+        raise ValueError(f"unknown nms mode {nms!r}, expected 'maxpool' or 'greedy'")
+
     if peak_idx.shape[0] == 0:
         return np.empty((0, 4), dtype=np.int16)
 

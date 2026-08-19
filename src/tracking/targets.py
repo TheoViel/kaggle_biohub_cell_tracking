@@ -12,6 +12,9 @@ import numpy as np
 import polars as pl
 import torch
 
+from tracking.post_process import pool_kernel_from_um
+from tracking.weak_positives import greedy_nms
+
 _POS_EMBED_DIM = 8  # per axis; total = 4 axes × _POS_EMBED_DIM = 32
 
 
@@ -120,6 +123,23 @@ def build_detection_target(
     return target
 
 
+def _top_k_peaks(
+    probas: torch.Tensor,     # (Z, Y, X)
+    peak_mask: torch.Tensor,  # (Z, Y, X) bool — local maxima, unthresholded
+    k: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Highest-scoring local maxima, ignoring the detection threshold."""
+    _, Y, X = probas.shape
+    masked = torch.where(peak_mask, probas, torch.full_like(probas, -1.0))
+    vals, flat = masked.reshape(-1).topk(min(k, masked.numel()))
+    keep = vals > 0
+    vals, flat = vals[keep], flat[keep]
+    z = flat // (Y * X)
+    rem = flat % (Y * X)
+    coords = torch.stack([z, rem // X, rem % X], dim=1).float()
+    return coords, vals
+
+
 def detect_and_match(
     det_probas: torch.Tensor,       # (B, 1, Z, Y, X)
     gt_coords: torch.Tensor,        # (B, max_nodes, 3)
@@ -127,17 +147,39 @@ def detect_and_match(
     image_shape: tuple,
     det_threshold: float = 0.3,
     pool_kernel_um: float = 5.0,
-    max_match_distance: float = 5.0,
+    max_match_distance: float = 7.0,
     voxel_size: tuple | None = None,
     unet_scaling: tuple | None = None,
     frame_index: int = 0,
     window_size: int | None = None,
     max_dets_per_sample: int | None = None,
+    top_k_nodes: int | None = None,
+    teacher_forcing: bool = False,
+    nms: str = "maxpool",
+    nms_radius_um: float = 7.0,
+    max_nms_candidates: int = 50_000,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]:
     """Detect local-max peaks in logits, match to GT, return padded edge-prediction inputs.
 
+    ``nms`` selects how peaks are picked out of the above-threshold voxels:
+    "maxpool" uses a stride-1 max-pool over an odd voxel kernel derived from
+    ``pool_kernel_um``, "greedy" suppresses at an exact ``nms_radius_um``.
+    The max-pool kernel quantises hard on a coarse grid (at 3.25 um only
+    3.25/9.75/16.25 um are reachable) and reports every voxel of a plateau;
+    greedy has neither problem, at the cost of a loop over output peaks.
+    ``max_nms_candidates`` caps its input by score to bound that.
+
     If max_dets_per_sample is given, each sample keeps only its highest-scoring
     peaks up to that count, which bounds the size of the edge-scoring matrix.
+
+    If top_k_nodes is given, a sample yielding fewer than that many peaks above
+    det_threshold instead falls back to its top-k highest-scoring local maxima.
+    This keeps the node set non-empty while the detector is still weak — with
+    no nodes the edge branch receives an identically zero gradient.
+
+    If teacher_forcing is True the GT points are used directly as the node set
+    (each trivially matched to itself), decoupling edge training from detector
+    quality entirely. Intended for the start of training only.
 
     Returns
     -------
@@ -152,28 +194,41 @@ def detect_and_match(
     device = det_probas.device
 
     if voxel_size is not None:
-
-        # print('pool_kernel: ', pool_kernel)
         vs = torch.tensor(voxel_size, dtype=torch.float32, device=device)
 
         if unet_scaling is not None:
             unet_vs = vs * torch.tensor(unet_scaling, dtype=torch.float32, device=device)
         else:  # assume (1, 1, 1)
             unet_vs = vs
-
-        pool_kernel = [max(1, round(pool_kernel_um / unet_vs[i].item())) for i in range(3)]
-        pool_kernel = tuple(max(1, k if k % 2 == 1 else k + 1) for k in pool_kernel)
     else:
-        k = max(1, round(pool_kernel_um))
-        pool_kernel = (k if k % 2 == 1 else k + 1,) * 3
         vs = torch.ones(3, dtype=torch.float32, device=device)
         unet_vs = vs
 
+    # Shared with predict.py, so training and inference suppress over the same
+    # physical distance.
+    pool_kernel = pool_kernel_from_um(pool_kernel_um, tuple(unet_vs.tolist()))
+    # print(pool_kernel)
+
     pad = tuple(k // 2 for k in pool_kernel)
+    spatial = det_probas.shape[2:]
+
+    use_greedy = nms == "greedy"
+    if nms not in ("greedy", "maxpool"):
+        raise ValueError(f"unknown nms mode {nms!r}, expected 'maxpool' or 'greedy'")
 
     with torch.no_grad():
-        pooled = F.max_pool3d(det_probas, pool_kernel, stride=1, padding=pad)
-        is_peak = (det_probas == pooled) & (det_probas > det_threshold)
+        # The max-pool is still needed for the top_k fallback, which ranks raw
+        # local maxima, but not otherwise in greedy mode.
+        if use_greedy and top_k_nodes is None:
+            is_peak_raw = None
+        else:
+            pooled = F.max_pool3d(det_probas, pool_kernel, stride=1, padding=pad)
+            is_peak_raw = det_probas == pooled
+
+        above = det_probas > det_threshold
+        # Greedy suppresses among all above-threshold voxels; max-pool has
+        # already reduced them to local maxima.
+        is_peak = above if use_greedy else (is_peak_raw & above)
         peak_idx = torch.nonzero(is_peak[:, 0])   # (N_total, 4): [b, z, y, x]
 
     batch_ids = peak_idx[:, 0]
@@ -187,16 +242,46 @@ def detect_and_match(
     sample_coords: list[torch.Tensor] = []
     max_det = 0
 
+    if unet_scaling is not None:
+        scale_t = torch.tensor(unet_scaling, dtype=torch.float32, device=device)
+    else:
+        scale_t = torch.ones(3, dtype=torch.float32, device=device)
+
     for b in range(B):
+        nt = int(nt_per_sample[b].item())
+
+        if teacher_forcing:
+            # GT points *are* the node set; each matches itself.
+            det_b = (gt_coords[b, :nt].float() / scale_t).floor()
+            for a in range(3):
+                det_b[:, a].clamp_(0, spatial[a] - 1)
+            sample_matches.append(torch.arange(nt, dtype=torch.long, device=device))
+            sample_coords.append(det_b)
+            max_det = max(max_det, nt)
+            continue
+
         sel = batch_ids == b
         det_b = peak_coords[sel]
         scores_b = peak_scores[sel]
+
+        if use_greedy and det_b.shape[0]:
+            if det_b.shape[0] > max_nms_candidates:
+                top = scores_b.topk(max_nms_candidates).indices
+                det_b, scores_b = det_b[top], scores_b[top]
+            keep = greedy_nms(det_b, scores_b, unet_vs, nms_radius_um)
+            det_b, scores_b = det_b[keep], scores_b[keep]
+
+        # Too few peaks cleared the threshold — fall back to the top-k local
+        # maxima so the edge branch still has nodes to learn from.
+        if top_k_nodes is not None and det_b.shape[0] < top_k_nodes:
+            det_b, scores_b = _top_k_peaks(
+                det_probas[b, 0], is_peak_raw[b, 0], top_k_nodes,
+            )
 
         if max_dets_per_sample is not None and det_b.shape[0] > max_dets_per_sample:
             det_b = det_b[scores_b.topk(max_dets_per_sample).indices]
 
         n_det = det_b.shape[0]
-        nt = int(nt_per_sample[b].item())
         gt_b = gt_coords[b, :nt]
 
         matched = torch.full((n_det,), -1, dtype=torch.long, device=device)

@@ -6,29 +6,43 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 
-from tracking.targets import detect_and_match, build_matched_edge_targets
+from tracking.targets import build_matched_edge_targets
+from tracking.fit_utils import collate_frame_det, encode_nodes, split_frame_det
 
 
 def _evaluate_pair(
     logits: torch.Tensor,  # (N_t, N_t1)
     target: torch.Tensor,  # (N_t, N_t1)
-) -> tuple[float, int, int]:
-    """Returns (focal_bce_loss, n_correct, n_total) for one unpadded pair."""
+) -> tuple[float, int, int, int]:
+    """Returns (focal_bce_loss, tp, fp, fn) for one unpadded pair.
+
+    Links are picked by argmax over the parent axis — each child takes its
+    best-scoring parent — matching ``predict.py``'s default
+    ``edge_selection="argmax"``. A fixed probability cutoff is useless here:
+    the softmax is normalised across all N candidate parents, so scores scale
+    like 1/N and never approach 0.5 once a frame holds a few hundred
+    detections, which pins the jaccard at 0 however well the model ranks.
+    """
     active_rows = target.sum(dim=1) > 0
     active_cols = target.sum(dim=0) > 0
     if not active_rows.any():
-        return 0.0, 0, 0
+        return 0.0, 0, 0, 0
 
     from tracking.losses import edge_loss
 
     loss_val = edge_loss(logits, target).item()
 
     probs = torch.softmax(logits, dim=0)
-    preds = (probs > 0.5).float()
+    preds = torch.zeros_like(probs, dtype=torch.bool)
+    preds[probs.argmax(dim=0), torch.arange(probs.shape[1], device=probs.device)] = True
+
+    target_bool = target > 0.5
     mask = active_rows.unsqueeze(1) | active_cols.unsqueeze(0)
-    correct = int((preds[mask] == target[mask]).sum().item())
-    total = int(mask.sum().item())
-    return loss_val, correct, total
+
+    tp = (preds[mask] & target_bool[mask]).sum().item()
+    fp = (preds[mask] & ~target_bool[mask]).sum().item()
+    fn = (~preds[mask] & target_bool[mask]).sum().item()
+    return loss_val, tp, fp, fn
 
 
 def _all_reduce_sums(values: list[float], device: torch.device) -> list[float]:
@@ -45,20 +59,23 @@ def evaluate(
     loader: DataLoader,
     args,
     device: torch.device | None = None,
+    eval_edges: bool = True,
+    transformer_only: bool = False,
+    fts_cache: dict[str, list] = None,
 ) -> tuple[float, float, float]:
     """Evaluate on a sharded validation loader across all ranks.
 
-    Returns (avg_loss, edge_accuracy, node_recall), reduced over the process group.
+    Returns (avg_loss, edge_jaccard, node_recall), reduced over the process group.
     """
     if device is None:
         device = next(model.parameters()).device
 
     if loader is None:
-        return 0.0, 0.0, 0.0
+        return 0., 0., 0.
 
     model.eval()
-    total_loss, correct, total, n_pairs = 0.0, 0, 0, 0
-    gt_matched, gt_total = 0, 0
+    gt_total, gt_matched = 0, 0
+    total_loss, tp, fp, fn, n_pairs = 0.0, 0, 0, 0, 0
 
     for batch in loader:
         imgs = batch["imgs"].to(device, dtype=torch.float32, non_blocking=True)
@@ -69,29 +86,23 @@ def evaluate(
         voxel_size = tuple(batch["voxel_size"][0].tolist())
 
         B, W, d, h, w = imgs.shape
-        unet_out, det_logits = model.encode(imgs)
 
-        d_out, h_out, w_out = unet_out.shape[-3:]
-        unet_scaling = (d // d_out, h // h_out, w // w_out)
+        if transformer_only and fts_cache is not None:
+            names = batch["name"]
+            if any(name not in fts_cache for name in names):
+                fresh = encode_nodes(
+                    model, imgs, coords, masks, image_shape, voxel_size, args, nms=args.nms, nms_radius_um=args.nms_radius_um,
+                )[0]
+                for b, name in enumerate(names):
+                    fts_cache[name] = split_frame_det(fresh, b)
+            frame_det = collate_frame_det([fts_cache[n] for n in names])
+        else:
+            frame_det = encode_nodes(
+                model, imgs, coords, masks, image_shape, voxel_size, args, nms=args.nms, nms_radius_um=args.nms_radius_um,
+            )[0]
 
-        frame_det = []
         for i in range(W):
-            det_c, det_p, det_m, matches = detect_and_match(
-                det_logits[i].sigmoid(),
-                coords[:, i],
-                masks[:, i],
-                image_shape,
-                voxel_size=voxel_size,
-                unet_scaling=unet_scaling,
-                pool_kernel_um=args.pool_kernel_um,
-                frame_index=i,
-                window_size=W,
-                det_threshold=args.detect_and_match_threshold,
-                max_dets_per_sample=args.max_dets_per_sample,
-            )
-            unet_feat = model._index_features(unet_out[:, i], det_c, det_m)
-            frame_det.append((det_c, det_p, det_m, matches, unet_feat))
-
+            matches = frame_det[i][3]
             for b in range(B):
                 n_gt = int(masks[b, i].sum().item())
                 n_matched = int((matches[b] >= 0).sum().item())
@@ -99,6 +110,8 @@ def evaluate(
                 gt_matched += n_matched
 
         for i in range(W - 1):
+            if not eval_edges:
+                continue
             ns = frame_det[i][0].shape[1]
             nt = frame_det[i + 1][0].shape[1]
             pair_target = build_matched_edge_targets(
@@ -122,21 +135,22 @@ def evaluate(
             for b in range(B):
                 ns_b = int(frame_det[i][2][b].sum().item())
                 nt_b = int(frame_det[i + 1][2][b].sum().item())
-                pair_loss, pair_correct, pair_total = _evaluate_pair(
+                pair_loss, pair_tp, pair_fp, pair_fn = _evaluate_pair(
                     pair_logits[b, :ns_b, :nt_b],
                     pair_target[b, :ns_b, :nt_b],
                 )
                 total_loss += pair_loss
-                correct += pair_correct
-                total += pair_total
+                tp += pair_tp
+                fp += pair_fp
+                fn += pair_fn
                 n_pairs += 1
 
-    total_loss, correct, total, n_pairs, gt_matched, gt_total = _all_reduce_sums(
-        [total_loss, correct, total, n_pairs, gt_matched, gt_total],
+    # Aggregate
+    total_loss, tp, fp, fn, n_pairs, gt_matched, gt_total = _all_reduce_sums(
+        [total_loss, tp, fp, fn, n_pairs, gt_matched, gt_total],
         device,
     )
-
+    edge_jaccard = tp / (tp + fp + fn) if (tp + fp + fn) > 0 else 0.0
     node_recall = gt_matched / max(gt_total, 1.0)
-    edge_acc = correct / max(total, 1.0)
     avg_loss = total_loss / max(n_pairs, 1.0)
-    return avg_loss, edge_acc, node_recall
+    return avg_loss, edge_jaccard, node_recall
