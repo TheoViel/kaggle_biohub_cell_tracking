@@ -104,46 +104,6 @@ def _select_edges(
     return edges
 
 
-def load_track_model(
-    checkpoint_path: str | Path,
-    device: str | torch.device = "cuda",
-) -> UNetNodeTransformer:
-    """Load a UNetNodeTransformer from a checkpoint.
-
-    The checkpoint must contain a 'model_config' key (saved by train.py).
-    """
-    checkpoint_path = Path(checkpoint_path)
-    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-
-    cfg = ckpt.get("model_config", {})
-    unet_pool_stride = cfg.get("unet_pool_stride")
-    # unet_features decides whether the contrastive branch is built at all, so
-    # it has to come from the checkpoint — building it differently here would
-    # give the transformer a different input width than it was trained with.
-    model = define_track_model(
-        unet_out_channels=cfg.get("unet_out_channels", 32),
-        unet_layers=cfg.get("unet_layers", [32, 64, 128]),
-        unet_pool_stride=tuple(unet_pool_stride) if unet_pool_stride else 2,
-        unet_n_decode_steps=cfg.get("unet_n_decode_steps"),
-        transformer_hidden=cfg.get("transformer_hidden", 128),
-        transformer_heads=cfg.get("transformer_heads", 4),
-        transformer_blocks=cfg.get("transformer_blocks", 4),
-        pos_feat_dim=cfg.get("pos_feat_dim", 0),
-        edge_knn_k=cfg.get("edge_knn_k"),
-        edge_geom_feats=cfg.get("edge_geom_feats", True),
-        unet_features=tuple(cfg.get("unet_features", ("detection",)) or ()),
-        contrastive=cfg.get("contrastive"),
-        gradient_checkpointing=False,
-    )
-
-    state = ckpt.get("model_state_dict", ckpt)
-    # Strip any DataParallel "unet.module." prefix
-    state = {k.replace("unet.module.", "unet.", 1): v for k, v in state.items()}
-    model.load_state_dict(state)
-    model.eval()
-    return model.to(device)
-
-
 def _load_frame(zarr_arr, t: int) -> torch.Tensor:
     """Load one full-resolution frame from zarr (no normalisation)."""
     raw = zarr_arr[t].astype(np.float32)
@@ -251,6 +211,11 @@ def predict_video(
             )
             pool_k = pool_kernel_from_um(cfg.pool_kernel_um, voxel_size_out)
 
+            # print("UNET SCALING: ", unet_scaling)
+            # print("OUT SHAPE: ", out_shape)
+            # print("VOXEL SIZE OUT: ", voxel_size_out)
+            # print("POOL K: ", pool_k)
+
         # Detection TTA: average logits over Y/X flips.
         if cfg.det_tta:
             for dims in [(-1,), (-2,), (-2, -1)]:
@@ -272,7 +237,7 @@ def predict_video(
             if t in seen_frames:
                 continue
             arr = detect_cells_pooled(
-                det_logits[f_idx][0],
+                det_logits[f_idx][0].sigmoid(),
                 t,
                 cfg.det_threshold,
                 nms=cfg.nms,

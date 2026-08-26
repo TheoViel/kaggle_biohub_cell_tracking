@@ -43,12 +43,10 @@ DEFAULTS = {
     "transformer_blocks": 4,
     "transformer_dropout": 0.1,
     "pos_feat_dim": 32,  # 32
-    "edge_geom_feats": True,  # feed distance / NN-rank straight to the pair MLP
-    "edge_knn_k": None,  # 16,  # 16,   # score each child only against its K nearest parents (None = all-vs-all)
-    # Node features the edge transformer sees, concatenated in this order.
-    # Leave "contrastive" out and its UNet is never built (stage 2 is skipped);
-    # an empty list leaves the transformer with geometry alone.
-    "unet_features": ["contrastive"],  # ["detection", "contrastive"]
+    "edge_geom_feats": True,
+    "edge_drift_correction": True,
+    "edge_knn_k": None,  # 16,   # score each child only against its K nearest parents (None = all-vs-all)
+    "unet_features": [],  # ["detection", "contrastive"]  # Node features the edge transformer sees
 
     # Data
     "brightness_strength": 1.,   # heavy photometric aug; 0 = plain scalar shift
@@ -59,6 +57,8 @@ DEFAULTS = {
         "nms_um": 5.0,
         "max_nodes": 512,
         "dir": None,
+        "pl_folder": "../logs/2026-08-19/14/preds_pl/",
+        # "pl_folder": "../logs/2026-08-20/0/preds_pl/",
     },
 
     # Detection
@@ -71,8 +71,8 @@ DEFAULTS = {
 
     # Stage 1 - Pretraining
     "pretraining": {
-        "enabled": False,
-        "weights": "../logs/2026-08-19/0/fold_0/ckpt_pretrain.pt",
+        "enabled": True,
+        "weights": "../logs/2026-08-20/16/fold_0/ckpt_pretrain.pt",
         "epochs": 20,
         "crop_size": (16, 64, 64),
         "batch_size": 16,
@@ -80,20 +80,21 @@ DEFAULTS = {
 
     # Stage 2 - Contrastive - Built and trained only when "contrastive" is in unet_features.
     "contrastive": {
-        "weights": None,  # "../logs/2026-08-19/15/fold_0/ckpt_contrastive.pt",  # load one instead of training it
-        "epochs": 20,
+        "weights": None,
+        "epochs": 10,
         "crop_size": None,  # (16, 64, 64),
-        "batch_size": 16,
-        "augment": True,
+        "batch_size": 8,
+        "augment": False,
         "lr": 1e-3,
         "temperature": 0.1,     # InfoNCE over cosine similarities
-        "embed_dim": 128,        # node embedding width
-        "unet_out_channels": 128,
+        "hard_negatives_k": None,  # None = every candidate
+        "embed_dim": 64,        # node embedding width
+        "unet_out_channels": 64,
         "unet_layers": (32, 64, 128),
     },
 
     # Training
-    "epochs": 100,
+    "epochs": 3,
     "batch_size": 16,
     "val_batch_size": 4,
     "num_workers": 8,
@@ -115,10 +116,10 @@ DEFAULTS = {
 
     # Losses
     "loss_config": {
-        "det_use_weak_positives": True,   # image peaks count as (down-weighted) cells
-        "det_loss_weight": 1,    # 0.01,
+        "det_use_weak_positives": True,
+        "det_loss_weight": 1,
         "det_neg_weight": 0.1,
-        "det_weak_weight": 0.5,        # weight for image-derived weak positives
+        "det_weak_weight": 0.25,        # To balance GT share of positive weight 
         "det_weak_smoothing": 0.05,    # smoothing factor for weak positives
         "det_gaussian_sigma": 1.0,
     },
@@ -130,8 +131,9 @@ DEFAULTS = {
     # Logging & evaluation
     "log_path": LOG_FOLDER,
     "log_every": 100,
-    "save_every": 1000,
+    "save_every": 500,
     "eval_every": 100,          # 0 = no mid-training evaluation
+    "eval_thresholds": [0.3, 0.4, 0.5],
 
     # Distributed
     "seed": 0,

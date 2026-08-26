@@ -30,10 +30,19 @@ def fts_cache_dir(args, fold: int) -> Path:
     a run pointing at a pretrained embedding UNet also inherits its cache;
     otherwise inside this run's own fold folder.
     """
-    weights = (getattr(args, "contrastive", None) or {}).get("weights")
+    # None when the run has no reusable upstream weights to key the cache on —
+    # a fresh in-run pretraining, or a feature set neither branch covers.
+    weights = None
+    if getattr(args, "transformer_only", False):
+        features = getattr(args, "unet_features", None) or ()
+        if "contrastive" in features:
+            weights = (getattr(args, "contrastive", None) or {}).get("weights")
+        else:
+            weights = (getattr(args, "pretraining", None) or {}).get("weights")
+
     if weights:
         weights = weights.format(fold=fold) if "{fold}" in weights else weights
-        return Path(weights).parent / "fts_cache"
+        return Path(weights).parent / "fts_cache" / f"fold_{fold}"
     return Path(args.output_dir) / "fts_cache"
 
 
@@ -45,6 +54,7 @@ def _cache_signature(args) -> dict:
         for k in ("weights", "embed_dim", "unet_out_channels")
     }
     signature["unet_features"] = list(getattr(args, "unet_features", []) or [])
+    signature["format"] = "v3-frozen-bn"
     signature["pretraining_weights"] = (getattr(args, "pretraining", None) or {}).get("weights")
     return {k: str(v) for k, v in signature.items()}
 
@@ -72,6 +82,25 @@ def save_fts_cache(cache: dict, folder, split: str, args, ctx) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({"signature": _cache_signature(args), "cache": cache}, path)
     return path
+
+
+def set_frozen_eval(core_model, trainable: tuple[str, ...]) -> None:
+    """Put every top-level module outside ``trainable`` into eval mode.
+
+    ``requires_grad_(False)`` stops gradients but not BatchNorm's running
+    statistics: those are buffers, updated on the *forward* pass whenever the
+    module is in train mode. A "frozen" detector therefore keeps drifting for
+    as long as it is still being called — and the node features cached from it
+    drift with it, so windows encoded early in an epoch disagree with those
+    encoded late.
+
+    train() recurses into children, so this has to be re-applied after every
+    model.train() call, not just once at setup.
+    """
+    keep = tuple(t.rstrip(".") for t in trainable)
+    for name, module in core_model.named_children():
+        if name not in keep:
+            module.eval()
 
 
 def loader_without_images(loader: DataLoader) -> DataLoader:
@@ -106,8 +135,8 @@ def split_frame_det(frame_det: list, b: int) -> list:
     other samples later.
     """
     return [
-        (coords[b, :n], pos[b, :n], matches[b], feat[b, :n])
-        for coords, pos, mask, matches, feat in frame_det
+        (coords[b, :n], pos[b, :n], matches[b], feat[b, :n], scores[b, :n])
+        for coords, pos, mask, matches, feat, scores in frame_det
         for n in [int(mask[b].sum())]
     ]
 
@@ -115,8 +144,9 @@ def split_frame_det(frame_det: list, b: int) -> list:
 def collate_frame_det(samples: list) -> list:
     """Inverse of ``split_frame_det``: re-pad per-sample nodes into a batch.
 
-    Returns the same ``(coords, pos_embed, mask, matches, unet_feat)`` per-frame
-    layout ``encode_nodes`` produces, padded to the widest sample of this batch.
+    Returns the same ``(coords, pos_embed, mask, matches, unet_feat, scores)``
+    per-frame layout ``encode_nodes`` produces, padded to the widest sample of
+    this batch.
     """
     frame_det = []
     for w in range(len(samples[0])):
@@ -126,16 +156,41 @@ def collate_frame_det(samples: list) -> list:
         coords = ref[0].new_zeros(shape + (3,))
         pos = ref[1].new_zeros(shape + (ref[1].shape[-1],))
         feat = ref[3].new_zeros(shape + (ref[3].shape[-1],))
+        scores = ref[4].new_zeros(shape)
         mask = torch.zeros(shape, dtype=torch.bool, device=coords.device)
         matches = []
         for b, sample in enumerate(samples):
-            c, p, m, f = sample[w]
+            c, p, m, f, sc = sample[w]
             n = c.shape[0]
-            coords[b, :n], pos[b, :n], feat[b, :n] = c, p, f
+            coords[b, :n], pos[b, :n], feat[b, :n], scores[b, :n] = c, p, f, sc
             mask[b, :n] = True
             matches.append(m)
-        frame_det.append((coords, pos, mask, matches, feat))
+        frame_det.append((coords, pos, mask, matches, feat, scores))
     return frame_det
+
+
+def filter_frame_det(frame_det: list, threshold: float) -> list:
+    """Same nodes, minus the ones scoring at or below ``threshold``.
+
+    Detection ran once at the lowest threshold, so every higher one is a subset
+    of those peaks. Re-padding the survivors gives the node set that threshold
+    would have produced, ready for another edge forward — no second UNet pass.
+    """
+    samples = []
+    for b in range(frame_det[0][0].shape[0]):
+        per_frame = []
+        for coords, pos, mask, matches, feat, scores in frame_det:
+            n = int(mask[b].sum())
+            keep = scores[b, :n] > threshold
+            per_frame.append((
+                coords[b, :n][keep],
+                pos[b, :n][keep],
+                matches[b][keep],
+                feat[b, :n][keep],
+                scores[b, :n][keep],
+            ))
+        samples.append(per_frame)
+    return collate_frame_det(samples)
 
 
 def encode_nodes(
@@ -155,8 +210,10 @@ def encode_nodes(
     """UNet encode, then peak detection and GT matching on every frame.
 
     Returns ``(frame_det, det_logits, unet_scaling)`` where ``frame_det`` holds
-    one ``(coords, pos_embed, mask, matches, unet_feat)`` tuple per frame, empty
-    when ``detect`` is False (the detection-only warmup never reads it).
+    one ``(coords, pos_embed, mask, matches, unet_feat, scores)`` tuple per
+    frame, empty when ``detect`` is False (the detection-only warmup never
+    reads it). ``scores`` is each node's detection probability, which lets a
+    higher threshold be applied later by filtering instead of re-detecting.
 
     ``nms`` defaults to the cheap max-pool path: greedy NMS costs one GPU round
     per emitted peak, which is fine once per evaluation but not per training
@@ -185,10 +242,11 @@ def encode_nodes(
                 unet_out if source == "detection" else core_model.encode_embed(imgs)
             )
 
+    probas = [logit.sigmoid() for logit in det_logits] if detect else []
     frame_det = []
     for i in range(window_size if detect else 0):
         det_coords, det_pos_embed, det_mask, matches = detect_and_match(
-            det_logits[i].sigmoid(),
+            probas[i],
             coords[:, i],
             masks[:, i],
             image_shape,
@@ -201,8 +259,8 @@ def encode_nodes(
             max_dets_per_sample=args.max_dets_per_sample,
             top_k_nodes=args.top_k_nodes,
             teacher_forcing=teacher_forcing,
-            nms=nms,
-            nms_radius_um=nms_radius_um,
+            nms=args.nms,
+            nms_radius_um=args.nms_radius_um,
         )
         unet_feat = torch.cat(
             [
@@ -211,6 +269,10 @@ def encode_nodes(
             ],
             dim=-1,
         ) if source_maps else det_coords.new_zeros(det_coords.shape[:2] + (0,))
-        frame_det.append((det_coords, det_pos_embed, det_mask, matches, unet_feat))
+        # The peak's own probability, read back off the same grid it came from.
+        det_scores = core_model._index_features(probas[i], det_coords, det_mask).squeeze(-1)
+        frame_det.append(
+            (det_coords, det_pos_embed, det_mask, matches, unet_feat, det_scores)
+        )
 
     return frame_det, det_logits, unet_scaling

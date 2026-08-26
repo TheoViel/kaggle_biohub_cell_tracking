@@ -49,6 +49,9 @@ class TrackDataset(Dataset):
         self.load_images = load_images
         self.weak_positives_cfg = weak_positives_cfg
         self._weak_cache: dict[str, torch.Tensor] = {}
+        # One npz per video, a few hundred KB each — cheaper to hold than to
+        # re-read for every window of that video.
+        self._pl_cache: dict[str, np.ndarray] = {}
         self.brightness_strength = brightness_strength
         self.max_nodes = max_nodes
         self.augment = augment
@@ -99,6 +102,54 @@ class TrackDataset(Dataset):
                 coords[f, :n] = pts[:n].float()
                 mask[f, :n] = True
         return coords, mask
+
+    def _pl_positives(
+        self,
+        sample_name: str,                 # video stem, e.g. 44b6_0113de3b
+        t_start: int,
+        n_frames: int,
+        gt_coords: torch.Tensor,          # (W, M, 3) downscaled voxels
+        gt_masks: torch.Tensor,           # (W, M) bool
+        voxel_size: tuple[float, float, float],
+    ) -> torch.Tensor:                    # (W, N, 3), -1 padded
+        """Weak positives read from a pseudo-label run instead of the image.
+
+        The predictions are a tracker's own detections, so they cover the cells
+        the annotation misses — which is exactly what the weak-positive term is
+        for. Anything within ``pl_min_gt_dist_um`` of a GT point is dropped: a
+        prediction there is that same cell, already supervised at full weight,
+        and keeping it would fight the GT target with a down-weighted duplicate.
+        """
+        folder = Path(self.weak_positives_cfg["pl_folder"])
+        coords = self._pl_cache.get(sample_name)
+        if coords is None:
+            path = folder / f"{sample_name}.npz"
+            if not path.exists():
+                raise FileNotFoundError(f"No pseudo-labels for {sample_name} at {path}")
+            # (N, 4) [t, z, y, x] at original resolution, as predict.py writes.
+            coords = np.load(path)["coords"].astype(np.float32)
+            self._pl_cache[sample_name] = coords
+
+        radius = self.weak_positives_cfg.get("pl_min_gt_dist_um", 7.0)
+        n_max = self.weak_positives_cfg["max_nodes"]
+        vs = torch.tensor(voxel_size, dtype=torch.float32)
+
+        out = torch.full((n_frames, n_max, 3), -1.0, dtype=torch.float32)
+        for f in range(n_frames):
+            pts = coords[coords[:, 0] == t_start + f][:, 1:]
+            if not len(pts):
+                continue
+            pts = torch.from_numpy(pts) / self.downscale_factor
+
+            gt = gt_coords[f][gt_masks[f]]
+            if len(gt):
+                d = torch.cdist(pts * vs, gt * vs)
+                pts = pts[d.min(dim=1).values >= radius]
+
+            n = min(len(pts), n_max)
+            if n:
+                out[f, :n] = pts[:n]
+        return out
 
     def _get_weak_positives(
         self,
@@ -181,15 +232,27 @@ class TrackDataset(Dataset):
         # Derived from the raw normalised image, before any augmentation.
         weak_coords = None
         if self.weak_positives_cfg.get("use", False):
-            weak_coords = self._get_weak_positives(
-                imgs=imgs,
-                coords=coords,
-                masks=masks,
-                spatial=coord_spatial,
-                voxel_size=voxel_size,
-                sample_name=vm.zarr_path.name,
-                frame=t_start,
-            )
+            if self.weak_positives_cfg.get("pl_folder"):
+                # A previous run's detections beat image peaks: they already
+                # know what a cell looks like.
+                weak_coords = self._pl_positives(
+                    sample_name=vm.zarr_path.stem,
+                    t_start=t_start,
+                    n_frames=W,
+                    gt_coords=coords,
+                    gt_masks=masks,
+                    voxel_size=voxel_size,
+                )
+            else:
+                weak_coords = self._get_weak_positives(
+                    imgs=imgs,
+                    coords=coords,
+                    masks=masks,
+                    spatial=coord_spatial,
+                    voxel_size=voxel_size,
+                    sample_name=vm.zarr_path.name,
+                    frame=t_start,
+                )
         else:
             # -1, not 0: a zero row is a valid coordinate, and the loss would
             # splat a phantom weak positive at the origin of every sample.

@@ -30,6 +30,7 @@ class UNetNodeTransformer(nn.Module):
         dropout: float = 0.3,
         edge_knn_k: int | None = None,
         edge_geom_feats: bool = True,
+        edge_drift_correction: bool = False,
         embed_unet: TemporalUNet3D | None = None,
         embed_unet_out_channels: int = 32,
         embed_dim: int = 32,
@@ -83,6 +84,7 @@ class UNetNodeTransformer(nn.Module):
             dropout=dropout,
             knn_k=edge_knn_k,
             use_geom_feats=edge_geom_feats,
+            drift_correction=edge_drift_correction,
         )
 
         self.verbose = verbose
@@ -193,6 +195,7 @@ def define_track_model(
     transformer_blocks: int = 4,
     edge_knn_k: int | None = None,
     edge_geom_feats: bool = True,
+    edge_drift_correction: bool = False,
     pos_feat_dim: int = 0,
     transformer_dropout: float = 0.3,
     gradient_checkpointing: bool = False,
@@ -255,6 +258,7 @@ def define_track_model(
         n_blocks=transformer_blocks,
         edge_knn_k=edge_knn_k,
         edge_geom_feats=edge_geom_feats,
+        edge_drift_correction=edge_drift_correction,
         embed_unet=embed_unet,
         embed_unet_out_channels=contrastive.get("unet_out_channels", 32),
         embed_dim=contrastive.get("embed_dim", 32),

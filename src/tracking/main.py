@@ -72,7 +72,7 @@ def build_loader(
             if n_videos is not None:
                 if len(video_data) >= n_videos:
                     break
-    
+
     dataset = TrackDataset(
         video_data,
         downscale_factor=downscale_factor,
@@ -130,6 +130,7 @@ def build_model(args, ctx):
         transformer_dropout=args.transformer_dropout,
         edge_knn_k=getattr(args, "edge_knn_k", None),
         edge_geom_feats=getattr(args, "edge_geom_feats", True),
+        edge_drift_correction=getattr(args, "edge_drift_correction", False),
         pos_feat_dim=args.pos_feat_dim,
         contrastive=getattr(args, "contrastive", None),
         unet_features=tuple(getattr(args, "unet_features", ("detection",)) or ()),
@@ -199,7 +200,9 @@ def load_weights(
 
     if ctx.is_main:
         n_backbone = sum(1 for k in current if k.startswith(prefixes))
-        print(f"- Loaded {len(to_load)}/{n_backbone} backbone tensors ({'|'.join(prefixes)}) from {path}")
+        print(
+            f"- Loaded {len(to_load)}/{n_backbone} backbone tensors ({'|'.join(prefixes)}) from {path}"
+        )
         if len(to_load) < n_backbone:
             print(f"  WARNING: {n_backbone - len(to_load)} not loaded", end="")
             print(f", {len(mismatched)} shape mismatches" if mismatched else "")
@@ -233,9 +236,6 @@ def k_fold(args, ctx) -> None:
             batch_size=args.batch_size,
             num_workers=args.num_workers,
             downscale_factor=args.downscale_factor,
-            # Transformer-only training reuses cached node features, so the
-            # images must not change between epochs — but the batch order still
-            # should, and the cache is per sample, so shuffling stays on.
             augment=not getattr(args, "transformer_only", False),
             shuffle=True,
             stable_shard=getattr(args, "transformer_only", False),
@@ -295,7 +295,7 @@ def k_fold(args, ctx) -> None:
             seg_args = copy.copy(args)
             for k, v in pretraining.items():
                 setattr(seg_args, k, v)
-            seg_args.save_every = -1  # do not save
+            seg_args.stage = "seg"
             seg_args.det_warmup_prop = 1.0
             # Stage 1 is the one stage that *does* train the detection UNet,
             # so it must not inherit stage 3's freeze-everything flag.
@@ -342,7 +342,10 @@ def k_fold(args, ctx) -> None:
         weights = contrastive.get("weights") if use_contrastive else None
         if weights:
             load_weights(
-                model, weights, fold, ctx,
+                model,
+                weights,
+                fold,
+                ctx,
                 prefixes=("embed_unet.", "embed_head."),
             )
         if use_contrastive and not weights:
@@ -355,12 +358,12 @@ def k_fold(args, ctx) -> None:
                 downscale_factor=args.downscale_factor,
                 augment=contrastive.get("augment", True),
                 video_data=train_video_data,  # save reloading the videos
-                weak_positives_cfg={},        # detection is frozen here
+                weak_positives_cfg={},  # detection is frozen here
                 brightness_strength=getattr(args, "brightness_strength", 0.0),
                 crop_size=contrastive.get("crop_size"),
                 ctx=ctx,
                 seed=getattr(args, "seed", 0),
-                stable_shard=True,            # node coords are cached per rank
+                stable_shard=True,  # node coords are cached per rank
             )
             if ctx.is_main:
                 print(
@@ -369,9 +372,14 @@ def k_fold(args, ctx) -> None:
                     f"{len(emb_loader.dataset)} windows, "
                     f"{contrastive['epochs']} epochs\n"
                 )
+            args.stage = "contrastive"
             fit_contrastive(
-                model, emb_loader, args, ctx,
-                train_sampler=emb_sampler, val_loader=val_loader,
+                model,
+                emb_loader,
+                args,
+                ctx,
+                train_sampler=emb_sampler,
+                val_loader=val_loader,
             )
             del emb_loader, emb_sampler
             if ctx.device.type == "cuda":
@@ -380,6 +388,8 @@ def k_fold(args, ctx) -> None:
         # --- Stage 3: edge transformer on frozen coordinates + embeddings ---
         if ctx.is_main:
             print("\n-> Stage 3: Edge transformer training\n")
+
+        args.stage = "edge"
 
         fit(
             model,
@@ -390,8 +400,17 @@ def k_fold(args, ctx) -> None:
             val_loader=val_loader,
         )
 
+        if ctx.is_main:
+            torch.save(
+                {"model_state_dict": unwrap_model(model).state_dict()},
+                os.path.join(fold_dir, "ckpt_final.pt"),
+            )
+
         del model, train_loader, train_sampler, val_loader
         if ctx.device.type == "cuda":
             torch.cuda.empty_cache()
 
         break
+
+    if ctx.is_main:
+        print("\nDone!")

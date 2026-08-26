@@ -42,7 +42,7 @@ def pool_kernel_from_um(
 
 
 def detect_peaks(
-    det_logit: torch.Tensor,              # (Z, Y, X) raw detection logits
+    probas: torch.Tensor,              # (Z, Y, X) raw detection logits
     pool_kernel_um: float = 3.0,
     voxel_size: tuple[float, float, float] = (1.625, 0.40625, 0.40625),
     threshold: float = 0.5,
@@ -51,7 +51,7 @@ def detect_peaks(
     """Detect local-maximum peaks in a detection logit volume.
 
     Uses max-pool NMS with a kernel sized in physical units, then keeps peaks
-    whose sigmoid probability exceeds ``threshold``.
+    whose probability exceeds ``threshold``.
 
     Returns
     -------
@@ -62,14 +62,14 @@ def detect_peaks(
         pool_kernel = pool_kernel_from_um(pool_kernel_um, voxel_size)
     pad = tuple(k // 2 for k in pool_kernel)
 
-    logits = det_logit[None, None]   # (1, 1, Z, Y, X)
-    pooled = F.max_pool3d(logits, pool_kernel, stride=1, padding=pad)
-    is_peak = (logits == pooled) & (torch.sigmoid(logits) > threshold)
+    probas_ = probas[None, None]   # (1, 1, Z, Y, X)
+    pooled = F.max_pool3d(probas_, pool_kernel, stride=1, padding=pad)
+    is_peak = (probas_ == pooled) & (probas_ > threshold)
     return torch.nonzero(is_peak[0, 0])   # (N, 3)
 
 
 def detect_peaks_greedy(
-    det_logit: torch.Tensor,              # (Z, Y, X) raw detection logits
+    probas: torch.Tensor,              # (Z, Y, X) raw detection probabilities
     voxel_size: tuple[float, float, float],
     radius_um: float = 2.5,
     threshold: float = 0.5,
@@ -83,7 +83,7 @@ def detect_peaks_greedy(
       achievable suppression widths are far apart — at a 3.25 um grid only
       3.25, 9.75, 16.25 um exist, and a 5 um request cannot be expressed.
       ``radius_um`` here is exact and continuous.
-    * ``logits == pooled`` marks every voxel of a plateau, so one flat blob
+    * ``probas == pooled`` marks every voxel of a plateau, so one flat blob
       yields a cluster of detections. Greedy NMS emits one point per
       ``radius_um`` ball instead — but only once the radius exceeds the grid
       spacing. On a 3.25 um grid a 2x2x2 plateau collapses to 8/4/2/1 points
@@ -99,22 +99,22 @@ def detect_peaks_greedy(
     torch.Tensor  shape (N, 3) int64 — detected voxel coordinates (z, y, x)
                   in the same (downsampled) grid as the input.
     """
-    above = torch.sigmoid(det_logit) > threshold
+    above = probas > threshold
     points = torch.nonzero(above)                       # (n, 3)
     if points.shape[0] == 0:
         return points
-    scores = det_logit[above]
+    scores = probas[above]
 
     if points.shape[0] > max_candidates:
         keep = scores.topk(max_candidates).indices
         points, scores = points[keep], scores[keep]
 
-    vs = torch.as_tensor(voxel_size, dtype=torch.float32, device=det_logit.device)
+    vs = torch.as_tensor(voxel_size, dtype=torch.float32, device=probas.device)
     return points[greedy_nms(points, scores, vs, radius_um)]
 
 
 def detect_cells_pooled(
-    det_logit: torch.Tensor,   # (1, Z, Y, X) or (Z, Y, X) raw logits
+    probas: torch.Tensor,   # (1, Z, Y, X) or (Z, Y, X) raw probabilities
     t: int,
     det_threshold: float = 0.5,
     nms: str = "maxpool",
@@ -132,14 +132,14 @@ def detect_cells_pooled(
     -------
     np.ndarray  (N, 4) int16 with columns [t, z, y, x] in downsampled space.
     """
-    if det_logit.dim() == 4:
-        det_logit = det_logit[0]
+    if probas.dim() == 4:
+        probas = probas[0]
 
     if nms == "greedy":
         if voxel_size is None or nms_radius_um is None:
             raise ValueError("nms='greedy' needs voxel_size and nms_radius_um")
         peak_idx = detect_peaks_greedy(
-            det_logit,
+            probas,
             voxel_size=voxel_size,
             radius_um=nms_radius_um,
             threshold=det_threshold,
@@ -148,7 +148,7 @@ def detect_cells_pooled(
         if pool_kernel is None:
             raise ValueError("nms='maxpool' needs pool_kernel")
         peak_idx = detect_peaks(
-            det_logit, threshold=det_threshold, pool_kernel=pool_kernel,
+            probas, threshold=det_threshold, pool_kernel=pool_kernel,
         )
     else:
         raise ValueError(f"unknown nms mode {nms!r}, expected 'maxpool' or 'greedy'")

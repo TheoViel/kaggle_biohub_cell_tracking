@@ -30,7 +30,7 @@ def plot_sample(sample, t_start=0, tol=2, z=None):
         if near.any():
             ax.scatter(c[near, 2], c[near, 1], c="cyan", s=50, edgecolors="white", linewidths=0.8, zorder=5)
 
-        n_weak = int(weak[i].sum())
+        n_weak = int((weak[i, :, 0] >= 0).sum())
         c = weak[i, :n_weak]   # (N, 3) in downsampled space
         near = np.abs(c[:, 0] - z) <= tol
         if near.any():

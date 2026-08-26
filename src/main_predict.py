@@ -59,6 +59,10 @@ def parse_args():
     p.add_argument("--n_videos", type=int, default=None,
                    help="cap the number of stacks (debugging)")
 
+    p.add_argument("--pl", action="store_true",
+                   help="pseudo-labelling: predict on the fold's TRAIN embryos "
+                        "instead of its val one, writing to <log_folder>/preds_pl")
+
     p.add_argument("--det_tta", action=argparse.BooleanOptionalAction,
                    default=PredictConfig.det_tta)
     p.add_argument("--det_threshold", type=float, default=PredictConfig.det_threshold)
@@ -86,17 +90,6 @@ def _predict_config(args) -> PredictConfig:
     ):
         setattr(cfg, k, getattr(args, k))
     return cfg
-
-
-def _find_checkpoint(log_folder: str, fold: int) -> str:
-    ckpts = sorted(glob.glob(os.path.join(log_folder, f"fold_{fold}", "ckpt_*.pt")))
-    if not ckpts:
-        raise FileNotFoundError(
-            f"No ckpt_*.pt under {os.path.join(log_folder, f'fold_{fold}')}"
-        )
-    # ckpt_best sorts before ckpt_final/ckpt_<step>; take the last for the
-    # most-trained weights, matching the notebook.
-    return ckpts[-1]
 
 
 def _jsonable(obj):
@@ -186,7 +179,7 @@ def main():
     device = ctx.device
 
     log_folder = args.log_folder.rstrip("/") + "/"
-    out_dir = Path(args.out_dir or (log_folder + "preds"))
+    out_dir = Path(args.out_dir or (log_folder + ("preds_pl" if args.pl else "preds")))
     if ctx.is_main:
         out_dir.mkdir(parents=True, exist_ok=True)
     if ctx.distributed:
@@ -196,34 +189,39 @@ def main():
     window_size = getattr(cfg, "window_size", 2)
     downscale_factor = getattr(cfg, "downscale_factor", 1)
 
-    # Same split logic as tracking.main.k_fold.
+    # Same split logic as tracking.main.k_fold. --pl flips it: the fold's
+    # training embryos are the ones the detector has never been scored on, and
+    # they are what a pseudo-labelling pass wants to label.
     if args.embryos:
-        val_embryos = [e.strip() for e in args.embryos.split(",") if e.strip()]
+        embryos = [e.strip() for e in args.embryos.split(",") if e.strip()]
+    elif args.pl:
+        embryos = [e for e in EMBRYOS if e != EMBRYOS[args.fold]]
     else:
-        val_embryos = [EMBRYOS[args.fold]]
+        embryos = [EMBRYOS[args.fold]]
 
     train_dir = Path(TRAIN_DIR)
-    paths = sorted(_paths_for_embryos(str(train_dir), val_embryos))
+    paths = sorted(_paths_for_embryos(str(train_dir), embryos))
     if args.n_videos is not None:
         paths = paths[: args.n_videos]
     if not paths:
-        raise ValueError(f"No datasets found for embryos {val_embryos}")
+        raise ValueError(f"No datasets found for embryos {embryos}")
 
-    ckpt_path = args.ckpt or _find_checkpoint(log_folder, args.fold)
+    ckpt_path = args.ckpt or os.path.join(log_folder, f"fold_{args.fold}", "ckpt_final.pt")
 
     if ctx.is_main:
         print(f"-> log_folder     : {log_folder}")
         print(f"-> checkpoint     : {ckpt_path}")
-        print(f"-> val embryos    : {val_embryos}  ({len(paths)} stacks)")
-        print(f"-> window_size={window_size}  downscale_factor={downscale_factor}")
-        print(f"-> writing to     : {out_dir}")
+        split = "train (pseudo-label)" if args.pl else "val"
+        print(f"-> {split} embryos : {embryos}  ({len(paths)} stacks)")
+        print(f"-> threshold       : {args.det_threshold}")
+        print(f"-> writing to      : {out_dir}")
         if ctx.distributed:
             print(f"-> distributed    : {ctx.world_size} processes\n")
 
     state = torch.load(ckpt_path, map_location="cpu")
     state = state.get("model_state_dict", state)
     state = {k.replace("unet.module.", "unet.", 1): v for k, v in state.items()}
-    cfg = _reconcile_arch(cfg, state, verbose=ctx.is_main)
+    # cfg = _reconcile_arch(cfg, state, verbose=ctx.is_main)
 
     model = build_model(cfg, None)
     model.load_state_dict(state, strict=True)
@@ -313,17 +311,20 @@ def main():
         scores = {
             "checkpoint": ckpt_path,
             "fold": args.fold,
-            "val_embryos": val_embryos,
+            "split": "train" if args.pl else "val",
+            "embryos": embryos,
             "n_samples": len(all_rows),
             "overall": _jsonable(summary),
+            "threshold": args.det_threshold,
             "per_sample": {
                 r["sample_name"]: _jsonable({k: r[k] for k in report_keys if k in r})
                 for r in sorted(all_rows, key=lambda r: r["sample_name"])
             },
         }
-        with open(Path(log_folder) / "scores.json", "w") as f:
+        scores_path = Path(log_folder) / ("scores_pl.json" if args.pl else f"scores_{args.det_threshold:.2f}.json")
+        with open(scores_path, "w") as f:
             json.dump(scores, f, indent=4)
-        print(f"-> per-sample scores: {Path(log_folder) / 'scores.json'}")
+        print(f"\n-> Saving scores to {scores_path}")
 
         print(f"\n{'=' * 60}")
         print(f"{len(all_rows)} stacks  ->  {out_dir}")

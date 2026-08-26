@@ -17,6 +17,7 @@ from tracking.fit_utils import (
     collate_frame_det,
     encode_nodes,
     fts_cache_dir,
+    set_frozen_eval,
     load_fts_cache,
     loader_without_images,
     save_fts_cache,
@@ -49,6 +50,10 @@ def fit(
     amp_dtype = torch.bfloat16 if use_bf16 else torch.float16
     core_model: UNetNodeTransformer = unwrap_model(model)
 
+    # Which of the three training stages this call is running, for the log
+    # line and the checkpoint names. k_fold sets it per stage.
+    stage = getattr(args, "stage", "edge")
+
     # Loss
     criterion = TrackingLoss(**args.loss_config)
 
@@ -62,7 +67,8 @@ def fit(
     if transformer_only:
         for name, param in core_model.named_parameters():
             param.requires_grad_(name.startswith("transformer."))
-        log("- Transformer-only: UNet + detect head frozen, node features cached")
+        set_frozen_eval(core_model, ("transformer",))
+        log(f"- Transformer-only: UNet + detect head frozen, node features cached in {cache_dir}")
         # Both UNets are frozen, so features computed by an earlier run against
         # the same weights and detection config are still exact.
         fts_cache = load_fts_cache(cache_dir, "train", args, ctx, device)
@@ -115,12 +121,13 @@ def fit(
     interval_start = time.time()
 
     global_step = 0
-    best_score = 0.0
     val_cache_saved = bool(val_fts_cache)
     total_steps = args.epochs * len(train_loader)
 
     for epoch in range(args.epochs):
         model.train()
+        if transformer_only:
+            set_frozen_eval(core_model, ("transformer",))
 
         # Once the cache covers every window this rank will ever be given, the
         # volumes are dead weight. Verified rather than assumed: a sampler that
@@ -278,7 +285,8 @@ def fit(
                     and (global_step % args.eval_every == 0 or is_last_step)
                     and val_loader is not None
                 ):
-                    val_loss, val_edge_jaccard, val_node_recall = evaluate(
+                    (val_loss, val_edge_jaccard, val_node_recall,
+                     val_adjust, val_edge_recall) = evaluate(
                         core_model,
                         val_loader,
                         args,
@@ -292,28 +300,23 @@ def fit(
                     if transformer_only and not val_cache_saved:
                         save_fts_cache(val_fts_cache, cache_dir, "val", args, ctx)
                         val_cache_saved = True
-                    if ctx.is_main:
-                        val_message = (
-                            f"   val_loss={val_loss:.4f}  "
-                            f"val_node_recall={val_node_recall:.3f}  "
-                            f"val_edge_jaccard={val_edge_jaccard:.3f}"
-                        )
-                        if val_edge_jaccard > best_score:
-                            best_score = val_edge_jaccard
-                            torch.save(
-                                {"model_state_dict": core_model.state_dict(),
-                                 "model_config": _model_config(args)},
-                                output_dir / "ckpt_best.pt",
-                            )
+                    val_message = "".join(
+                        f"  [thr {t:g}] node_rec={val_node_recall[t]:.3f}"
+                        f" adjust={val_adjust[t]:.3f}"
+                        + ("" if stage == "seg" else  f" edge_jac={val_edge_jaccard[t]:.3f}")
+                        for t in sorted(val_node_recall)
+                    )
+                    val_message = f"   val_loss={val_loss:.4f}" + val_message
+
                     model.train()
+                    if transformer_only:
+                        set_frozen_eval(core_model, ("transformer",))
 
                 # After the evaluation, so its cost shows up in the timing.
                 elapsed = time.time() - interval_start
                 log(
                     f"epoch {epoch + 1:02d}/{args.epochs:02d}  (step {global_step:05d})  "
-                    f"lr={lr_str}   loss={avg['total']:.4f}  "
-                    f"det={avg['det']:.4f}  edge={avg['edge']:.4f}  t={elapsed:.0f}s"
-                    + val_message
+                    f"lr={lr_str}  loss={avg['total']:.4f}  t={elapsed:.0f}s \t{val_message}"
                 )
                 interval_losses = {"det": 0.0, "edge": 0.0, "total": 0.0}
                 interval_steps = 0
@@ -322,17 +325,8 @@ def fit(
             if args.save_every > 0 and global_step % args.save_every == 0 and ctx.is_main:
                 torch.save(
                     {"model_state_dict": core_model.state_dict()},
-                    output_dir / f"ckpt_{global_step:05d}.pt",
+                    output_dir / f"ckpt_stage_{stage}_{global_step:05d}.pt",
                 )
-
-    if ctx.is_main and args.save_every > -1:
-        torch.save(
-            {"model_state_dict": core_model.state_dict(),
-             "model_config": _model_config(args)},
-            output_dir / "ckpt_final.pt",
-        )
-        log("\n-> Saved weights to", output_dir / "ckpt_final.pt")
-        log("\nDone!")
 
 
 def _model_config(args) -> dict:
@@ -347,6 +341,7 @@ def _model_config(args) -> dict:
         "pos_feat_dim": getattr(args, "pos_feat_dim", 0),
         "edge_knn_k": getattr(args, "edge_knn_k", None),
         "edge_geom_feats": getattr(args, "edge_geom_feats", True),
+        "edge_drift_correction": getattr(args, "edge_drift_correction", False),
         # Inference has to rebuild the same node-feature stack, which means
         # knowing whether the embedding UNet exists and how wide it is.
         "unet_features": list(getattr(args, "unet_features", ["detection"]) or []),

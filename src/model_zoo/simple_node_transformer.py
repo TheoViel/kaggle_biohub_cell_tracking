@@ -10,6 +10,61 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as grad_ckpt
 
 
+@torch.no_grad()
+def estimate_drift(
+    coords_t: torch.Tensor,    # (B, N_t, 3)   parents
+    coords_t1: torch.Tensor,   # (B, N_t1, 3)  children
+    mask_t: torch.Tensor | None,
+    mask_t1: torch.Tensor | None,
+    n_iter: int = 3,
+) -> torch.Tensor:             # (B, 3) translation carrying t onto t+1
+    """Whole-field translation between two frames, from the node sets alone.
+
+    A sample can slide bodily between frames — one video here moves a steady
+    -1.6 um in Z every single frame — which biases every distance and
+    nearest-neighbour rank the pair scorer sees. Removing it makes those
+    features describe a cell's *own* motion.
+
+    The centroid difference is the obvious estimator but it moves with whichever
+    cells entered or left the field of view. Matching each child to its nearest
+    parent and taking the median offset is insensitive to that and to the cells
+    that genuinely moved; the rounds matter because the first matching is only
+    as good as the centroid estimate that seeded it.
+
+    Works in grid voxels, which the detection grid makes isotropic (see
+    _knn_keep), so no physical scaling is needed — and by the same token the
+    estimate is quantised to whole voxels.
+    """
+    zero = coords_t.new_zeros(coords_t.shape[0], 3)
+    if coords_t.shape[1] == 0 or coords_t1.shape[1] == 0:
+        return zero
+
+    if mask_t is None:
+        mask_t = torch.ones(coords_t.shape[:2], dtype=torch.bool, device=coords_t.device)
+    if mask_t1 is None:
+        mask_t1 = torch.ones(coords_t1.shape[:2], dtype=torch.bool, device=coords_t1.device)
+
+    src, tgt = coords_t.float(), coords_t1.float()
+    wt, wt1 = mask_t.unsqueeze(-1).float(), mask_t1.unsqueeze(-1).float()
+    drift = (
+        (tgt * wt1).sum(1) / wt1.sum(1).clamp(min=1)
+        - (src * wt).sum(1) / wt.sum(1).clamp(min=1)
+    )                                                        # (B, 3) centroid seed
+
+    for _ in range(n_iter):
+        dist = torch.cdist(tgt - drift.unsqueeze(1), src)     # (B, N_t1, N_t)
+        dist = dist.masked_fill(~mask_t.unsqueeze(1), float("inf"))
+        nn = dist.argmin(dim=-1, keepdim=True).expand(-1, -1, 3)
+        offset = tgt - src.gather(1, nn)                      # (B, N_t1, 3)
+        # Padded children must not vote; NaN drops out of nanmedian.
+        offset = offset.masked_fill(~mask_t1.unsqueeze(-1), float("nan"))
+        drift = torch.nanmedian(offset, dim=1).values.nan_to_num()
+
+    # A frame with no nodes on either side has nothing to align.
+    empty = (mask_t.sum(1) == 0) | (mask_t1.sum(1) == 0)
+    return drift.masked_fill(empty.unsqueeze(-1), 0.0)
+
+
 class CrossAttentionBlock(nn.Module):
     """A single cross-attention block with MLP and residual connections."""
 
@@ -97,11 +152,13 @@ class SimpleNodeTransformer(nn.Module):
         pair_chunk_size: int | None = 32,
         knn_k: int | None = None,
         use_geom_feats: bool = True,
+        drift_correction: bool = False,
     ):
         super().__init__()
         self.pair_chunk_size = pair_chunk_size
         self.knn_k = knn_k
         self.use_geom_feats = use_geom_feats
+        self.drift_correction = drift_correction
         # feat_dim == 0 is a supported configuration (unet_features=[]): every
         # node token is then just this layer's bias, and geometry alone drives
         # the pair scores. Torch warns that initialising the zero-element
@@ -256,6 +313,13 @@ class SimpleNodeTransformer(nn.Module):
             feat_t1 = feat_t1.unsqueeze(0)
             coords_t = coords_t.unsqueeze(0)
             coords_t1 = coords_t1.unsqueeze(0)
+
+        if self.drift_correction:
+            # Carry the parents into the children's frame, so every geometry
+            # feature below describes motion relative to the field, not the
+            # field's own translation.
+            drift = estimate_drift(coords_t, coords_t1, mask_t, mask_t1)
+            coords_t = coords_t + drift.unsqueeze(1)
 
         q = self.norm_in(self.proj(feat_t))   # (B, N_t, hidden)
         k = self.norm_in(self.proj(feat_t1))  # (B, N_t1, hidden)

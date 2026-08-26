@@ -114,6 +114,71 @@ def _evaluate_matched_graph(
     return edge_attrs
 
 
+def _mark_gt_matched_edges(
+    graph: td.graph.BaseGraph,
+    gt_graph: td.graph.BaseGraph,
+    key: str = td.DEFAULT_ATTR_KEYS.MATCHED_EDGE_MASK,
+) -> None:
+    """Flag every GT edge with whether the prediction reproduced it.
+
+    ``graph.match`` writes its edge mask onto the *predicted* graph only, so
+    the false negatives — the GT links nothing was predicted for — are left
+    implicit in a count. Replaying the same source/target join in the GT
+    direction makes them addressable per edge, which is what a viewer or an
+    error breakdown needs.
+
+    *graph* must already have been matched against *gt_graph*; without the
+    node matching there is nothing to join on and every GT edge stays False.
+    """
+    edge_ids = gt_graph.edge_ids()
+    if key not in gt_graph.edge_attr_keys():
+        gt_graph.add_edge_attr_key(key, pl.Boolean, default_value=False)
+    elif len(edge_ids) > 0:
+        # The update below only ever writes True, so a previous evaluation's
+        # flags would otherwise survive into this one.
+        gt_graph.update_edge_attrs(edge_ids=edge_ids, attrs={key: False})
+
+    if len(edge_ids) == 0 or graph.num_edges() == 0:
+        return
+    if td.DEFAULT_ATTR_KEYS.MATCHED_NODE_ID not in graph.node_attr_keys():
+        return
+
+    node_attrs = graph.node_attrs(
+        attr_keys=[td.DEFAULT_ATTR_KEYS.NODE_ID, td.DEFAULT_ATTR_KEYS.MATCHED_NODE_ID]
+    ).filter(
+        pl.col(td.DEFAULT_ATTR_KEYS.MATCHED_NODE_ID).is_not_null()
+        & (pl.col(td.DEFAULT_ATTR_KEYS.MATCHED_NODE_ID) != -1)
+    )
+    gt_to_pred = dict(
+        zip(
+            node_attrs[td.DEFAULT_ATTR_KEYS.MATCHED_NODE_ID].to_list(),
+            node_attrs[td.DEFAULT_ATTR_KEYS.NODE_ID].to_list(),
+        )
+    )
+    if not gt_to_pred:
+        return
+
+    gt_edges = gt_graph.edge_attrs(attr_keys=[])
+    gt_edges = gt_edges.with_columns(
+        gt_edges[col].map_elements(gt_to_pred.get, return_dtype=pl.Int64).alias(col)
+        for col in (td.DEFAULT_ATTR_KEYS.EDGE_SOURCE, td.DEFAULT_ATTR_KEYS.EDGE_TARGET)
+    )
+    # unique(): a duplicated predicted edge must not multiply the join, the
+    # same way _evaluate_matched_graph dedups before counting the intersection.
+    pred_pairs = graph.edge_attrs(attr_keys=[]).select(
+        td.DEFAULT_ATTR_KEYS.EDGE_SOURCE, td.DEFAULT_ATTR_KEYS.EDGE_TARGET
+    ).unique()
+
+    matched_ids = gt_edges.join(
+        pred_pairs,
+        on=[td.DEFAULT_ATTR_KEYS.EDGE_SOURCE, td.DEFAULT_ATTR_KEYS.EDGE_TARGET],
+        how="inner",
+    )[td.DEFAULT_ATTR_KEYS.EDGE_ID].unique().to_list()
+
+    if matched_ids:
+        gt_graph.update_edge_attrs(edge_ids=matched_ids, attrs={key: True})
+
+
 def _compute_score(
     edge_attrs: pl.DataFrame,
     gt_num_edges: int,
@@ -203,7 +268,10 @@ def evaluate(
         The predicted graph. Matching attributes are written onto *graph*
         as a side effect.
     gt_graph : tracksdata.graph.BaseGraph
-        The ground truth graph.
+        The ground truth graph. Its edges gain a
+        ``DEFAULT_ATTR_KEYS.MATCHED_EDGE_MASK`` attribute as a side effect —
+        True where the prediction reproduced that link, False for the false
+        negatives.
     scale : tuple[float, ...] | None, optional
         Physical scale for each spatial dimension (e.g., (z, y, x)) to
         account for anisotropy. If None, assumes isotropic data.
@@ -218,6 +286,7 @@ def evaluate(
 
     # Match graph against gt_graph (in place); discard the returned score.
     _evaluate(graph, gt_graph, "jaccard", scale, max_distance)
+    _mark_gt_matched_edges(graph, gt_graph)
 
     if graph.num_edges() == 0:
         edge_tp = 0
@@ -259,8 +328,8 @@ def evaluate_datasets(
     Parameters
     ----------
     graph_pairs : list of (pred_graph, gt_graph)
-        Predicted / ground-truth graph pairs. Each *pred_graph* is mutated
-        in place by matching (same side effect as :func:`evaluate`).
+        Predicted / ground-truth graph pairs. Both graphs of each pair are
+        mutated in place by matching (same side effect as :func:`evaluate`).
     scale : tuple[float, ...] | None, optional
         Physical voxel scale used for centroid-distance matching.
     max_distance : float, optional
