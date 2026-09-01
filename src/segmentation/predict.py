@@ -1,146 +1,125 @@
-"""
-Inference + post-processing for the 3D cell segmentation model.
+"""Inference for the 3D Cellpose segmenter, on real frames.
 
-Post-processing pipeline:
-1. Threshold sigmoid(fg_logits) → foreground binary mask
-2. Accumulate centroid votes: for each fg voxel, predict centroid = voxel + offset * (D/2, H/2, W/2)
-3. Smooth vote map and find local maxima → candidate cell centres
-4. Assign each fg voxel to its nearest centre → instance mask
+Real volumes are (64, 256, 256) and the backbone's stride chain divides that
+exactly, so a frame goes through in one piece and there is no tiling seam to
+reconcile. If one ever does not fit in memory, note that flows are a local
+field -- a halo of a cell radius would do for the overlap -- but trajectories
+are *not* local: a voxel near a seam can walk out of its tile. Reconstruction
+would still have to run on the reassembled volume, never per tile.
+
+The architecture is rebuilt from the ``unet_*`` entries a run recorded in its
+``args.json``, the same names ``main_track.py`` uses.
 """
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
 import numpy as np
 import torch
-from pathlib import Path
-from scipy.ndimage import gaussian_filter, maximum_filter, label as scipy_label
 
-from segmentation.post_process import postprocess
-from model_zoo.models_seg import CELL_SEG_HEADS, define_model
+from model_zoo.models_flow import FLOW_HEADS, define_flow_model
+from segmentation.dynamics import masks_from_flows
+from tracking.data import resolve_normalization
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+IMAGE_FOLDER = PROJECT_ROOT / "input" / "processed" / "images"
+NODES_FOLDER = PROJECT_ROOT / "input" / "processed" / "nodes"
+SCALE = np.array([1.625, 0.40625, 0.40625], np.float32)
 
 
-def sigmoid(x):
-    return 1.0 / (1.0 + np.exp(-x))
-
-
-def load_model(
-    checkpoint_path,
-    in_channels=1,
-    device='cuda',
-    decoder_name='Unet',
-    encoder_name='resnet18',
-):
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-
-    # Checkpoints written by train.py carry the architecture they were built with
-    config = ckpt.get('model_config', {})
-    model = define_model(
-        decoder_name=config.get('decoder_name', decoder_name),
-        encoder_name=config.get('encoder_name', encoder_name),
-        n_channels=config.get('in_channels', in_channels),
-        pretrained=False,
-        heads=CELL_SEG_HEADS,
-        use_3d=True,
+def build_model(cfg: dict, device="cuda"):
+    """Rebuild the architecture a run recorded in its ``args.json``."""
+    keys = (
+        "unet_arch", "unet_out_channels", "unet_layers", "unet_pool_stride",
+        "unet_n_anisotropic", "unet_n_decode_steps", "unet_temporal_attention",
+        "unet_blocks_per_stage", "unet_stem", "unet_norm", "unet_hires_fusion",
+        "in_channels",
     )
-    model.load_state_dict(ckpt['model_state_dict'])
-    return model.to(device).eval()
+    kwargs = {k: cfg[k] for k in keys if k in cfg}
+    for k in ("unet_layers", "unet_pool_stride", "unet_blocks_per_stage"):
+        if kwargs.get(k) is not None:
+            kwargs[k] = tuple(kwargs[k])
+    kwargs["dropout"] = cfg.get("head_dropout", 0.0)
+    return define_flow_model(**kwargs, heads=FLOW_HEADS).to(device)
 
-def _pad_to_multiple(x, multiple=16):
-    """Pad spatial dims to the next multiple so the U-Net stride chain works."""
-    D, H, W = x.shape[-3:]
-    pd = (-D) % multiple
-    ph = (-H) % multiple
-    pw = (-W) % multiple
-    if pd or ph or pw:
-        x = torch.nn.functional.pad(x, (0, pw, 0, ph, 0, pd))
-    return x, (D, H, W)
+
+def load_model(log_folder, checkpoint=None, device="cuda", fold=0):
+    """Rebuild the model recorded in a run's ``args.json`` and load weights."""
+    log_folder = Path(log_folder)
+    cfg = json.load(open(log_folder / "args.json"))
+    model = build_model(cfg, device)
+    if checkpoint is None:
+        # main_seg writes checkpoints into the log folder itself; the tracking
+        # runs use a fold_N subfolder, so both layouts are accepted.
+        found = sorted(log_folder.glob("ckpt_*.pt")) or sorted(
+            (log_folder / f"fold_{fold}").glob("ckpt_*.pt")
+        )
+        if not found:
+            raise FileNotFoundError(f"no ckpt_*.pt under {log_folder}")
+        checkpoint = [f for f in found if f.name == "ckpt_final.pt"] or found
+        checkpoint = checkpoint[-1]
+    state = torch.load(checkpoint, map_location=device, weights_only=False)
+    model.load_state_dict(state.get("model_state_dict", state))
+    return model.eval(), cfg
+
+
+def normalize(volume: np.ndarray, normalization: dict | None = None) -> np.ndarray:
+    """Quantile normalisation, the convention the model was trained under.
+
+    Quantiles are taken per frame. Training crops are normalised by their own
+    quantiles, so a per-frame reference is the closest match; the tracking
+    loader's per-*video* statistics would put the model on a slightly different
+    intensity scale than it ever saw.
+    """
+    norm = resolve_normalization(normalization)
+    raw = volume.astype(np.float32)
+    lo = float(np.quantile(raw, float(norm["low_q"])))
+    hi = float(np.quantile(raw, float(norm["high_q"])))
+    return np.clip((raw - lo) / (hi - lo + 1e-6), 0.0, float(norm["clamp_max"]))
 
 
 @torch.no_grad()
-def predict_volume(model, data, use_cellpose=False, device='cuda'):
-    """
-    Run inference on a single 3D image array.
-
-    Args:
-        img_array: (D, H, W) uint16 or float32 in any range
-        device: torch device string
-
-    Returns dict with keys: fg_logits, heatmap_logits, offsets — all numpy (D, H, W) / (3, D, H, W).
-    """
-    img = data['img'].astype(np.float32)
-    if img.max() > 1.0:
-        img /= 65535.0
-
-    if use_cellpose:
-        flows = data['flows']
-        probas = sigmoid(data['probas'])
-        # img = np.stack([img, probas], axis=0)
-        img = probas[None]
-    else:
-        img = img[None]
-
-    print(img.min(), img.max())
-
-    x = torch.from_numpy(img[None]).to(device)   # (1, c, D, H, W)
-    x_padded, orig_shape = _pad_to_multiple(x)
-
-    with torch.amp.autocast('cuda'):
-        preds = model(x_padded)
-
-    D, H, W = orig_shape
-    return {
-        'fg_logits': preds['fg_logits'][0, 0, :D, :H, :W].float().cpu().numpy(),
-        'heatmap_logits': preds['heatmap_logits'][0, 0, :D, :H, :W].float().cpu().numpy(),
-        'offsets': preds['offsets'][0, :, :D, :H, :W].float().cpu().numpy(),  # (3, D, H, W)
-    }
-
-# ---------------------------------------------------------------------------
-# Convenience wrapper
-# ---------------------------------------------------------------------------
-
-def run(checkpoint_path, npz_path, output_path=None, device='cuda', **postprocess_kwargs):
-    """
-    Load model, run on an npz file, and optionally save results.
-
-    Returns: (masks, centroids, preds)
-    """
-    model = load_model(checkpoint_path, device=device)
-    data = np.load(npz_path)
-    preds = predict_volume(model, data['img'], device=device)
-    masks, centroids = postprocess(preds, **postprocess_kwargs)
-
-    if output_path is not None:
-        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(
-            output_path,
-            masks=masks,
-            centroids=centroids,
-            fg_prob=sigmoid(preds['fg_logits']),
-            heatmap=sigmoid(preds['heatmap_logits']),
-        )
-
-    return masks, centroids, preds
+def predict_volume(model, volume, normalization=None, device="cuda", amp=True,
+                   already_normalized=False):
+    """One volume -> ``(cellprob, flows)`` as numpy, at full resolution."""
+    img = volume if already_normalized else normalize(volume, normalization)
+    x = torch.from_numpy(np.ascontiguousarray(img))[None, None].to(device).float()
+    with torch.amp.autocast("cuda", enabled=amp and device.startswith("cuda")):
+        out = model(x)
+    cellprob = torch.sigmoid(out["cellprob_logits"][0, 0].float()).cpu().numpy()
+    flows = out["flows"][0].float().cpu().numpy()
+    return cellprob, flows
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-if __name__ == '__main__':
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument('checkpoint')
-    parser.add_argument('npz_path')
-    parser.add_argument('--output', default=None)
-    parser.add_argument('--fg_thresh', type=float, default=0.5)
-    parser.add_argument('--vote_sigma', type=float, default=2.0)
-    parser.add_argument('--nms_size', type=int, default=7)
-    parser.add_argument('--device', default='cuda')
-    args = parser.parse_args()
-
-    masks, centroids, _ = run(
-        args.checkpoint, args.npz_path, args.output,
-        device=args.device,
-        fg_thresh=args.fg_thresh,
-        vote_sigma=args.vote_sigma,
-        nms_size=args.nms_size,
+def segment_volume(model, volume, normalization=None, device="cuda",
+                   return_masks=False, **dynamics_kwargs):
+    """Volume -> ``(centroids, cellprob, flows, instance_masks)``."""
+    cellprob, flows = predict_volume(model, volume, normalization, device)
+    instance, centroids = masks_from_flows(
+        cellprob, flows, device=device, return_masks=return_masks, **dynamics_kwargs
     )
-    print(f"Found {len(centroids)} cells | mask shape {masks.shape} | unique IDs {masks.max()}")
+    return centroids, cellprob, flows, instance
+
+
+def frame_path(sample: str, t: int) -> Path:
+    return IMAGE_FOLDER / f"{sample}_{t}.npy"
+
+
+def load_frame(sample: str, t: int) -> np.ndarray:
+    return np.load(frame_path(sample, t))
+
+
+def gt_nodes(sample: str, t: int | None = None) -> np.ndarray:
+    """Annotated cell centres for a sample, as (N, 3) z/y/x voxel coordinates.
+
+    The real ground truth is sparse -- a few percent of the cells -- so this is
+    a recall reference, never a precision one.
+    """
+    import pandas as pd
+
+    df = pd.read_csv(NODES_FOLDER / f"{sample}.csv")
+    if t is not None:
+        df = df[df["t"] == t]
+    return df[["z", "y", "x"]].to_numpy(np.float32)

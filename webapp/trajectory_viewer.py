@@ -18,14 +18,14 @@ the view stays on them.
 
 import base64
 import io
-import json
 import sys
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import tracksdata as td
+import zarr
 from matplotlib.colors import to_rgb
 from PIL import Image
 from scipy.spatial import cKDTree
@@ -34,13 +34,15 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from params import SCALE  # noqa: E402
-from utils.build_graph import link_frames  # noqa: E402
 from utils.metrics import match_frame_nodes  # noqa: E402
 
-IMAGE_DIR = ROOT / "input" / "processed" / "images"
-NODE_DIR = ROOT / "input" / "processed" / "nodes"
-EDGE_DIR = ROOT / "input" / "processed" / "edges"
+TRAIN_DIR = ROOT / "input" / "train"
+OUTPUT_DIR = ROOT / "output"
+PREDICTIONS_DIR = OUTPUT_DIR / "predictions"
 
+# Radius, in microns, within which a prediction counts as having found a
+# ground-truth cell. The same value tracking_cellmot.metrics.evaluate matches
+# at, so the rings drawn here mean what the score means.
 MAX_MATCH_DISTANCE = 7.0
 
 # How big the view is, in pixels, and how the page splits between it and the
@@ -52,9 +54,9 @@ DISPLAY_SHARE = (3, 1)
 LEGEND_PIXELS = 190
 
 _OF_460_PIXELS = VIEW_PIXELS / 460
-# Wider than a prediction, so that the two stay apart when one sits on the other.
-GT_MARKER = 11 * _OF_460_PIXELS
 PRED_MARKER = 7 * _OF_460_PIXELS
+# Same size as a matched prediction, so the ring sits right on top of its dot.
+GT_MARKER = PRED_MARKER
 FAINT_MARKER = 4 * _OF_460_PIXELS
 RING_WIDTH = 1.2 * _OF_460_PIXELS
 DOT_WIDTH = 0.8 * _OF_460_PIXELS
@@ -69,7 +71,6 @@ GT_UNMATCHED_EDGE = "darkred"
 PRED_MATCHED = "skyblue"
 PRED_MATCHED_EDGE = "dodgerblue"
 PRED_UNMATCHED = "orangered"
-OTHER_FOLDERS = ("gold", "violet", "darkorange", "aqua")
 
 # What became of a ground-truth edge, in the colours utils.plot uses for the
 # same verdicts, so a colour means the same thing here as in the notebook.
@@ -77,61 +78,123 @@ VERDICT_COLORS = {
     "correct": "limegreen",
     "wrong partner": "orangered",
     "no link": "goldenrod",
-    "undetected": "slategray",
+    "undetected": "orangered",
     "unjudged": "limegreen",
 }
 WRONG_LINK = "darkorange"
 
 
 @st.cache_data(show_spinner=False)
-def list_samples():
-    """Sample names that have both a stack and ground-truth nodes."""
-    stacks = {path.name.rsplit("_", 1)[0] for path in IMAGE_DIR.glob("*.npy")}
-    labelled = {path.stem for path in NODE_DIR.glob("*.csv")}
-    return sorted(stacks & labelled) or sorted(stacks)
+def list_all_samples():
+    """Sample names that have a stack, whether or not anything is predicted for them."""
+    return sorted(path.stem for path in TRAIN_DIR.glob("*.zarr"))
+
+
+@st.cache_data(show_spinner=False)
+def list_experiments():
+    """Experiment names, the subfolders of output/predictions holding *.geff predictions."""
+    return sorted(
+        path.name for path in PREDICTIONS_DIR.glob("*")
+        if path.is_dir() and any(path.glob("*.geff"))
+    )
+
+
+@st.cache_data(show_spinner=False)
+def list_samples(experiment):
+    """Sample names an experiment has predictions for, that also have a stack."""
+    predicted = {path.stem for path in (PREDICTIONS_DIR / experiment).glob("*.geff")}
+    return sorted(predicted & set(list_all_samples()))
 
 
 @st.cache_data(show_spinner=False)
 def list_frames(sample):
     """Timepoints available for a sample."""
-    return sorted(int(path.stem.rsplit("_", 1)[1]) for path in IMAGE_DIR.glob(f"{sample}_*.npy"))
+    return list(range(load_stack(sample).shape[0]))
 
 
 @st.cache_data(show_spinner=False)
-def list_prediction_folders():
-    """Folders holding predicted_nodes_*.json, as paths relative to the repository."""
-    folders = {
-        path.parent.relative_to(ROOT).as_posix()
-        for path in ROOT.glob("*/predicted_nodes_*.json")
-    }
-    folders |= {
-        path.parent.relative_to(ROOT).as_posix()
-        for path in ROOT.glob("*/*/predicted_nodes_*.json")
-    }
-    return sorted(folders | {"output"})
+def load_stack(sample):
+    """The whole (t, z, y, x) stack for a sample, loaded into memory once."""
+    group = zarr.open_group(TRAIN_DIR / f"{sample}.zarr", mode="r")
+    return np.asarray(group["0"])
 
 
-@st.cache_data(show_spinner=False)
 def load_volume(sample, t):
-    """The (z, y, x) stack of one timepoint."""
-    return np.load(IMAGE_DIR / f"{sample}_{t}.npy")
+    """The (z, y, x) stack of one timepoint, sliced out of the in-memory stack."""
+    return load_stack(sample)[t]
 
 
 @st.cache_data(show_spinner=False)
-def contrast_limits(sample, t, low=0.01, high=0.999):
+def contrast_limits(sample, low=0.01, high=0.999):
     """Display range from quantiles, since the raw range is set by a few bright voxels."""
-    flat = load_volume(sample, t).ravel()[::10]
+    quantiles = zarr.open_group(TRAIN_DIR / f"{sample}.zarr", mode="r").attrs.get(
+        "image_statistics", {}
+    ).get("quantiles", {})
+    limits = [next((float(v) for k, v in quantiles.items() if abs(float(k) - q) < 1e-6), None)
+              for q in (low, high)]
+    if all(limit is not None for limit in limits):
+        return tuple(limits)
+    flat = load_stack(sample).ravel()[::50]
     return float(np.quantile(flat, low)), float(np.quantile(flat, high))
 
 
-@st.cache_data(show_spinner=False)
-def load_predictions(folder, sample):
-    """{t: (n, 3) centres as (z, y, x)} from a folder's predicted_nodes file."""
-    path = ROOT / folder / f"predicted_nodes_{sample}.json"
+def _load_geff(path):
+    """A geff's graph, or None if there is nothing at that path."""
     if not path.exists():
-        return {}
-    raw = json.load(open(path))
-    return {int(t): np.asarray(centres, dtype=float).reshape(-1, 3) for t, centres in raw.items()}
+        return None
+    result = td.graph.IndexedRXGraph.from_geff(path)
+    return result[0] if isinstance(result, tuple) else result
+
+
+@st.cache_data(show_spinner=False)
+def load_prediction_graph(experiment, sample):
+    """An experiment's predicted graph: where its cells are, and how it linked them.
+
+    Returns the centres keyed by timepoint, the (timepoint, row) each node id
+    occupies in them, and the edges as (source id, target id, probability).
+
+    The edges are read off the geff rather than re-derived from the centres.
+    They are what the metric scores, so linking the centres afresh here would
+    draw a different tracker than the one being measured — which is precisely
+    how the view came to disagree with the numbers.
+    """
+    if not experiment:
+        return {}, {}, np.empty((0, 3))
+    graph = _load_geff(PREDICTIONS_DIR / experiment / f"{sample}.geff")
+    if graph is None:
+        return {}, {}, np.empty((0, 3))
+
+    centres, row_of = {}, {}
+    for (t,), frame in graph.node_attrs().group_by("t"):
+        centres[int(t)] = frame.select("z", "y", "x").to_numpy()
+        for row, node in enumerate(frame["node_id"].to_list()):
+            row_of[int(node)] = (int(t), row)
+
+    if graph.num_edges() == 0:
+        return centres, row_of, np.empty((0, 3))
+
+    edges = graph.edge_attrs()
+    # A geff written by a linker that keeps no score still has edges worth
+    # drawing; they are simply all equally confident.
+    probability = (
+        edges["edge_prob"].to_numpy().astype(float)
+        if "edge_prob" in edges.columns
+        else np.ones(len(edges))
+    )
+    return centres, row_of, np.stack(
+        [
+            edges["source_id"].to_numpy().astype(float),
+            edges["target_id"].to_numpy().astype(float),
+            probability,
+        ],
+        axis=1,
+    )
+
+
+@st.cache_data(show_spinner=False)
+def load_predictions(experiment, sample):
+    """{t: (n, 3) centres as (z, y, x)} from an experiment's geff file."""
+    return load_prediction_graph(experiment, sample)[0]
 
 
 @st.cache_data(show_spinner=False)
@@ -142,33 +205,43 @@ def load_ground_truth(sample):
     id, the node ids present at each timepoint in the same order as the centres,
     and each node's parent.
     """
-    node_path = NODE_DIR / f"{sample}.csv"
-    if not node_path.exists():
+    graph = _load_geff(TRAIN_DIR / f"{sample}.geff")
+    if graph is None:
         # Test-split samples have a stack but nothing annotated on it.
         return {}, {}, {}, {}
 
-    nodes = pd.read_csv(node_path)
+    nodes = graph.node_attrs()
     centres, ids = {}, {}
-    for t, frame in nodes.groupby("t"):
-        centres[int(t)] = frame[["z", "y", "x"]].to_numpy(dtype=float)
+    for (t,), frame in nodes.group_by("t"):
+        centres[int(t)] = frame.select("z", "y", "x").to_numpy()
         ids[int(t)] = frame["node_id"].to_numpy()
 
     position = {
-        int(row.node_id): np.array([row.z, row.y, row.x], dtype=float)
-        for row in nodes.itertuples()
+        int(row["node_id"]): np.array([row["z"], row["y"], row["x"]], dtype=float)
+        for row in nodes.iter_rows(named=True)
     }
 
-    parent = {}
-    edge_path = EDGE_DIR / f"{sample}.csv"
-    if edge_path.exists():
-        edges = pd.read_csv(edge_path)
-        parent = dict(zip(edges["target_id"].astype(int), edges["source_id"].astype(int)))
+    edges = graph.edge_attrs()
+    parent = dict(zip(edges["target_id"].to_list(), edges["source_id"].to_list()))
 
     return centres, position, ids, parent
 
 
 @st.cache_data(show_spinner=False)
-def split_by_match(folder, sample, t):
+def truth_frames(sample):
+    """Timepoints that have at least one annotated ground-truth cell."""
+    return sorted(t for t, centres in load_ground_truth(sample)[0].items() if len(centres))
+
+
+@st.cache_data(show_spinner=False)
+def truth_zs(sample, t):
+    """z slices holding an annotated cell at t."""
+    centres = load_ground_truth(sample)[0].get(t, np.empty((0, 3)))
+    return sorted({int(round(z)) for z in centres[:, 0]})
+
+
+@st.cache_data(show_spinner=False)
+def split_by_match(experiment, sample, t):
     """Ground-truth and predicted centres of one timepoint, split into matched and not.
 
     The ground truth is sparse, so most predictions are unmatched simply because
@@ -176,9 +249,9 @@ def split_by_match(folder, sample, t):
     cell was missed.
     """
     truth = load_ground_truth(sample)[0].get(t, np.empty((0, 3)))
-    seeds = load_predictions(folder, sample).get(t, np.empty((0, 3)))
+    seeds = load_predictions(experiment, sample).get(t, np.empty((0, 3)))
     if len(truth) == 0 or len(seeds) == 0:
-        return np.empty((0, 3)), truth, seeds, np.empty((0, 3))
+        return np.empty((0, 3)), truth, np.empty((0, 3)), seeds
 
     _, matched_gt, unmatched_gt = match_frame_nodes(
         seeds, truth, t=t, scale=SCALE, max_distance=MAX_MATCH_DISTANCE
@@ -198,27 +271,49 @@ def split_by_match(folder, sample, t):
 
 
 @st.cache_data(show_spinner=False)
-def parents_of_frame(folder, sample, t):
-    """For each cell at t + 1, the index of the cell at t it came from, or -1.
+def predicted_links(experiment, sample):
+    """The predicted edges as, per timepoint, the parent of each cell in it.
 
-    This runs the same linker the graph is built with, one frame pair at a time
-    so that scrubbing through t only ever pays for the pair it just reached.
+    Keyed by the *child* timepoint: ``parents[t][i]`` is the row at t - 1 that
+    cell i of frame t was linked to, or -1 where nothing linked to it, and
+    ``probability[t][i]`` is that link's score.
+
+    Built in one pass over the edge list rather than per frame pair: the whole
+    graph is already in memory, and walking it once per timepoint would make
+    scrubbing t quadratic. A cell given more than one parent keeps the most
+    confident of them, which is the one a single trail can honestly draw.
     """
-    predictions = load_predictions(folder, sample)
-    here, there = predictions.get(t), predictions.get(t + 1)
-    if here is None or there is None or len(here) == 0 or len(there) == 0:
-        return np.full(0 if there is None else len(there), -1, dtype=int)
+    centres, row_of, edges = load_prediction_graph(experiment, sample)
+    parents = {t: np.full(len(c), -1, dtype=int) for t, c in centres.items()}
+    probability = {t: np.zeros(len(c)) for t, c in centres.items()}
 
-    links, _ = link_frames(here, there, max_distance=MAX_MATCH_DISTANCE, scale=SCALE)
-    parent = np.full(len(there), -1, dtype=int)
-    for source, target in links:
-        parent[target] = source
-    return parent
+    for source, target, prob in edges:
+        parent_at = row_of.get(int(source))
+        child_at = row_of.get(int(target))
+        if parent_at is None or child_at is None:
+            continue
+        t, row = child_at
+        # Only consecutive frames: a gap-closing edge has no frame pair to be
+        # drawn on, and stepping over it would draw a trail through a cell
+        # that was never there.
+        if parent_at[0] != t - 1:
+            continue
+        if parents[t][row] < 0 or prob > probability[t][row]:
+            parents[t][row] = parent_at[1]
+            probability[t][row] = prob
+
+    return parents, probability
 
 
-def predicted_trails(folder, sample, t, length, keep):
+def parents_of_frame(experiment, sample, t):
+    """For each cell at t + 1, the index of the cell at t it came from, or -1."""
+    parents = predicted_links(experiment, sample)[0]
+    return parents.get(t + 1, np.empty(0, dtype=int))
+
+
+def predicted_trails(experiment, sample, t, length, keep):
     """Where each of the kept cells at t was over the previous frames."""
-    predictions = load_predictions(folder, sample)
+    predictions = load_predictions(experiment, sample)
     centres = predictions.get(t)
     if centres is None or length < 1:
         return []
@@ -229,7 +324,7 @@ def predicted_trails(folder, sample, t, length, keep):
         earlier = t - step - 1
         if earlier < 0 or earlier not in predictions or not alive:
             break
-        parent = parents_of_frame(folder, sample, earlier)
+        parent = parents_of_frame(experiment, sample, earlier)
         moved = {}
         for start, current in alive.items():
             if current < len(parent) and parent[current] >= 0:
@@ -241,7 +336,7 @@ def predicted_trails(folder, sample, t, length, keep):
 
 
 @st.cache_data(show_spinner=False)
-def detections_of_truth(folder, sample, t):
+def detections_of_truth(experiment, sample, t):
     """For each ground-truth cell at t, the prediction that found it, or -1.
 
     Which cells count as found is decided by the same assignment split_by_match
@@ -250,8 +345,8 @@ def detections_of_truth(folder, sample, t):
     """
     truth = load_ground_truth(sample)[0].get(t, np.empty((0, 3)))
     found = np.full(len(truth), -1, dtype=int)
-    matched_gt = split_by_match(folder, sample, t)[0]
-    seeds = load_predictions(folder, sample).get(t, np.empty((0, 3)))
+    matched_gt = split_by_match(experiment, sample, t)[0]
+    seeds = load_predictions(experiment, sample).get(t, np.empty((0, 3)))
     if len(found) == 0 or len(matched_gt) == 0 or len(seeds) == 0:
         return found
 
@@ -264,31 +359,35 @@ def detections_of_truth(folder, sample, t):
     return found
 
 
-def _verdict(folder, sample, t, parent_row, child_row):
+def _verdict(experiment, sample, t, parent_row, child_row):
     """What became of one ground-truth edge, in the words of utils.plot.link_errors.
 
     Returns the verdict, and where we linked the parent instead when we linked
     it somewhere: an edge is only wrong in a way worth drawing if there is
     another edge to draw in its place.
     """
-    found_parent = detections_of_truth(folder, sample, t)[parent_row]
-    found_child = detections_of_truth(folder, sample, t + 1)[child_row]
+    found_parent = detections_of_truth(experiment, sample, t)[parent_row]
+    found_child = detections_of_truth(experiment, sample, t + 1)[child_row]
     if found_parent < 0 or found_child < 0:
         return "undetected", None
 
-    children = np.flatnonzero(parents_of_frame(folder, sample, t) == found_parent)
+    children = np.flatnonzero(parents_of_frame(experiment, sample, t) == found_parent)
     if found_child in children:
         return "correct", None
     if len(children) == 0:
         return "no link", None
 
-    predictions = load_predictions(folder, sample)
+    # Where a division was predicted, draw the arm we were most sure of.
+    probability = predicted_links(experiment, sample)[1].get(t + 1)
+    instead = children[int(np.argmax(probability[children]))]
+
+    predictions = load_predictions(experiment, sample)
     return "wrong partner", np.stack(
-        [predictions[t][found_parent], predictions[t + 1][children[0]]]
+        [predictions[t][found_parent], predictions[t + 1][instead]]
     )
 
 
-def truth_trails(folder, sample, t, length, keep):
+def truth_trails(experiment, sample, t, length, keep):
     """The ground-truth lineages behind the kept cells, every step of them judged.
 
     A step of a lineage is a ground-truth edge, and its colour says what we made
@@ -319,13 +418,13 @@ def truth_trails(folder, sample, t, length, keep):
             step = np.stack([position[source], position[child]])
             (source_t, source_row) = row_of.get(source, (None, None))
             (child_t, _) = row_of.get(child, (None, None))
-            if folder is None:
+            if experiment is None:
                 segments["unjudged"].append(step)
             elif source_t is None or child_t != source_t + 1:
                 # An edge spanning a gap in the annotation was never ours to get.
                 segments["undetected"].append(step)
             else:
-                kind, instead = _verdict(folder, sample, source_t, source_row, row_of[child][1])
+                kind, instead = _verdict(experiment, sample, source_t, source_row, row_of[child][1])
                 segments[kind].append(step)
                 if instead is not None:
                     wrong.append(instead)
@@ -360,7 +459,7 @@ def slice_png(sample, t, z):
     down the wire on every move of a slider instead of a quarter of a megabyte,
     which is the difference between a view that keeps up and one that stutters.
     """
-    low, high = contrast_limits(sample, t)
+    low, high = contrast_limits(sample)
     plane = load_volume(sample, t)[z].astype(np.float32)
     grey = np.clip((plane - low) / max(high - low, 1e-6), 0.0, 1.0)
     buffer = io.BytesIO()
@@ -406,10 +505,10 @@ def _trails(figure, paths, colour, name=None, alpha=0.45, width=TRAIL_WIDTH):
     )
 
 
-def busiest_slice(folders, sample, t, depth):
+def busiest_slice(experiment, sample, t, depth):
     """A z worth opening on: the middle of wherever the cells are, not of the stack."""
-    for folder in folders:
-        centres = load_predictions(folder, sample).get(t)
+    if experiment is not None:
+        centres = load_predictions(experiment, sample).get(t)
         if centres is not None and len(centres):
             return int(np.clip(np.median(centres[:, 0]), 0, depth - 1))
     centres = load_ground_truth(sample)[0].get(t)
@@ -418,17 +517,16 @@ def busiest_slice(folders, sample, t, depth):
     return depth // 2
 
 
-def render(sample, folders, t, z, tol, trail, show_truth, show_trails):
+def render(sample, experiment, t, z, tol, trail, show_truth, show_trails):
     """Draw one slice with everything asked for on top of it."""
     height, width = load_volume(sample, t).shape[1:]
     figure = go.Figure()
 
-    reference = folders[0] if folders else None
     counts = {}
 
-    if show_truth and reference is not None:
+    if show_truth and experiment is not None:
         matched_gt, unmatched_gt, matched_pred, unmatched_pred = split_by_match(
-            reference, sample, t
+            experiment, sample, t
         )
         counts["gt matched"] = len(matched_gt)
         counts["gt missed"] = len(unmatched_gt)
@@ -442,10 +540,10 @@ def render(sample, folders, t, z, tol, trail, show_truth, show_trails):
                     size=GT_MARKER, width=RING_WIDTH)
 
         keep, fade = _near(unmatched_pred, z, tol)
-        _points(figure, unmatched_pred, keep, fade * 0.35, f"{reference} unmatched",
+        _points(figure, unmatched_pred, keep, fade * 0.35, f"{experiment} unmatched",
                 face=PRED_UNMATCHED, edge="red", size=FAINT_MARKER)
         keep, fade = _near(matched_pred, z, tol)
-        _points(figure, matched_pred, keep, fade, f"{reference} matched",
+        _points(figure, matched_pred, keep, fade, f"{experiment} matched",
                 face=PRED_MATCHED, edge=PRED_MATCHED_EDGE, size=PRED_MARKER)
     else:
         # Nothing to match against, or nothing to match: draw what there is.
@@ -455,37 +553,29 @@ def render(sample, folders, t, z, tol, trail, show_truth, show_trails):
             _points(figure, centres, keep, fade, "GT", face=GT_MATCHED,
                     edge=GT_MATCHED_EDGE, size=GT_MARKER, width=RING_WIDTH)
             counts["gt"] = len(centres)
-        if reference is not None:
-            centres = load_predictions(reference, sample).get(t, np.empty((0, 3)))
+        if experiment is not None:
+            centres = load_predictions(experiment, sample).get(t, np.empty((0, 3)))
             keep, fade = _near(centres, z, tol)
-            _points(figure, centres, keep, fade, reference, face=PRED_MATCHED,
+            _points(figure, centres, keep, fade, experiment, face=PRED_MATCHED,
                     edge=PRED_MATCHED_EDGE, size=PRED_MARKER)
 
-    # Any further folder is drawn plainly, in its own colour, for comparison.
-    for folder, colour in zip(folders[1:], OTHER_FOLDERS):
-        centres = load_predictions(folder, sample).get(t, np.empty((0, 3)))
-        keep, fade = _near(centres, z, tol)
-        _points(figure, centres, keep, fade, folder, face=colour, edge="white",
-                size=PRED_MARKER)
-        counts[folder] = len(keep)
-
     if show_trails:
-        annotated = bool(load_ground_truth(sample)[0])
-        for folder, colour in zip(folders, (PRED_MATCHED_EDGE, *OTHER_FOLDERS)):
-            centres = load_predictions(folder, sample).get(t, np.empty((0, 3)))
+        if experiment is not None:
+            annotated = bool(load_ground_truth(sample)[0])
+            centres = load_predictions(experiment, sample).get(t, np.empty((0, 3)))
             keep, _ = _near(centres, z, tol)
             if annotated:
                 # Only the cells that found an annotated one: the rest are so
                 # many that their tracks bury the slice.
-                found = detections_of_truth(folder, sample, t)
+                found = detections_of_truth(experiment, sample, t)
                 keep = np.intersect1d(keep, found[found >= 0])
-            _trails(figure, predicted_trails(folder, sample, t, trail, keep), colour,
-                    name=f"{folder} track")
+            _trails(figure, predicted_trails(experiment, sample, t, trail, keep), PRED_MATCHED_EDGE,
+                    name=f"{experiment} track")
 
         if show_truth:
             centres = load_ground_truth(sample)[0].get(t, np.empty((0, 3)))
             keep, _ = _near(centres, z, tol)
-            judged, instead = truth_trails(reference, sample, t, trail, keep)
+            judged, instead = truth_trails(experiment, sample, t, trail, keep)
             for kind, segments in judged.items():
                 _trails(
                     figure, segments, VERDICT_COLORS[kind],
@@ -570,7 +660,7 @@ def _stepper(label, options, default, key, back, forward):
 
 
 @st.fragment
-def view(sample, folders, frames, depth, tol, trail, show_truth, show_trails):
+def view(sample, experiment, frames, depth, tol, trail, show_truth, show_trails):
     """The stack and the two sliders that move through it.
 
     A fragment, so that moving a slider reruns this and nothing else: the page
@@ -586,11 +676,26 @@ def view(sample, folders, frames, depth, tol, trail, show_truth, show_trails):
         # the stack before it.
         t = _stepper("t", frames, frames[0], f"t {sample}", "Left", "Right")
         z = _stepper(
-            "z", list(range(depth)), busiest_slice(folders, sample, frames[0], depth),
+            "z", list(range(depth)), busiest_slice(experiment, sample, frames[0], depth),
             f"z {sample}", "Down", "Up",
         )
 
-    figure, counts = render(sample, folders, t, z, tol, trail, show_truth, show_trails)
+        st.markdown("#### Ground truth")
+        gt_frames = truth_frames(sample)
+        if gt_frames:
+            st.caption(
+                f"t with GT ({len(gt_frames)}/{len(frames)}): "
+                + ", ".join(map(str, gt_frames))
+            )
+            gt_zs = truth_zs(sample, t)
+            st.caption(
+                f"z with GT at t={t}: " + ", ".join(map(str, gt_zs))
+                if gt_zs else f"No GT at t={t}."
+            )
+        else:
+            st.caption("No ground truth for this sample.")
+
+    figure, counts = render(sample, experiment, t, z, tol, trail, show_truth, show_trails)
 
     with display:
         st.plotly_chart(
@@ -614,28 +719,29 @@ def main():
         "<style>.block-container {padding-top: 1rem;}</style>", unsafe_allow_html=True
     )
 
-    samples = list_samples()
-    if not samples:
-        st.error(f"No stacks found under {IMAGE_DIR}.")
-        return
-
     with st.sidebar:
-        st.header("Sample")
-        with_predictions = [s for s in samples if (ROOT / "output" / f"predicted_nodes_{s}.json").exists()]
-        sample = st.selectbox(
-            "sample_name", samples,
-            index=samples.index(with_predictions[0]) if with_predictions else 0,
-        )
-
         st.header("Predictions")
-        folders = st.multiselect(
-            "folders", list_prediction_folders(), default=["output"],
-            help="The first one is the reference: the ground truth is matched against it "
-                 "and its cells are split into matched and unmatched. The rest are drawn plainly.",
-        )
-        missing = [f for f in folders if not (ROOT / f / f"predicted_nodes_{sample}.json").exists()]
-        if missing:
-            st.warning(f"No predictions for {sample} in: {', '.join(missing)}")
+        experiments = list_experiments()
+        experiment = None
+        if experiments:
+            experiment = st.selectbox(
+                "experiment", experiments,
+                help="Predictions come from output/predictions/<experiment>/<sample>.geff. "
+                     "The ground truth is matched against it and its cells split into "
+                     "matched and unmatched.",
+            )
+        else:
+            st.warning(f"No experiments found under {PREDICTIONS_DIR}.")
+
+        st.header("Sample")
+        samples = list_samples(experiment) if experiment else list_all_samples()
+        if not samples:
+            st.error(
+                f"No samples with predictions in {experiment}." if experiment
+                else f"No stacks found under {TRAIN_DIR}."
+            )
+            return
+        sample = st.selectbox("sample_name", samples)
 
         st.header("Display")
         tol = st.slider("z tolerance (slices)", 0, 10, 3,
@@ -646,7 +752,7 @@ def main():
 
     frames = list_frames(sample)
     depth = load_volume(sample, frames[0]).shape[0]
-    view(sample, folders, frames, depth, tol, trail, show_truth, show_trails)
+    view(sample, experiment, frames, depth, tol, trail, show_truth, show_trails)
 
 
 if __name__ == "__main__":

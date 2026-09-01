@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
 import numpy as np
 import polars as pl
@@ -113,6 +114,40 @@ def detect_peaks_greedy(
     return points[greedy_nms(points, scores, vs, radius_um)]
 
 
+def _peak_indices(
+    probas: torch.Tensor,   # (Z, Y, X) raw probabilities
+    threshold: float,
+    nms: str = "maxpool",
+    pool_kernel: tuple[int, ...] | None = None,
+    voxel_size: tuple[float, float, float] | None = None,
+    nms_radius_um: float | None = None,
+) -> torch.Tensor:
+    """Run the configured NMS, returning (N, 3) peak voxel coordinates."""
+    if nms == "greedy":
+        if voxel_size is None or nms_radius_um is None:
+            raise ValueError("nms='greedy' needs voxel_size and nms_radius_um")
+        return detect_peaks_greedy(
+            probas,
+            voxel_size=voxel_size,
+            radius_um=nms_radius_um,
+            threshold=threshold,
+        )
+    if nms == "maxpool":
+        if pool_kernel is None:
+            raise ValueError("nms='maxpool' needs pool_kernel")
+        return detect_peaks(probas, threshold=threshold, pool_kernel=pool_kernel)
+    raise ValueError(f"unknown nms mode {nms!r}, expected 'maxpool' or 'greedy'")
+
+
+def _stamp_time(peak_idx: torch.Tensor, t: int) -> np.ndarray:
+    """Prefix (N, 3) peak coordinates with their frame index."""
+    if peak_idx.shape[0] == 0:
+        return np.empty((0, 4), dtype=np.int16)
+    coords = peak_idx.float().cpu().numpy()
+    t_col = np.full((len(coords), 1), t, dtype=np.float32)
+    return np.concatenate([t_col, coords], axis=1).astype(np.int16)
+
+
 def detect_cells_pooled(
     probas: torch.Tensor,   # (1, Z, Y, X) or (Z, Y, X) raw probabilities
     t: int,
@@ -135,30 +170,56 @@ def detect_cells_pooled(
     if probas.dim() == 4:
         probas = probas[0]
 
-    if nms == "greedy":
-        if voxel_size is None or nms_radius_um is None:
-            raise ValueError("nms='greedy' needs voxel_size and nms_radius_um")
-        peak_idx = detect_peaks_greedy(
-            probas,
-            voxel_size=voxel_size,
-            radius_um=nms_radius_um,
-            threshold=det_threshold,
-        )
-    elif nms == "maxpool":
-        if pool_kernel is None:
-            raise ValueError("nms='maxpool' needs pool_kernel")
-        peak_idx = detect_peaks(
-            probas, threshold=det_threshold, pool_kernel=pool_kernel,
-        )
-    else:
-        raise ValueError(f"unknown nms mode {nms!r}, expected 'maxpool' or 'greedy'")
+    peak_idx = _peak_indices(
+        probas, det_threshold, nms=nms, pool_kernel=pool_kernel,
+        voxel_size=voxel_size, nms_radius_um=nms_radius_um,
+    )
+    return _stamp_time(peak_idx, t)
 
+
+def detect_cells_multi_threshold(
+    probas: torch.Tensor,   # (1, Z, Y, X) or (Z, Y, X) raw probabilities
+    t: int,
+    thresholds: Sequence[float],
+    nms: str = "maxpool",
+    pool_kernel: tuple[int, ...] | None = None,
+    voxel_size: tuple[float, float, float] | None = None,
+    nms_radius_um: float | None = None,
+) -> dict[float, np.ndarray]:
+    """``detect_cells_pooled`` at several thresholds, for the price of the lowest.
+
+    Both NMS modes nest exactly across thresholds, so one pass at the lowest one
+    answers all of them:
+
+    * max-pool keeps ``(probas == pooled) & (probas > threshold)``, and being a
+      local maximum does not depend on the threshold at all.
+    * greedy NMS walks candidates in descending score, so every peak above a
+      higher threshold is visited — and accepted or suppressed identically —
+      before any candidate that only the lower threshold admits. Its result at
+      the lower threshold therefore contains the higher one's as a prefix.
+
+    Filtering by score is thus exact, not an approximation. That matters most
+    for greedy NMS, which costs a GPU round per emitted peak.
+
+    Returns
+    -------
+    dict  threshold -> (N, 4) int16 array with columns [t, z, y, x], as
+    ``detect_cells_pooled`` returns.
+    """
+    if probas.dim() == 4:
+        probas = probas[0]
+    if not len(thresholds):
+        return {}
+
+    peak_idx = _peak_indices(
+        probas, min(thresholds), nms=nms, pool_kernel=pool_kernel,
+        voxel_size=voxel_size, nms_radius_um=nms_radius_um,
+    )
     if peak_idx.shape[0] == 0:
-        return np.empty((0, 4), dtype=np.int16)
+        return {th: np.empty((0, 4), dtype=np.int16) for th in thresholds}
 
-    coords = peak_idx.float().cpu().numpy()
-    t_col = np.full((len(coords), 1), t, dtype=np.float32)
-    return np.concatenate([t_col, coords], axis=1).astype(np.int16)
+    scores = probas[peak_idx[:, 0], peak_idx[:, 1], peak_idx[:, 2]]
+    return {th: _stamp_time(peak_idx[scores > th], t) for th in thresholds}
 
 
 def build_graph(

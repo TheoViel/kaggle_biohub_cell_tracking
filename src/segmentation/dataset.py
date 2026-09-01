@@ -1,120 +1,245 @@
-import os
-import torch
-import numpy as np
+"""Training data for the 3D Cellpose model: the synthetic static volumes.
 
-from tqdm import tqdm
+Only the *static* volumes carry instance masks -- ``generate_sequence`` saves
+nodes and edges but no per-voxel labels -- so they are what a flow model can be
+trained on at all. There are few of them and each is large, so an epoch is
+defined as a number of random crops rather than a pass over the files.
+
+The one thing worth care here is that flows are a *vector* field. Flipping the
+image and forgetting to negate the matching flow component trains the model
+against itself: the picture says the centre is to the left and the target says
+it is to the right. Geometric augmentation is therefore restricted to the
+axis-aligned operations whose effect on a vector is exact -- flips, and
+rotations in the y/x plane. An arbitrary affine would have to rotate the
+vectors as well as resample them, and interpolating a rotated unit field
+quietly shortens it wherever neighbouring vectors disagree.
+
+Rotations stay inside y/x on purpose: a voxel is 1.625 um in z against 0.40625
+in y/x, so turning z into y would claim the microscope sampled four times finer
+than it did.
+"""
+
+from __future__ import annotations
+
 from pathlib import Path
+
+import numpy as np
+import torch
 from torch.utils.data import Dataset
-from joblib import Parallel, delayed
 
-from .targets import compute_all_targets
-from data.transforms import augment_seg, random_crop_seg
+from data.transforms import (
+    background_level_augment,
+    blur_augment,
+    brightness_augment,
+    lowres_augment,
+)
+from segmentation.flows import FLOW_SCALE, masks_to_flows
+from tracking.data import resolve_normalization
+from tqdm import tqdm
+
+VOXEL_UM = (1.625, 0.40625, 0.40625)
+
+AUG_DEFAULTS = {
+    "flip_p": 0.5,
+    "rot90_p": 0.5,
+    "blur_p": 0.2,
+    "blur_sigma_um": 1.0,
+    "lowres_p": 0.2,
+    "lowres_max_factor": 2.0,
+    "brightness_p": 0.3,
+    "brightness_strength": 0.1,
+    "bg_level_p": 0.3,
+    "bg_level_range": (0.03, 0.30),
+}
 
 
-class CellSegDataset(Dataset):
+def flow_cache_path(volume_path: str | Path) -> Path:
+    p = Path(volume_path)
+    return p.with_name(p.stem + "_flows.npz")
+
+
+def build_flow_cache(volume_path, mode="diffusion", overwrite=False,
+                     device="auto") -> Path:
+    """Compute and store the flow field for one static volume.
+
+    Done once per volume rather than per crop: the diffusion is ``n_iter``
+    passes over the whole volume and there is no point repeating it every
+    epoch. Flows are stored as float16 -- they are unit vectors, so the range
+    is known and the precision costs about a thousandth of a voxel in
+    direction. ``savez`` rather than ``savez_compressed``: the field is
+    high-entropy noise to a compressor, so zipping it buys a few percent and
+    costs more than the diffusion did.
     """
-    Loads npz files produced by the cellpose preprocessing pipeline.
+    out = flow_cache_path(volume_path)
+    if out.exists() and not overwrite:
+        return out
+    with np.load(volume_path) as d:
+        masks = d["mask"].astype(np.int32)
+    cellprob, flows = masks_to_flows(masks, mode=mode, device=device)
+    np.savez(out, cellprob=cellprob.astype(np.uint8), flows=flows.astype(np.float16))
+    return out
 
-    Each npz must contain:
-        img     : (D, H, W) uint16
-        masks   : (D, H, W) uint16  instance labels
-        probas  : (D, H, W) float32 cellpose foreground logits
 
-    Training targets are derived on-the-fly:
-        fg       : sigmoid(probas) — foreground probability in [0, 1]
-        heatmap  : Gaussian blobs at mask-derived cell centers
-        offsets  : per-voxel normalized offset to nearest cell centroid
-        fg_mask  : bool mask where masks > 0 (for offset loss)
+def _rot90_yx(img, cellprob, flows, k):
+    """Rotate by ``k`` right angles in y/x, turning the flow vectors with it.
+
+    ``torch.rot90`` sends the point (y, x) to (N-1-x, y), so a displacement
+    (dy, dx) becomes (-dx, dy). Applying that k times is the whole correction.
+    """
+    k %= 4
+    if k == 0:
+        return img, cellprob, flows
+    img = torch.rot90(img, k, dims=(-2, -1))
+    cellprob = torch.rot90(cellprob, k, dims=(-2, -1))
+    flows = torch.rot90(flows, k, dims=(-2, -1))
+    for _ in range(k):
+        fy, fx = flows[1].clone(), flows[2].clone()
+        flows[1], flows[2] = -fx, fy
+    return img, cellprob, flows
+
+
+def _flip(img, cellprob, flows, axis):
+    """Mirror along one axis; the flow component along it changes sign."""
+    img = torch.flip(img, dims=(axis,))
+    cellprob = torch.flip(cellprob, dims=(axis,))
+    flows = torch.flip(flows, dims=(axis + 1,))
+    flows[axis] = -flows[axis]
+    return img, cellprob, flows
+
+
+class SyntheticStaticDataset(Dataset):
+    """Random crops of the synthetic static volumes, with Cellpose targets.
+
+    Args:
+        data_dir: dataset root, e.g. ``../input/synthetic/v3``. Reads
+            ``static/vol_*.npz``.
+        crop_size: (D, H, W) crop, or None for the whole volume.
+        epoch_size: crops per epoch. With only a handful of volumes on disk,
+            a pass over the files is far too short to be an epoch.
+        flow_mode: passed to ``masks_to_flows`` when building the cache.
+        normalization: the tracking pipeline's quantile normalisation, so the
+            model sees the same intensity convention it will meet on real data.
     """
 
-    def __init__(self, data_dir, sigma=3.0, augment=True, patch_size=None, use_cellpose=False):
+    def __init__(
+        self,
+        data_dir,
+        crop_size=(32, 128, 128),
+        epoch_size=2000,
+        augment=True,
+        flow_mode="diffusion",
+        normalization: dict | None = None,
+        aug_cfg: dict | None = None,
+    ):
+        root = Path(data_dir)
+        # The flow caches live beside the volumes and match "vol_*.npz" too.
         self.files = [
-            str(file) for file in sorted(Path(data_dir).glob('*.npz')) if "targets" not in str(file)
+            f for f in sorted((root / "static").glob("vol_*.npz"))
+            if not f.stem.endswith("_flows")
         ]
         if not self.files:
-            raise FileNotFoundError(f"No *.npz files found in {data_dir}")
-        self.sigma = sigma
+            raise FileNotFoundError(f"no static/vol_*.npz under {root}")
+        self.crop_size = tuple(crop_size) if crop_size else None
+        self.epoch_size = int(epoch_size)
         self.augment = augment
-        self.patch_size = patch_size  # (pd, ph, pw) or None for full volume
-        self.use_cellpose = use_cellpose
+        self.flow_mode = flow_mode
+        self.aug = {**AUG_DEFAULTS, **(aug_cfg or {})}
 
-    def __len__(self):
-        return len(self.files)
+        norm = resolve_normalization(normalization)
+        self.low_q = float(norm["low_q"])
+        self.high_q = float(norm["high_q"])
+        self.clamp_max = float(norm["clamp_max"])
 
-    def precompute_targets(self):
-        self.targets = {}
-        def _compute_target_for_file(path, sigma):
-            if os.path.exists(path[:-4] + "_targets.npz"):
-                return
-            heatmap, offsets, centroid_map = compute_all_targets(
-                np.load(path)["masks"], sigma=sigma
-            )
-            np.savez_compressed(
-                path[:-4] + "_targets.npz",
-                heatmap=np.array(heatmap),
-                offsets=np.array(offsets),
-                centroid_map_keys=np.array(list(centroid_map.keys())),
-                centroid_map_values=np.array(list(centroid_map.values())),
-            )
-            return
+    def __len__(self) -> int:
+        return self.epoch_size
 
-        Parallel(n_jobs=8, backend="loky")(
-            delayed(_compute_target_for_file)(file, self.sigma)
-            for file in tqdm(self.files)
+    def prepare(self, overwrite=False, n_jobs=8, device="auto"):
+        """Build every flow cache up front.
+
+        On a GPU this runs in one process: the diffusion is already ~50x faster
+        there than on a core, and eight workers would only queue up on the same
+        device while each holding its own CUDA context. Processes are for the
+        CPU path, where they do help.
+        """
+        todo = [f for f in self.files if overwrite or not flow_cache_path(f).exists()]
+        if not todo:
+            return []
+
+        use_gpu = device.startswith("cuda") or (
+            device == "auto" and torch.cuda.is_available()
+        )
+        if use_gpu:
+            return [
+                build_flow_cache(f, self.flow_mode, overwrite, device)
+                for f in tqdm(todo, desc="flow cache (gpu)")
+            ]
+
+        from joblib import Parallel, delayed
+
+        return Parallel(n_jobs=n_jobs)(
+            delayed(build_flow_cache)(f, self.flow_mode, overwrite, "cpu")
+            for f in tqdm(todo, desc="flow cache (cpu)")
         )
 
-    def __getitem__(self, idx):
-        data = np.load(self.files[idx])
+    def _load(self, idx):
+        path = self.files[idx]
+        cache = flow_cache_path(path)
+        if not cache.exists():
+            build_flow_cache(path, self.flow_mode)
+        with np.load(path) as d:
+            volume = d["volume"]
+        with np.load(cache) as d:
+            return volume, d["cellprob"], d["flows"]
 
-        img = data['img'].astype(np.float32) / 65535.0
-        masks = data['masks']
+    def __getitem__(self, _idx):
+        rng = np.random.default_rng()
+        volume, cellprob, flows = self._load(int(rng.integers(len(self.files))))
 
-        sigmoid = lambda x: 1.0 / (1.0 + np.exp(-x))
-        if self.use_cellpose:
-            probas = sigmoid(data['probas'])
-            # flows = data['flows'].transpose(3, 0, 1, 2)
-            # flows = (flows / 255).astype(np.float32)
+        if self.crop_size is not None:
+            shape = volume.shape
+            lo = [int(rng.integers(0, max(1, s - c + 1)))
+                  for s, c in zip(shape, self.crop_size)]
+            sl = tuple(slice(l, l + c) for l, c in zip(lo, self.crop_size))
+            volume = volume[sl]
+            cellprob = cellprob[sl]
+            flows = flows[(slice(None),) + sl]
 
-            # img = np.stack([img, probas], axis=0)
-            img = probas[None]  # cellpose probas
-            fg_mask = (probas > 0.4)
-        else:
-            img = img[None]
-            fg_mask = (masks > 0)
-
-        fg_target = fg_mask.astype(np.float32)
-
-        try:
-            targets = np.load(self.files[idx][:-4] + "_targets.npz")
-            heatmap = targets["heatmap"]
-            offsets = targets["offsets"]
-            # centroid_map = {k: v for k, v in zip(targets["centroid_map_keys"], targets["centroid_map_values"])}
-        except FileNotFoundError:
-            heatmap, offsets, centroid_map = compute_all_targets(
-                masks, sigma=self.sigma,
-            )
-            np.savez_compressed(
-                self.files[idx][:-4] + "_targets.npz",
-                heatmap=np.array(heatmap),
-                offsets=np.array(offsets),
-                centroid_map_keys=np.array(list(centroid_map.keys())),
-                centroid_map_values=np.array(list(centroid_map.values())),
-            )
-
-        if self.patch_size is not None:
-            img, fg_target, heatmap, offsets, fg_mask = random_crop_seg(
-                img, fg_target, heatmap, offsets, fg_mask, self.patch_size
-            )
+        raw = volume.astype(np.float32)
+        # Quantiles over the crop, matching what the real loader does per video.
+        lo_v = float(np.quantile(raw, self.low_q))
+        hi_v = float(np.quantile(raw, self.high_q))
+        img = torch.from_numpy((raw - lo_v) / (hi_v - lo_v + 1e-6)).clamp(0, self.clamp_max)
+        cellprob = torch.from_numpy(np.ascontiguousarray(cellprob)).float()
+        flows = torch.from_numpy(np.ascontiguousarray(flows)).float()
 
         if self.augment:
-            img, fg_target, heatmap, offsets, fg_mask = augment_seg(
-                img, fg_target, heatmap, offsets, fg_mask
-            )
+            img, cellprob, flows = self._augment(img, cellprob, flows, rng)
 
         return {
-            'image': torch.from_numpy(img),                 # (1, D, H, W)
-            'fg': torch.from_numpy(fg_target),              # (D, H, W)
-            'heatmap': torch.from_numpy(heatmap),           # (D, H, W)
-            'offsets': torch.from_numpy(offsets),           # (3, D, H, W)
-            'fg_mask': torch.from_numpy(fg_mask),           # (D, H, W) bool
+            "image": img[None],                     # (1, D, H, W)
+            "cellprob": cellprob,                   # (D, H, W) in {0, 1}
+            "flows": flows * FLOW_SCALE,            # (3, D, H, W)
         }
+
+    def _augment(self, img, cellprob, flows, rng):
+        a = self.aug
+        for axis in range(3):
+            if rng.random() < a["flip_p"]:
+                img, cellprob, flows = _flip(img, cellprob, flows, axis)
+        if rng.random() < a["rot90_p"]:
+            img, cellprob, flows = _rot90_yx(
+                img, cellprob, flows, int(rng.integers(1, 4))
+            )
+
+        # Photometric only from here: these never move a voxel, so the flow
+        # field is untouched and stays consistent with the image.
+        w = img[None]
+        if rng.random() < a["blur_p"]:
+            w = blur_augment(w, rng, VOXEL_UM, a["blur_sigma_um"])
+        if rng.random() < a["lowres_p"]:
+            w = lowres_augment(w, rng, a["lowres_max_factor"])
+        if rng.random() < a["bg_level_p"]:
+            w = background_level_augment(w, rng, a["bg_level_range"], self.clamp_max)
+        if rng.random() < a["brightness_p"]:
+            w = brightness_augment(w, rng, a["brightness_strength"])
+        return w[0].clamp(0, self.clamp_max), cellprob, flows

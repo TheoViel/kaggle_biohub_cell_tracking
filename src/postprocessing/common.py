@@ -54,14 +54,22 @@ def load_prediction(path: Path | None = None):
     return coords, edges
 
 
-def load_gt():
-    """The ground-truth graph and the sample's estimated total node count."""
-    result = td.graph.IndexedRXGraph.from_geff(Path(TRAIN_DIR) / f"{SAMPLE}.geff")
+def load_gt_graph(sample: str):
+    """The ground-truth graph and the sample's estimated total node count.
+
+    Matching mutates the graph, so load a fresh one per scored candidate.
+    """
+    result = td.graph.IndexedRXGraph.from_geff(Path(TRAIN_DIR) / f"{sample}.geff")
     gt_graph = result[0] if isinstance(result, tuple) else result
 
     meta = pd.read_csv("../input/metadata.csv")
-    n_total = float(meta.loc[meta["sample_name"] == SAMPLE, "estimated_number_of_nodes"].iloc[0])
+    n_total = float(meta.loc[meta["sample_name"] == sample, "estimated_number_of_nodes"].iloc[0])
     return gt_graph, n_total
+
+
+def load_gt():
+    """``load_gt_graph`` for the sample under study."""
+    return load_gt_graph(SAMPLE)
 
 
 def to_graph(coords, edges):

@@ -1,6 +1,8 @@
 import matplotlib.pyplot as plt
 import numpy as np
 
+from utils.plot import scatter_by_depth
+
 
 def plot_offsets(offsets, z=32):
     dz_n, dy_n, dx_n = offsets[0], offsets[1], offsets[2]  # normalised, (D,H,W)
@@ -118,14 +120,9 @@ def plot_preds(
     axes[pred_row, 1].imshow(pm, cmap="nipy_spectral", alpha=0.6, interpolation="none")
     # overlay predicted centroids in this slice
     if pred_centroids is not None and len(pred_centroids):
-        in_slice = pred_centroids[np.abs(pred_centroids[:, 0] - z) <= 2]
-        axes[pred_row, 1].scatter(
-            in_slice[:, 2],
-            in_slice[:, 1],
-            c="yellow",
-            s=30,
-            marker="x",
-            linewidths=1.5,
+        scatter_by_depth(
+            axes[pred_row, 1], pred_centroids, z, "yellow", tol=2,
+            facecolor="yellow", s=30, marker="x", linewidths=1.5,
             label="pred centres",
         )
     axes[pred_row, 1].set_title("Pred instance masks")

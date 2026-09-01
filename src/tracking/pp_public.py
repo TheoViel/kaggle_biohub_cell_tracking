@@ -8,7 +8,6 @@ import json
 from pathlib import Path
 import csv
 import pandas as pd
-from IPython.display import display
 
 
 SUBMISSION_COLUMNS = ["dataset", "row_type", "node_id", "t", "z", "y", "x", "source_id", "target_id"]

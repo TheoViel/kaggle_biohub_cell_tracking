@@ -67,6 +67,10 @@ def parse_args():
     p.add_argument("--geff", default=None,
                    help="also write a geff into this directory, for the viewer")
 
+    p.add_argument("--no-recentre", action="store_true",
+                   help="skip the grid-centring correction. It is applied only "
+                        "to npz files that still need it, detected from the "
+                        "coordinates, so this is rarely what you want")
     p.add_argument("--no-pipeline", action="store_true",
                    help="skip the re-linking and short-track pruning")
     p.add_argument("--no-pp-public", action="store_true",
@@ -118,7 +122,8 @@ def main():
 
     stages = []
     if not args.no_pipeline:
-        stages.append(("pipeline", lambda c, e: run_pipeline(c, e)))
+        recentre = None if args.no_recentre else "auto"
+        stages.append(("pipeline", lambda c, e: run_pipeline(c, e, recentre=recentre)))
     if not args.no_pp_public:
         stages.append(("pp_public(tuned)",
                        lambda c, e: run_pp_public(c, e, sample=sample, **PP_PUBLIC_TUNED)))
@@ -138,7 +143,8 @@ def main():
     out_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         out_path,
-        coords=np.asarray(coords, dtype=np.int16),
+        # round, not truncate — see stages.run_pp_public.
+        coords=np.round(np.asarray(coords, dtype=np.float64)).astype(np.int16),
         edges=np.asarray(edges, dtype=np.float64).reshape(-1, 4),
     )
     print(f"\n-> wrote {out_path}")

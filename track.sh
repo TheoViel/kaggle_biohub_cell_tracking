@@ -6,4 +6,8 @@ set -e
 
 cd src
 
-torchrun --standalone --nproc_per_node=8 main_track.py
+torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node=8 main_track.py
+
+
+# torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node=8 main_track.py
+

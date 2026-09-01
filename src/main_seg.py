@@ -23,35 +23,56 @@ from utils.logger import create_logger, prepare_log_folder
 
 
 DEFAULTS = {
-    # Data
-    "data_dir": OUTPUT_FOLDER + "segs_3/",
-    "use_cellpose": True,
-    "sigma": 3.0,
-    "patch_size": (64, 64, 64),  # D, H, W crop; None = full volume
+    # Data. Only the *static* volumes carry instance masks, so they are what a
+    # flow model can train on; sequences store nodes and edges but no labels.
+    "data_dir": "../input/synthetic/v4",
+    # "diffusion" is the Cellpose field; "center" is the straight direction to
+    # the centroid, exact for an ellipsoid and ~30x cheaper to build.
+    "flow_mode": "diffusion",
+    "patch_size": (16, 64, 64),  # D, H, W crop; None = full volume
+    # An epoch is a number of crops, not a pass over the files: there are few
+    # volumes and each one holds hundreds of cells.
+    "epoch_size": 10000,
+    "normalization": {"low_q": "0.001", "high_q": "0.999", "clamp_max": 4.0},
+    "augmentations": {
+        "flip_p": 0.5,
+        "rot90_p": 0.5,
+        "blur_p": 0.2,
+        "blur_sigma_um": 1.0,
+        "lowres_p": 0.2,
+        "lowres_max_factor": 2.0,
+        "brightness_p": 0.3,
+        "brightness_strength": 0.1,
+        "bg_level_p": 0.3,
+        "bg_level_range": (0.03, 0.30),
+    },
     
-
     # Model
+    # The same backbone and the same argument names as main_track.py: the
+    # tracking model is this U-Net with a detection head and a transformer on
+    # top, so a geometry that works there transfers by copying the numbers, and
+    # a checkpoint from here can be handed to a tracking run's
+    # pretraining.weights -- the backbone is stored under "unet." either way.
+    #
+    # The one that differs on purpose is unet_temporal_attention: a static
+    # volume is a window of one frame, so there is nothing for it to mix.
     "in_channels": 1,
-    "decoder_name": "Unet",
-    "encoder_name": "resnet18",
-    "pretrained": True,
-
-    # Augmentations
-    # Only p, alpha and use_3d matter here: the batch-dict path ignores the class args
-    "mixup": {
-        "p": 0.0,
-        "alpha": 0.4,
-        "use_3d": True,
-    },
-    "cutmix": {
-        "p": 0.0,
-        "alpha": 0.4,
-        "use_3d": True,
-    },
+    "unet_arch": "resenc",          # "temporal" (two-conv) or "resenc" (nnU-Net ResEnc)
+    "unet_out_channels": 32,
+    "unet_layers": (32, 64, 128),
+    "unet_pool_stride": (1, 2, 2),    # pool Y/X only; full-scale Z preserved
+    "unet_n_anisotropic": 2,          # downsampling steps using unet_pool_stride
+    "unet_n_decode_steps": None,      # None = symmetric; the head upsamples the rest
+    "unet_temporal_attention": False, # a still volume is a window of one frame
+    "unet_blocks_per_stage": None,    # (1, 3, 4) residual depth per stage; None = two-conv
+    "unet_stem": "unshuffle",         # "unshuffle" keeps every voxel, "stride" drops 3 in 4
+    "unet_norm": "batch",             # "batch" / "instance" / "group"
+    "unet_hires_fusion": False,       # feed the skips finer than the head's grid into the head
+    "head_dropout": 0.0,
 
     # Training
-    "epochs": 10,
-    "batch_size": 4,
+    "epochs": 100,
+    "batch_size": 8,
     "num_workers": 8,
     "optimizer_config": {
         "name": "AdamW",
@@ -64,17 +85,26 @@ DEFAULTS = {
     "fp16": True,
 
     # Losses
-    "w_fg": 1.0,
-    "w_center": 1.0,
-    "w_offset": 1.0,
+    "w_flow": 1.0,
+    "w_cellprob": 1.0,
 
     # Logging & evaluation
     "log_path": LOG_FOLDER,
-    "log_every": 50,
+    "log_every": 500,
     "save_every": 1000,
-    "eval_every": 50,
-    "eval_frames": 1,
-    "eval_sample_name": "6bba_09961292",
+    "eval_every": 1000,
+    # Validation is on REAL stacks -- the model never trains on one, so this is
+    # the only number that means anything. Cost is n_eval_samples *
+    # eval_frames volume inferences plus their flow-following, ~2.5 s each on
+    # one GPU and divided by the world size under torchrun.
+    "n_eval_samples": 20,       # real stacks, split evenly between the embryos
+    "eval_frames": 8,          # most densely annotated timepoints per stack
+    "eval_samples": None,      # explicit names, overriding n_eval_samples
+    "eval_embryos": None,      # restrict the draw, e.g. ("44b6",)
+    # Scored in one pass: cell probability and flows do not depend on the
+    # threshold, so the whole sweep costs one forward per frame plus one
+    # reconstruction per threshold. Same idea as eval_thresholds in main_track.
+    "eval_thresholds": (0.3, 0.4, 0.5, 0.6, 0.7),
 
     # Distributed
     "seed": 0,

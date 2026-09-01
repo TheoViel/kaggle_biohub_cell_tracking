@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from data.mix import Mixup
 from tracking.losses import TrackingLoss
 from tracking.targets import detect_and_match, build_matched_edge_targets
-from tracking.eval import evaluate
+from tracking.eval import evaluate, evaluate_videos
 from tracking.fit_utils import (
     collate_frame_det,
     encode_nodes,
@@ -54,8 +54,22 @@ def fit(
     # line and the checkpoint names. k_fold sets it per stage.
     stage = getattr(args, "stage", "edge")
 
-    # Loss
-    criterion = TrackingLoss(**args.loss_config)
+    # Full-video evaluation, used in place of the window-level one when the
+    # caller supplies videos to run it on. k_fold sets it for the detection
+    # stage and for the edge stage, with args.eval_edge_mode picking how links
+    # are built in each: nearest while the edge head is at init, the
+    # transformer once it is trained.
+    eval_video_paths = list(getattr(args, "eval_video_paths", None) or [])
+    eval_thresholds = tuple(
+        getattr(args, "eval_thresholds", None) or (0.2, 0.3, 0.4)
+    )
+
+    # Loss. offset_radius comes from the model flag, not loss_config: the head
+    # is bounded by it, so a target built at a different radius would ask for a
+    # vote the head cannot make.
+    loss_config = dict(args.loss_config)
+    loss_config["offset_radius"] = int(getattr(args, "offset_radius", 2))
+    criterion = TrackingLoss(**loss_config)
 
     # Transformer-only mode
     transformer_only = getattr(args, "transformer_only", False)
@@ -68,14 +82,14 @@ def fit(
         for name, param in core_model.named_parameters():
             param.requires_grad_(name.startswith("transformer."))
         set_frozen_eval(core_model, ("transformer",))
-        log(f"- Transformer-only: UNet + detect head frozen, node features cached in {cache_dir}")
+        # log(f"- Transformer-only: UNet + detect head frozen, node features cached in {cache_dir}")
         # Both UNets are frozen, so features computed by an earlier run against
         # the same weights and detection config are still exact.
         fts_cache = load_fts_cache(cache_dir, "train", args, ctx, device)
         val_fts_cache = load_fts_cache(cache_dir, "val", args, ctx, device)
-        if fts_cache or val_fts_cache:
-            log(f"- Loaded node features from {cache_dir} "
-                f"({len(fts_cache)} train, {len(val_fts_cache)} val windows)")
+        # if fts_cache or val_fts_cache:
+        #     log(f"- Loaded node features from {cache_dir} "
+        #         f"({len(fts_cache)} train, {len(val_fts_cache)} val windows)")
     else:
         for param in core_model.parameters():
             param.requires_grad_(True)
@@ -100,6 +114,9 @@ def fit(
             "transformer": lr_transformer,
             "unet": lr_unet,
             "detect_head": lr_unet,
+            # A detection-side head, so it follows the backbone's rate rather
+            # than the edge scorer's.
+            "offset_head": lr_unet,
         },
         betas=args.optimizer_config["betas"],
         weight_decay=args.optimizer_config["weight_decay"],
@@ -107,24 +124,47 @@ def fit(
     max_grad_norm = args.optimizer_config.get("max_grad_norm", 1.0)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp and not use_bf16)
 
+    # Step budget. `iterations` is the fold-comparable one: the folds train on
+    # different embryos and 6bba has 128 videos against 44b6's 71, so a fixed
+    # epoch count silently hands one fold ~1.8x the gradient steps of the
+    # other and their scores stop being comparable. `epochs` is the fallback
+    # when iterations is unset, so older configs keep their behaviour.
+    steps_per_epoch = max(1, len(train_loader))
+    iterations = int(getattr(args, "iterations", 0) or 0)
+    if iterations > 0:
+        total_steps = iterations
+        # Ceil: the last pass over the loader stops early, mid-epoch.
+        n_epochs = -(-total_steps // steps_per_epoch)
+    else:
+        n_epochs = int(args.epochs)
+        total_steps = n_epochs * steps_per_epoch
+
     # Scheduler
     scheduler = define_scheduler(
-        optimizer, train_loader, args.epochs, args.optimizer_config["warmup_prop"]
+        optimizer,
+        train_loader,
+        n_epochs,
+        args.optimizer_config["warmup_prop"],
+        total_steps=total_steps,
     )
 
     output_dir = Path(args.output_dir)
     if ctx.is_main:
         output_dir.mkdir(parents=True, exist_ok=True)
 
+    # "offset" is absent on a model without the head, so the keys are taken
+    # from each breakdown rather than fixed here.
     interval_losses = {"det": 0.0, "edge": 0.0, "total": 0.0}
     interval_steps = 0
     interval_start = time.time()
 
     global_step = 0
     val_cache_saved = bool(val_fts_cache)
-    total_steps = args.epochs * len(train_loader)
+    # log(f"- Training for {total_steps} steps "
+    #     f"({steps_per_epoch} per epoch, {n_epochs} epoch(s)"
+    #     f"{', iteration-bounded' if iterations > 0 else ''})")
 
-    for epoch in range(args.epochs):
+    for epoch in range(n_epochs):
         model.train()
         if transformer_only:
             set_frozen_eval(core_model, ("transformer",))
@@ -140,11 +180,11 @@ def fit(
             if len(fts_cache) >= n_shard:
                 train_loader = loader_without_images(train_loader)
                 path = save_fts_cache(fts_cache, cache_dir, "train", args, ctx)
-                log(f"- Transformer-only: {len(fts_cache)} windows cached, "
-                    f"image loading disabled, saved to {path}")
-            elif epoch == 1:
-                log(f"- Transformer-only: only {len(fts_cache)}/{n_shard} windows "
-                    "cached after one epoch, keeping image loading on")
+            #     log(f"- Transformer-only: {len(fts_cache)} windows cached, "
+            #         f"image loading disabled, saved to {path}")
+            # elif epoch == 1:
+            #     log(f"- Transformer-only: only {len(fts_cache)}/{n_shard} windows "
+            #         "cached after one epoch, keeping image loading on")
 
         # SubsetRandomSampler (the stable-shard path) reshuffles on its own.
         if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
@@ -158,6 +198,9 @@ def fit(
             weak_pos = batch.get("weak_positives")
             if weak_pos is not None:
                 weak_pos = weak_pos.to(device, non_blocking=True)
+            ignore_pos = batch.get("ignore_positives")
+            if ignore_pos is not None:
+                ignore_pos = ignore_pos.to(device, non_blocking=True)
             image_shape = tuple(batch["image_shape"][0].tolist())
             voxel_size = tuple(batch["voxel_size"][0].tolist())
 
@@ -177,16 +220,18 @@ def fit(
                     names = batch["name"]
                     if any(name not in fts_cache for name in names):
                         with torch.no_grad():
-                            fresh, _, _ = encode_nodes(
+                            fresh, _, _, _ = encode_nodes(
                                 core_model, imgs, coords, masks, image_shape,
                                 voxel_size, args,
                             )
                         for b, name in enumerate(names):
                             fts_cache[name] = split_frame_det(fresh, b)
                     frame_det = collate_frame_det([fts_cache[n] for n in names])
-                    det_logits, unet_scaling = [], None
+                    # The detector is frozen here, so neither the heatmap nor
+                    # the vote is being supervised.
+                    det_logits, unet_scaling, offset_maps = [], None, None
                 else:
-                    frame_det, det_logits, unet_scaling = encode_nodes(
+                    frame_det, det_logits, unet_scaling, offset_maps = encode_nodes(
                         core_model,
                         imgs,
                         coords,
@@ -242,6 +287,11 @@ def fit(
                         [weak_pos[:, i] for i in range(window_size)]
                         if weak_pos is not None else None
                     ),
+                    ignore_pos_per_frame=(
+                        [ignore_pos[:, i] for i in range(window_size)]
+                        if ignore_pos is not None else None
+                    ),
+                    offset_maps_per_frame=offset_maps,
                 )
 
             scaler.scale(loss).backward()
@@ -254,8 +304,8 @@ def fit(
             # explicitly here too (e.g. against a stray NaN/inf batch).
             if torch.isfinite(grad_norm):
                 scaler.step(optimizer)
-            else:
-                log(f"- Skipping step {global_step}: non-finite grad norm ({grad_norm.item()})")
+            # else:
+            #     log(f"- Skipping step {global_step}: non-finite grad norm ({grad_norm.item()})")
             scale = scaler.get_scale()
             scaler.update()
             model.zero_grad(set_to_none=True)
@@ -264,8 +314,8 @@ def fit(
                 scheduler.step()
             global_step += 1
 
-            for k in interval_losses:
-                interval_losses[k] += breakdown[k]
+            for k, v in breakdown.items():
+                interval_losses[k] = interval_losses.get(k, 0.0) + v
             interval_steps += 1
 
             is_last_step = global_step >= total_steps
@@ -280,13 +330,37 @@ def fit(
 
                 # Evaluate
                 val_message = ""
-                if (
+                eval_due = (
                     getattr(args, "eval_every", 0) > 0
                     and (global_step % args.eval_every == 0 or is_last_step)
-                    and val_loader is not None
-                ):
+                )
+                if eval_due and eval_video_paths:
+                    # Score the real thing: full-video inference through the
+                    # actual predict path, then the competition metrics. The
+                    # window-level numbers saturate -- node recall at the 7 um
+                    # tolerance cannot rank two detectors. k_fold sets the
+                    # paths per stage, and eval_edge_mode with them: nearest
+                    # links while the edge head is still at init (stage 1),
+                    # the transformer once it is trained (stage 3).
+                    per_th = evaluate_videos(
+                        core_model,
+                        eval_video_paths,
+                        args,
+                        device=device,
+                        thresholds=eval_thresholds,
+                    )
+                    val_message = "".join(
+                        f"  [thr {t:g}] node_rec={m['node_recall']:.3f}"
+                        f" edge_jac={m['edge_jaccard']:.3f}"
+                        f" score={m['score']:.3f}"
+                        for t, m in sorted(per_th.items())
+                    )
+                    model.train()
+                    if transformer_only:
+                        set_frozen_eval(core_model, ("transformer",))
+                elif eval_due and val_loader is not None:
                     (val_loss, val_edge_jaccard, val_node_recall,
-                     val_adjust, val_edge_recall) = evaluate(
+                     val_adjust, val_edge_recall, val_node_recall_tight) = evaluate(
                         core_model,
                         val_loader,
                         args,
@@ -300,13 +374,16 @@ def fit(
                     if transformer_only and not val_cache_saved:
                         save_fts_cache(val_fts_cache, cache_dir, "val", args, ctx)
                         val_cache_saved = True
+                    tight_um = float(getattr(args, "eval_node_match_um", 0.0) or 0.0)
                     val_message = "".join(
                         f"  [thr {t:g}] node_rec={val_node_recall[t]:.3f}"
-                        f" adjust={val_adjust[t]:.3f}"
+                        + (f" rec@{tight_um:g}um={val_node_recall_tight[t]:.3f}" if val_node_recall_tight else "")
+                        + f" adjust={val_adjust[t]:.3f}"
                         + ("" if stage == "seg" else  f" edge_jac={val_edge_jaccard[t]:.3f}")
                         for t in sorted(val_node_recall)
                     )
-                    val_message = f"   val_loss={val_loss:.4f}" + val_message
+                    if val_loss:
+                        val_message = f"  val_loss={val_loss:.4f}" + val_message
 
                     model.train()
                     if transformer_only:
@@ -315,10 +392,13 @@ def fit(
                 # After the evaluation, so its cost shows up in the timing.
                 elapsed = time.time() - interval_start
                 log(
-                    f"epoch {epoch + 1:02d}/{args.epochs:02d}  (step {global_step:05d})  "
-                    f"lr={lr_str}  loss={avg['total']:.4f}  t={elapsed:.0f}s \t{val_message}"
+                    f"epoch {epoch + 1:02d}/{n_epochs:02d}  (step {global_step:04d}/{total_steps})  "
+                    f"lr={lr_str}  loss={avg['total']:.4f}"
+                    + (f" (det={avg['det']:.3f} off={avg['offset']:.3f})"
+                       if "offset" in avg else "")
+                    + f"  t={elapsed:.0f}s \t{val_message}"
                 )
-                interval_losses = {"det": 0.0, "edge": 0.0, "total": 0.0}
+                interval_losses = dict.fromkeys(interval_losses, 0.0)
                 interval_steps = 0
                 interval_start = time.time()
 
@@ -328,13 +408,31 @@ def fit(
                     output_dir / f"ckpt_stage_{stage}_{global_step:05d}.pt",
                 )
 
+            # The budget can land mid-epoch, so stop here rather than at the
+            # loader's end. is_last_step above has already run the final log,
+            # evaluation and checkpoint for this step.
+            if is_last_step:
+                break
+
+        if global_step >= total_steps:
+            break
+
 
 def _model_config(args) -> dict:
     return {
+        "unet_arch": getattr(args, "unet_arch", "temporal"),
         "unet_out_channels": args.unet_out_channels,
         "unet_layers": list(args.unet_layers),
         "unet_pool_stride": list(getattr(args, "unet_pool_stride", [2, 2, 2])),
+        "unet_n_anisotropic": getattr(args, "unet_n_anisotropic", 2),
         "unet_n_decode_steps": getattr(args, "unet_n_decode_steps", None),
+        "unet_temporal_attention": bool(getattr(args, "unet_temporal_attention", True)),
+        "unet_blocks_per_stage": (
+            list(b) if (b := getattr(args, "unet_blocks_per_stage", None)) else None
+        ),
+        "unet_stem": getattr(args, "unet_stem", "stride"),
+        "unet_norm": getattr(args, "unet_norm", "batch"),
+        "unet_hires_fusion": bool(getattr(args, "unet_hires_fusion", False)),
         "transformer_hidden": args.transformer_hidden,
         "transformer_heads": args.transformer_heads,
         "transformer_blocks": args.transformer_blocks,
@@ -356,4 +454,7 @@ def _model_config(args) -> dict:
         "nms_radius_um": getattr(args, "nms_radius_um", 7.0),
         "downscale_factor": getattr(args, "downscale_factor", 1),
         "window_size": args.window_size,
+        # Inference has to map raw intensities the same way training did, or
+        # every detection threshold shifts underneath the model.
+        "normalization": dict(getattr(args, "normalization", None) or {}),
     }

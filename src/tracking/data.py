@@ -24,6 +24,7 @@ class FrameWindowData:
     coords: list[torch.Tensor]  # W × (N_i, 3)  in downsampled space
     node_counts: list[int]
     targets: list[torch.Tensor]  # (W-1) transition matrices
+    stride: int = 1  # frame gap; 1 is consecutive
 
 
 @dataclass(frozen=True)
@@ -41,25 +42,70 @@ class VideoMeta:
 # ---------------------------------------------------------------------------
 
 
+def _successor_map(edge_attrs: pl.DataFrame) -> dict[int, list[int]]:
+    """node_id -> its children one frame later."""
+    succ: dict[int, list[int]] = {}
+    for source_id, target_id in zip(edge_attrs["source_id"], edge_attrs["target_id"]):
+        succ.setdefault(source_id, []).append(target_id)
+    return succ
+
+
+def _k_step_transition(
+    ids_a: np.ndarray,
+    ids_b: np.ndarray,
+    succ: dict[int, list[int]],
+    stride: int,
+) -> torch.Tensor:
+    """Transition matrix over ``stride`` frames, following the track graph.
+
+    At stride 1 this is the direct edge set. Past that it is reachability, so a
+    cell that divides somewhere inside the gap reaches both daughters and the
+    row carries two ones — which is what "the cells at t + stride that came
+    from this one" means, and what the edge head should predict.
+    """
+    col = {nid: i for i, nid in enumerate(ids_b)}
+    matrix = torch.zeros(len(ids_a), len(ids_b), dtype=torch.float32)
+    for i, nid in enumerate(ids_a):
+        frontier = {nid}
+        for _ in range(stride):
+            frontier = {c for s in frontier for c in succ.get(s, ())}
+            if not frontier:
+                break
+        for c in frontier:
+            j = col.get(c)
+            if j is not None:
+                matrix[i, j] = 1.0
+    return matrix
+
+
 def _get_window_data(
     gt_graph: td.graph.BaseGraph,
     image_shape: tuple[int, ...],
     t_start: int,
     window_size: int = 2,
+    stride: int = 1,
+    gt_attrs: pl.DataFrame | None = None,
+    succ: dict[int, list[int]] | None = None,
 ) -> FrameWindowData | None:
-    """Build a FrameWindowData for window_size consecutive frames.
+    """Build a FrameWindowData for window_size frames spaced ``stride`` apart.
 
     Returns None if any frame in the window has zero GT nodes.
+
+    ``gt_attrs`` and ``succ`` are hoisted out for the caller to compute once
+    per video: they are the same for every window of it, and rebuilding the
+    successor map per window is O(E) each time.
     """
-    gt_attrs = gt_graph.node_attrs(attr_keys=["node_id", "t", "z", "y", "x"])
-    edge_attrs = gt_graph.edge_attrs(attr_keys=["source_id", "target_id"])
+    if gt_attrs is None:
+        gt_attrs = gt_graph.node_attrs(attr_keys=["node_id", "t", "z", "y", "x"])
+    if succ is None:
+        succ = _successor_map(gt_graph.edge_attrs(attr_keys=["source_id", "target_id"]))
 
     per_frame_ids: list[np.ndarray] = []
     coords_list: list[torch.Tensor] = []
     node_counts: list[int] = []
 
     for i in range(window_size):
-        t = t_start + i
+        t = t_start + i * stride
         gt_t = gt_attrs.filter(pl.col("t") == t)
         if len(gt_t) == 0:
             return None
@@ -74,16 +120,13 @@ def _get_window_data(
     targets = []
     for i in range(window_size - 1):
         targets.append(
-            compute_gt_transition_matrix(
-                per_frame_ids[i],
-                per_frame_ids[i + 1],
-                edge_attrs,
-            )
+            _k_step_transition(per_frame_ids[i], per_frame_ids[i + 1], succ, stride)
         )
 
     return FrameWindowData(
         t_start=t_start,
         n_frames=window_size,
+        stride=stride,
         coords=coords_list,
         node_counts=node_counts,
         targets=targets,
@@ -114,6 +157,7 @@ def _pad_window(window: FrameWindowData, max_nodes: int) -> dict:
     return {
         "t_start": window.t_start,
         "n_frames": W,
+        "stride": window.stride,
         "coords": coords,
         "masks": masks,
         "targets": targets,
@@ -121,11 +165,29 @@ def _pad_window(window: FrameWindowData, max_nodes: int) -> dict:
     }
 
 
+NORM_DEFAULTS: dict = {
+    # Which stored quantile anchors zero. "0.001" sits in the extreme low tail,
+    # so whatever pedestal the background carries survives normalisation — the
+    # two embryos' floors differ ~3x after it while their cell amplitude
+    # matches to 9%. "0.1" sits inside the background instead, which cancels
+    # that pedestal at source rather than augmenting around it.
+    "low_q": "0.001",
+    "high_q": "0.999",
+    "clamp_max": 4.0,
+}
+
+
+def resolve_normalization(cfg: dict | None) -> dict:
+    return {**NORM_DEFAULTS, **(cfg or {})}
+
+
 def load_dataset_windows(
     ds_path: Path,
     window_size: int = 2,
     invert_time: bool = False,
     max_frames: int | None = None,
+    strides: tuple[int, ...] = (1,),
+    normalization: dict | None = None,
 ) -> tuple[VideoMeta, list[FrameWindowData]]:
     """Load per-window metadata and video stats for one dataset.
 
@@ -137,10 +199,13 @@ def load_dataset_windows(
         require_tracks=True,
         load_image=False,
     )
-    if "0.001" not in ds.quantiles or "0.999" not in ds.quantiles:
+    norm = resolve_normalization(normalization)
+    missing = [q for q in (norm["low_q"], norm["high_q"]) if q not in ds.quantiles]
+    if missing:
         raise ValueError(
-            f"Zarr attrs missing image_statistics.quantiles for {ds_path}. "
-            "Run precompute_quantiles on the dataset first."
+            f"Zarr attrs missing image_statistics.quantiles {missing} for {ds_path}. "
+            f"Stored: {sorted(ds.quantiles)}. Run precompute_quantiles first, or "
+            "pick normalization.low_q / high_q from the stored set."
         )
 
     image_shape = ds.image_shape
@@ -157,14 +222,23 @@ def load_dataset_windows(
         zarr_path=ds.zarr_path,
         image_shape=image_shape,
         voxel_size=ds.scale,
-        q_low=float(ds.quantiles["0.001"]),
-        q_high=float(ds.quantiles["0.999"]),
+        q_low=float(ds.quantiles[norm["low_q"]]),
+        q_high=float(ds.quantiles[norm["high_q"]]),
     )
 
+    # Same for every window of this video; O(E) to build, so build it once.
+    gt_attrs = tracks.node_attrs(attr_keys=["node_id", "t", "z", "y", "x"])
+    succ = _successor_map(tracks.edge_attrs(attr_keys=["source_id", "target_id"]))
+
     windows: list[FrameWindowData] = []
-    for t in range(image_shape[0] - window_size + 1):
-        data = _get_window_data(tracks, image_shape, t, window_size)
-        if data is not None:
-            windows.append(data)
+    for stride in sorted({int(s) for s in strides if int(s) >= 1}):
+        span = (window_size - 1) * stride
+        for t in range(image_shape[0] - span):
+            data = _get_window_data(
+                tracks, image_shape, t, window_size, stride=stride,
+                gt_attrs=gt_attrs, succ=succ,
+            )
+            if data is not None:
+                windows.append(data)
 
     return video_meta, windows

@@ -448,6 +448,52 @@ def per_sample_metrics(
     }
 
 
+MACRO_METRICS: tuple[str, ...] = (
+    "score", "adj_edge_jaccard", "edge_jaccard", "division_jaccard", "node_recall",
+)
+
+
+def macro_summarise(
+    rows: list[dict], key: str = "embryo"
+) -> tuple[dict[str, dict], dict]:
+    """Per-group summaries, and their *unweighted* mean.
+
+    :func:`summarise` pools every row, which weights a group by however many
+    samples it happens to contribute. The two embryos are not balanced -- 128
+    stacks of ``6bba`` against 71 of ``44b6`` -- so a pooled score is close to
+    ``6bba``'s alone. They are also annotated at very different densities, and
+    edge FP is only counted against annotated nodes, so the two are not even
+    measuring the same thing on the same scale. Averaging the groups instead
+    gives each embryo one vote.
+
+    Only the rate-like columns in :data:`MACRO_METRICS` are averaged; counts
+    stay pooled, where summing is the meaningful operation.
+
+    Returns
+    -------
+    per_group
+        ``{group: summarise(rows of that group)}``, in sorted group order.
+    macro
+        ``{metric: unweighted mean over groups}`` for :data:`MACRO_METRICS`,
+        plus ``n_groups``. NaN groups are skipped per metric, so one embryo
+        without divisions does not wipe out the other's division Jaccard.
+    """
+    grouped: dict[str, list[dict]] = {}
+    for row in rows:
+        grouped.setdefault(row.get(key, "?"), []).append(row)
+
+    per_group = {g: summarise(rs) for g, rs in sorted(grouped.items())}
+
+    macro: dict = {"n_groups": len(per_group)}
+    for metric in MACRO_METRICS:
+        vals = [
+            s[metric] for s in per_group.values()
+            if metric in s and s[metric] == s[metric]  # drop NaN
+        ]
+        macro[metric] = sum(vals) / len(vals) if vals else float("nan")
+    return per_group, macro
+
+
 def nan_metrics_row() -> dict:
     """Return a dict with every :data:`METRIC_COLUMNS` key set to NaN."""
     return {col: float("nan") for col in METRIC_COLUMNS}

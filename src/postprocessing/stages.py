@@ -176,8 +176,17 @@ def run_pp_public(coords, edges, sample="", **knobs):
          0.0 if e.get("distance_um") is None else e["distance_um"]]
         for e in edges_pp
     ], dtype=float).reshape(-1, 4)
-    return new_coords.astype(np.int64), new_edges
+    # round, not truncate: pp_public's linefit smoothing leaves sub-voxel
+    # positions, and astype() would drag every one of them toward zero — the
+    # same half-voxel bias the grid-centring correction exists to remove.
+    return np.round(new_coords).astype(np.int64), new_edges
 
 
 def run_pipeline(coords, edges, **kw):
     return postprocess(coords, edges, **kw)
+
+
+def run_suppress(coords, edges, **kw):
+    """Restore the detector's per-frame spacing floor; see suppress.py."""
+    from suppress import suppress_rivals
+    return suppress_rivals(coords, edges, **kw)

@@ -5,13 +5,30 @@ import segmentation_models_pytorch
 
 from timm.layers import Conv2dSame
 # from model_zoo.conv3d_same import Conv3dSame
+from model_zoo.cellpose_net import CPNET_PRESETS, define_cpnet
 from model_zoo.unet import Unet
+from model_zoo.resenc_unet import RESENC_PRESETS, define_resenc_unet, suggest_batch_size
 
 
 DECODERS = {"Unet": Unet}
 
+# nnU-Net ResEnc U-Nets are whole architectures, not timm encoders, so they get their own
+# branch in define_model: `decoder_name="ResEncUNet"`, `encoder_name` picks the preset.
+RESENC_DECODER = "ResEncUNet"
+
+# Cellpose's own CPnet, ported to 3D: decoder_name="CPnet", encoder_name picks
+# the channel widths. See model_zoo/cellpose_net.py.
+CPNET_DECODER = "CPnet"
+
+# Patch sizes used to plan the ResEnc topology when the caller trains on full volumes.
+DEFAULT_RESENC_PATCH = {2: (256, 256), 3: (64, 64, 64)}
+
 # Output layout of the 3D cell segmentation pipeline, as name -> channel count.
 CELL_SEG_HEADS = {"fg_logits": 1, "heatmap_logits": 1, "offsets": 3}
+# Cellpose in 3D: one interior-probability channel and the z/y/x flow field.
+# See segmentation/flows.py for what the flows are and dynamics.py for how the
+# cells are rebuilt from them.
+CELLPOSE_HEADS = {"cellprob_logits": 1, "flows": 3}
 
 
 def define_model(
@@ -27,19 +44,30 @@ def define_model(
     pretrained_weights=None,
     use_3d=False,
     heads=None,
+    patch_size=None,
+    spacing=None,
+    deep_supervision=False,
     verbose=0,
 ):
     """
     Define a segmentation model.
 
+    Two families are available:
+      - a U-Net decoder over a timm encoder, e.g. decoder_name="Unet", encoder_name="resnet18",
+        built in 2D and converted to 3D when use_3d is set;
+      - an nnU-Net ResEnc U-Net, decoder_name="ResEncUNet" with encoder_name one of
+        RESENC_PRESETS ("resenc_m", "resenc_l", "resenc_xl"), which is natively 2D or 3D and
+        whose topology is planned from patch_size.
+
     Args:
         decoder_name (str): Name of the decoder architecture.
-        encoder_name (str): Name of the encoder architecture.
+        encoder_name (str): Name of the encoder architecture, or of the ResEnc preset.
         num_classes (int, optional): Number of primary classes. Default is 1.
         num_classes_aux (int, optional): Number of auxiliary classes. Default is 1.
         increase_stride (bool, optional): Flag to increase the stride. Default is False.
         encoder_weights (str, optional): Encoder weights source. Default is "imagenet".
-        pretrained (bool, optional): Flag to use pretrained weights. Default is True.
+        pretrained (bool, optional): Flag to use pretrained weights. Ignored by ResEnc U-Nets,
+            which have no pretrained checkpoints. Default is True.
         use_cls (bool, optional): Flag to use auxiliary classifiers. Default is False.
         n_channels (int, optional): Number of input channels. Default is 3.
         pretrained_weights (str, optional): Path to pretrained model weights. Default is None.
@@ -47,6 +75,15 @@ def define_model(
         heads (dict, optional): name -> channel count. When given, the model returns a
             dict of logits split along the channel axis instead of (masks, labels),
             and num_classes is set to the total. Default is None.
+        patch_size (tuple, optional): Training patch size, which ResEnc U-Nets plan their
+            stage count, strides and kernel sizes from. Falls back to DEFAULT_RESENC_PATCH
+            when training on full volumes. Ignored by the timm family. Default is None.
+        spacing (tuple, optional): Voxel spacing, used to plan anisotropic ResEnc topologies.
+            Defaults to isotropic. Default is None.
+        deep_supervision (bool, optional): For ResEnc U-Nets, also return the logits of the
+            coarser decoder stages under the "deep_supervision" key. The loss has to consume
+            them: under DDP, heads that receive no gradient abort the backward pass.
+            Default is False.
         verbose (int, optional): Verbosity level. Default is 0.
 
     Returns:
@@ -55,31 +92,60 @@ def define_model(
     Raises:
         AssertionError: If the decoder name is not supported.
     """
-    assert decoder_name in DECODERS, "Decoder name not supported"
+    assert (
+        decoder_name in DECODERS
+        or decoder_name in (RESENC_DECODER, CPNET_DECODER)
+    ), "Decoder name not supported"
 
     if heads is not None:
         num_classes = sum(heads.values())
 
-    decoder = DECODERS[decoder_name]
-    model = decoder(
-        encoder_name="tu-" + encoder_name,
-        encoder_weights=encoder_weights if pretrained else None,
-        in_channels=n_channels,
-        classes=num_classes,
-        aux_params={"dropout": 0.0, "classes": num_classes_aux} if use_cls else None,
-    )
-    model.n_channels = n_channels
-    model.name = encoder_name
-    model.decoder_channels = (256, 128, 64, 32, 16)
-    model.num_classes = num_classes
+    if decoder_name == CPNET_DECODER:
+        model = define_cpnet(
+            preset=encoder_name,
+            nout=num_classes,
+            n_channels=n_channels,
+            heads=heads,
+            patch_size=patch_size,
+            spacing=spacing,
+            verbose=verbose,
+        )
+    elif decoder_name == RESENC_DECODER:
+        model = define_resenc_seg_model(
+            preset=encoder_name,
+            num_classes=num_classes,
+            num_classes_aux=num_classes_aux if use_cls else None,
+            n_channels=n_channels,
+            use_3d=use_3d,
+            heads=heads,
+            patch_size=patch_size,
+            spacing=spacing,
+            deep_supervision=deep_supervision,
+            increase_stride=increase_stride,
+            pretrained=pretrained,
+            verbose=verbose,
+        )
+    else:
+        decoder = DECODERS[decoder_name]
+        model = decoder(
+            encoder_name="tu-" + encoder_name,
+            encoder_weights=encoder_weights if pretrained else None,
+            in_channels=n_channels,
+            classes=num_classes,
+            aux_params={"dropout": 0.0, "classes": num_classes_aux} if use_cls else None,
+        )
+        model.n_channels = n_channels
+        model.name = encoder_name
+        model.decoder_channels = (256, 128, 64, 32, 16)
+        model.num_classes = num_classes
 
-    model = SegWrapper(model, heads=heads)
+        model = SegWrapper(model, heads=heads)
 
-    if increase_stride:
-        model.increase_stride()
+        if increase_stride:
+            model.increase_stride()
 
-    if use_3d:
-        model = convert_3d(model)
+        if use_3d:
+            model = convert_3d(model)
 
     if pretrained_weights is not None:
         if verbose:
@@ -88,6 +154,211 @@ def define_model(
         model.load_state_dict(state_dict, strict=True)
 
     return model
+
+
+def define_resenc_seg_model(
+    preset="resenc_m",
+    num_classes=1,
+    num_classes_aux=None,
+    n_channels=1,
+    use_3d=True,
+    heads=None,
+    patch_size=None,
+    spacing=None,
+    deep_supervision=False,
+    increase_stride=False,
+    pretrained=False,
+    verbose=0,
+):
+    """
+    Build an nnU-Net ResEnc U-Net wrapped to return the pipeline's head layout.
+
+    Args:
+        preset (str, optional): One of RESENC_PRESETS. Default is "resenc_m".
+        num_classes (int, optional): Total number of output channels. Default is 1.
+        num_classes_aux (int, optional): Number of auxiliary classes. None disables the
+            classification head. Default is None.
+        n_channels (int, optional): Number of input channels. Default is 1.
+        use_3d (bool, optional): Build a 3D model rather than a 2D one. Default is True.
+        heads (dict, optional): name -> channel count used to split the output. Default is None.
+        patch_size (tuple, optional): Training patch size the topology is planned from.
+            Falls back to DEFAULT_RESENC_PATCH. Default is None.
+        spacing (tuple, optional): Voxel spacing. Defaults to isotropic. Default is None.
+        deep_supervision (bool, optional): Also return the coarser decoder stages, which the
+            loss then has to consume. Default is False.
+        increase_stride (bool, optional): Unsupported, kept for signature parity. Default is False.
+        pretrained (bool, optional): Ignored, there are no pretrained ResEnc checkpoints.
+            Default is False.
+        verbose (int, optional): Verbosity level. Default is 0.
+
+    Returns:
+        ResEncSegWrapper: The wrapped network.
+
+    Raises:
+        AssertionError: If the preset is unknown, increase_stride is set, or patch_size does
+            not match use_3d.
+    """
+    assert preset in RESENC_PRESETS, (
+        f'Unknown ResEnc preset "{preset}", expected one of {list(RESENC_PRESETS)}'
+    )
+    assert not increase_stride, "increase_stride is not supported by ResEnc U-Nets"
+
+    dim = 3 if use_3d else 2
+    patch_size = DEFAULT_RESENC_PATCH[dim] if patch_size is None else tuple(patch_size)
+    assert len(patch_size) == dim, f"patch_size {patch_size} does not match use_3d={use_3d}"
+
+    if verbose and pretrained:
+        print(f"\n-> No pretrained weights for {preset}, training the ResEnc U-Net from scratch")
+
+    model = define_resenc_unet(
+        preset=preset,
+        in_channels=n_channels,
+        num_classes=num_classes,
+        patch_size=patch_size,
+        spacing=spacing,
+        deep_supervision=deep_supervision,
+        verbose=verbose,
+    )
+    return ResEncSegWrapper(model, heads=heads, num_classes_aux=num_classes_aux)
+
+
+def split_heads(masks, heads):
+    """
+    Split the channel axis of a logits tensor into the named heads.
+
+    Args:
+        masks (torch.Tensor): Logits of shape (B, sum(heads.values()), *spatial).
+        heads (dict, optional): name -> channel count. None returns the tensor as "masks".
+
+    Returns:
+        dict: Logits per head name.
+    """
+    if heads is None:
+        return {"masks": masks}
+
+    split, start = {}, 0
+    for name, channels in heads.items():
+        split[name] = masks[:, start : start + channels]
+        start += channels
+    return split
+
+
+class GlobalPoolClassificationHead(nn.Sequential):
+    """
+    Auxiliary classifier over pooled bottleneck features, for 2D or 3D inputs.
+    """
+
+    def __init__(self, in_channels, classes, dropout=0.0, dim=3):
+        """
+        Constructor.
+
+        Args:
+            in_channels (int): Number of bottleneck channels.
+            classes (int): Number of auxiliary classes.
+            dropout (float, optional): Dropout applied before the linear layer. Default is 0.0.
+            dim (int, optional): Number of spatial dimensions, 2 or 3. Default is 3.
+        """
+        pool = nn.AdaptiveAvgPool3d(1) if dim == 3 else nn.AdaptiveAvgPool2d(1)
+        super().__init__(
+            pool,
+            nn.Flatten(),
+            nn.Dropout(p=dropout, inplace=True),
+            nn.Linear(in_channels, classes, bias=True),
+        )
+
+
+class ResEncSegWrapper(nn.Module):
+    """
+    Wraps an nnU-Net ResEnc U-Net so that it returns the pipeline's dict of head logits.
+
+    Attributes:
+        model (ResidualEncoderUNet): The underlying network.
+        heads (dict): Optional name -> channel count used to split the output.
+        divisible_by (tuple): Per-axis multiple the input spatial size must be padded to.
+    """
+
+    def __init__(self, model, heads=None, num_classes_aux=None):
+        """
+        Constructor.
+
+        Args:
+            model (ResidualEncoderUNet): The underlying network.
+            heads (dict, optional): name -> channel count. When given, forward returns a dict
+                of logits instead of a single "masks" entry. Default is None.
+            num_classes_aux (int, optional): Number of auxiliary classes. None disables the
+                classification head. Default is None.
+        """
+        super().__init__()
+
+        self.model = model
+        self.name = model.preset
+        self.heads = heads
+        self.num_classes = model.num_classes
+        self.n_channels = model.encoder.stem.convs[0].input_channels
+        self.divisible_by = model.divisible_by
+        self.patch_size = model.patch_size
+
+        self.classification_head = None
+        if num_classes_aux is not None:
+            self.classification_head = GlobalPoolClassificationHead(
+                model.encoder.output_channels[-1],
+                num_classes_aux,
+                dim=len(model.patch_size),
+            )
+
+    def increase_stride(self):
+        """
+        Unsupported: a ResEnc U-Net's stride chain is fixed by its planned topology.
+
+        Raises:
+            NotImplementedError: Always.
+        """
+        raise NotImplementedError("increase_stride is not supported by ResEnc U-Nets")
+
+    def forward(self, x):
+        """
+        Forward pass of the segmentation model.
+
+        Args:
+            x (torch.Tensor): Input data as a tensor of shape (B, C, *spatial).
+
+        Returns:
+            dict: Logits per head, plus "labels" if a classification head was built, plus
+                "deep_supervision" -- a list of per-head dicts, coarsest last -- if the
+                underlying network was built with deep supervision.
+        """
+        skips = self.model.encoder(x)
+        out = self.model.decoder(skips)
+
+        if self.model.deep_supervision:
+            masks, coarser = out[0], out[1:]
+        else:
+            masks, coarser = out, []
+
+        heads = split_heads(masks, self.heads)
+        if coarser:
+            heads["deep_supervision"] = [split_heads(m, self.heads) for m in coarser]
+
+        if self.classification_head is not None:
+            heads["labels"] = self.classification_head(skips[-1])
+
+        return heads
+
+    def count_parameters(self):
+        """Number of trainable parameters."""
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+    def suggest_batch_size(self, preset=None):
+        """
+        Largest batch size the preset's VRAM target allows for this network and patch size.
+
+        Args:
+            preset (str, optional): One of RESENC_PRESETS. Defaults to the model's own preset.
+
+        Returns:
+            int: Suggested batch size.
+        """
+        return suggest_batch_size(self.model, preset or self.name)
 
 
 class SegWrapper(nn.Module):
@@ -171,14 +442,7 @@ class SegWrapper(nn.Module):
 
         masks = self.model.segmentation_head(decoder_output)
 
-        heads = {}
-        if self.heads is not None:
-            start = 0
-            for name, channels in self.heads.items():
-                heads[name] = masks[:, start : start + channels]
-                start += channels
-        else:
-            heads["masks"] = masks
+        heads = split_heads(masks, self.heads)
 
         if self.model.classification_head is not None:
             heads["labels"] = self.model.classification_head(features[-1])

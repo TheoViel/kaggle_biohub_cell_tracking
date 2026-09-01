@@ -1,102 +1,65 @@
+"""The Cellpose objective: regress the flow field, classify cell interior."""
+
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ---------------------------------------------------------------------------
-# Building blocks
-# ---------------------------------------------------------------------------
+class CellposeLoss(nn.Module):
+    """``w_flow * MSE(flows) + w_cellprob * BCE(cellprob)``.
 
-def dice_loss(pred_prob, target, smooth=1.0):
-    """Soft Dice loss; expects probabilities in [0, 1]."""
-    flat_p = pred_prob.reshape(-1)
-    flat_t = target.reshape(-1)
-    intersection = (flat_p * flat_t).sum()
-    return 1.0 - (2.0 * intersection + smooth) / (flat_p.sum() + flat_t.sum() + smooth)
+    Two things follow Stringer et al. rather than being tuned here.
 
+    The flow term is a plain MSE over the *whole* volume, background included,
+    where the target is zero. Masking it to the cell interior would leave the
+    background flow unconstrained, and at inference every voxel above the
+    probability threshold gets followed -- including the ones that only just
+    cross it. A model with no opinion outside cells sends those on a random
+    walk into whichever cell they drift toward.
 
-def focal_loss(pred_logits, target, alpha=0.25, gamma=2.0):
-    """
-    Focal loss for dense heatmap targets in [0, 1].
-    Uses the standard sigmoid focal form — soft targets naturally
-    down-weight easy negatives (background far from any centroid).
-    """
-    bce = F.binary_cross_entropy_with_logits(pred_logits, target, reduction='none')
-    pt  = torch.exp(-bce)                           # ≈ confidence of correct class
-    return (alpha * (1.0 - pt) ** gamma * bce).mean()
-
-
-# ---------------------------------------------------------------------------
-# Combined loss
-# ---------------------------------------------------------------------------
-
-class CellSegLoss(nn.Module):
-    """
-    Three-term loss matching the output heads of the segmentation model:
-
-        L = λ_fg     · (Dice + BCE)       on foreground probability
-          + λ_center · FocalLoss           on cell-centre heatmap
-          + λ_offset · SmoothL1 (fg only)  on centroid-offset vectors
-
-    Offsets are in raw voxel units (Δz, Δy, Δx), so λ_offset should be
-    set smaller than λ_fg / λ_center to keep magnitudes balanced
-    (typical cell radius ≈ 10–20 vx, BCE loss ≈ 0.5–1.0).
+    Flows are trained at ``FLOW_SCALE`` (5x unit length). Regressing raw unit
+    vectors puts the MSE an order of magnitude below the BCE, and the model
+    then buys its loss reduction almost entirely from cell probability -- which
+    is the half of the output that does not separate touching cells.
     """
 
-    def __init__(
-        self,
-        w_fg: float = 1.0,
-        w_center: float = 1.0,
-        w_offset: float = 0.05,
-        focal_alpha: float = 0.25,
-        focal_gamma: float = 2.0,
-        smooth_l1_beta: float = 1.0,
-    ):
+    def __init__(self, w_flow: float = 1.0, w_cellprob: float = 1.0):
         super().__init__()
-        self.w_fg      = w_fg
-        self.w_center  = w_center
-        self.w_offset  = w_offset
-        self.focal_alpha = focal_alpha
-        self.focal_gamma = focal_gamma
-        self.beta = smooth_l1_beta
+        self.w_flow = w_flow
+        self.w_cellprob = w_cellprob
 
     def forward(self, preds, targets):
-        fg_logits = preds['fg_logits'].squeeze(1)           # (B, D, H, W)
-        hm_logits = preds['heatmap_logits'].squeeze(1)      # (B, D, H, W)
-        offsets   = preds['offsets']                        # (B, 3, D, H, W)
+        flows = preds["flows"]                                  # (B, 3, D, H, W)
+        cellprob_logits = preds["cellprob_logits"].squeeze(1)   # (B, D, H, W)
 
-        tgt_fg  = targets['fg']                             # (B, D, H, W) float [0,1]
-        tgt_hm  = targets['heatmap']                        # (B, D, H, W) float [0,1]
-        tgt_off = targets['offsets']                        # (B, 3, D, H, W) voxel units
-        fg_mask = targets['fg_mask']                        # (B, D, H, W) bool
-
-        # --- Foreground: Dice + BCE ---
-        fg_prob  = torch.sigmoid(fg_logits)
-        loss_bce = F.binary_cross_entropy_with_logits(fg_logits, tgt_fg)
-        loss_dice = dice_loss(fg_prob, tgt_fg)
-        loss_fg  = loss_bce + loss_dice
-
-        # --- Heatmap: Focal ---
-        # loss_center = focal_loss(hm_logits, tgt_hm, self.focal_alpha, self.focal_gamma)
-        loss_center = F.binary_cross_entropy_with_logits(hm_logits, tgt_hm)
-
-        # --- Offsets: SmoothL1 masked to foreground voxels ---
-        if fg_mask.any():
-            mask3 = fg_mask.unsqueeze(1).expand_as(offsets)
-            loss_offset = F.smooth_l1_loss(offsets[mask3], tgt_off[mask3], beta=self.beta)
-        else:
-            loss_offset = offsets.sum() * 0.0   # same device / dtype, no gradient
-
-        total = (
-            self.w_fg * loss_fg
-            + self.w_center * loss_center
-            + self.w_offset * loss_offset
+        loss_flow = F.mse_loss(flows, targets["flows"]) / 2.0
+        loss_cellprob = F.binary_cross_entropy_with_logits(
+            cellprob_logits, targets["cellprob"]
         )
-
-        breakdown = {
-            'fg':     loss_fg.item(),
-            'center': loss_center.item(),
-            'offset': loss_offset.item(),
-            'total':  total.item(),
+        total = self.w_flow * loss_flow + self.w_cellprob * loss_cellprob
+        return total, {
+            "flow": loss_flow.item(),
+            "cellprob": loss_cellprob.item(),
+            "total": total.item(),
         }
-        return total, breakdown
+
+
+@torch.no_grad()
+def flow_error(preds, targets, eps: float = 1e-6) -> float:
+    """Mean cosine error between predicted and target flow, inside cells only.
+
+    The training MSE is dominated by background, where both are zero, so it
+    keeps falling long after the field inside the cells has stopped improving.
+    This is the number that tracks whether reconstruction will work: a cosine
+    below ~0.9 in the interior means trajectories will leave for the wrong
+    attractor no matter how good the probability map looks.
+    """
+    fg = targets["cellprob"] > 0.5
+    if not fg.any():
+        return float("nan")
+    p = preds["flows"].permute(0, 2, 3, 4, 1)[fg]
+    t = targets["flows"].permute(0, 2, 3, 4, 1)[fg]
+    cos = (p * t).sum(-1) / (p.norm(dim=-1) * t.norm(dim=-1) + eps)
+    return float(cos.mean())

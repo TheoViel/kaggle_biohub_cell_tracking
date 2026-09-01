@@ -123,6 +123,85 @@ def build_detection_target(
     return target
 
 
+def build_offset_target(
+    coords: torch.Tensor,          # (B, M, 3) GT coords, image-voxel space
+    mask: torch.Tensor,            # (B, M) bool
+    spatial: tuple[int, int, int],  # detection-grid shape
+    unet_scaling: tuple | None = None,
+    radius: int = 2,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-voxel vote for the cell centre, in detection-grid voxels.
+
+    Every grid voxel within ``radius`` of a ground-truth cell is asked for the
+    vector from itself to that cell's centre; a voxel in range of two cells
+    votes for the nearer one. This is the segmentation branch's centroid voting
+    (``segmentation/targets.py``), moved onto the detection grid.
+
+    A vote, rather than a sub-voxel residual, is what this problem needs. The
+    grid is 1.625 um isotropic, so a CenterNet-style offset confined to the
+    peak's own cell can move a detection by at most half of that — and the peak
+    is in the *wrong* cell 89% of the time on the hardest stacks, 39% of them by
+    two cells or more. Confined to its own cell such a head recovers 0.4 um of a
+    2.7 um error; reaching over a couple of cells is what makes it worth having.
+
+    Returns
+    -------
+    target : (B, 3, Z, Y, X)  the vector to the nearest cell centre, grid voxels
+    valid  : (B, Z, Y, X)     bool, True where a cell was in range to vote for
+    """
+    B, M = coords.shape[:2]
+    device = coords.device
+    Z, Y, X = spatial
+    n_vox = B * Z * Y * X
+
+    p = coords.float()
+    if unet_scaling is not None:
+        p = p / torch.tensor(unet_scaling, dtype=p.dtype, device=device)
+
+    r = max(int(radius), 0)
+    off = torch.arange(-r, r + 1, device=device)
+    oz, oy, ox = torch.meshgrid(off, off, off, indexing="ij")
+    oz, oy, ox = oz.reshape(-1), oy.reshape(-1), ox.reshape(-1)   # (K,)
+
+    base = p.floor().long()                                        # (B, M, 3)
+    zc = base[..., 0:1] + oz                                       # (B, M, K)
+    yc = base[..., 1:2] + oy
+    xc = base[..., 2:3] + ox
+
+    in_range = (
+        mask.unsqueeze(-1)
+        & (zc >= 0) & (zc < Z)
+        & (yc >= 0) & (yc < Y)
+        & (xc >= 0) & (xc < X)
+    )
+    bidx = torch.arange(B, device=device).view(B, 1, 1).expand_as(zc)
+    flat = ((bidx * Z + zc.clamp(0, Z - 1)) * Y + yc.clamp(0, Y - 1)) * X + xc.clamp(0, X - 1)
+    # One spare slot absorbs the out-of-range votes, then is dropped.
+    flat = torch.where(in_range, flat, torch.full_like(flat, n_vox))
+
+    vec = torch.stack(
+        [p[..., 0:1] - zc, p[..., 1:2] - yc, p[..., 2:3] - xc], dim=-1
+    )                                                              # (B, M, K, 3)
+    dist = vec.norm(dim=-1)
+    dist = torch.where(in_range, dist, torch.full_like(dist, float("inf")))
+
+    # Nearest cell wins the voxel, so a cell never votes over a closer one.
+    best = torch.full((n_vox + 1,), float("inf"), device=device)
+    best.scatter_reduce_(0, flat.reshape(-1), dist.reshape(-1), reduce="amin")
+    win = in_range & (dist <= best[flat] + 1e-6)
+
+    target = torch.zeros(3, n_vox + 1, device=device)
+    for c in range(3):
+        target[c].scatter_(0, flat[win], vec[..., c][win])
+    valid = torch.zeros(n_vox + 1, dtype=torch.bool, device=device)
+    valid.scatter_(0, flat[win], torch.ones_like(flat[win], dtype=torch.bool))
+
+    return (
+        target[:, :n_vox].view(3, B, Z, Y, X).movedim(0, 1).contiguous(),
+        valid[:n_vox].view(B, Z, Y, X),
+    )
+
+
 def _top_k_peaks(
     probas: torch.Tensor,     # (Z, Y, X)
     peak_mask: torch.Tensor,  # (Z, Y, X) bool — local maxima, unthresholded

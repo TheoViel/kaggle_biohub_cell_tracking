@@ -17,6 +17,7 @@ from tracking.fit_utils import (
     filter_frame_det,
     split_frame_det,
 )
+from training.distributed import unwrap_model
 
 
 def _evaluate_pair(
@@ -100,6 +101,42 @@ def _adjustment_factor(frame_nodes: dict, n_frames: dict) -> float:
     return sum(factors) / len(factors) if factors else 0.0
 
 
+def _output_stride(model) -> tuple[int, int, int] | None:
+    """How much coarser the UNet's grid is than the image, or None if unknown."""
+    unet = getattr(unwrap_model(model), "unet", None)
+    unet = getattr(unet, "module", unet)  # DataParallel
+    stride = getattr(unet, "output_stride", None)
+    return tuple(stride) if stride is not None else None
+
+
+def _matched_within(
+    det_coords: torch.Tensor,   # (N, 3) in UNet output space
+    det_mask: torch.Tensor,     # (N,) bool
+    matches: torch.Tensor,      # (N,) GT index per detection, -1 for unmatched
+    keep: torch.Tensor,         # (N,) bool, this threshold's subset
+    gt_coords: torch.Tensor,    # (M, 3) in image voxel space
+    scaling: tuple[int, int, int],
+    voxel_size: tuple[float, float, float],
+    tol_um: float,
+) -> int:
+    """Of the matches this threshold keeps, how many are within ``tol_um``.
+
+    detect_and_match assigns greedily in ascending distance under a 7 um gate,
+    so filtering its output by a smaller distance gives exactly the assignment
+    a run gated at that distance would have produced — no rematching needed.
+    """
+    sel = keep[: len(matches)] & (matches >= 0)
+    if not bool(sel.any()):
+        return 0
+    idx = torch.nonzero(sel, as_tuple=False).squeeze(1)
+    gt_idx = matches[idx]
+    vs = torch.tensor(voxel_size, device=det_coords.device, dtype=torch.float32)
+    scale = torch.tensor(scaling, device=det_coords.device, dtype=torch.float32)
+    # Detections live on the coarse grid; put them back in image voxels first.
+    d = ((det_coords[idx] * scale - gt_coords[gt_idx]) * vs).norm(dim=-1)
+    return int((d <= tol_um).sum())
+
+
 def _gather_dicts(local: dict, world_size: int) -> dict:
     """Merge one dict per rank; later ranks win on a key, which is fine here
     because a (sample, frame) count is the same whichever rank produced it."""
@@ -133,7 +170,8 @@ def evaluate(
 ) -> tuple[float, dict, dict, dict, dict]:
     """Evaluate on a sharded validation loader across all ranks.
 
-    Returns ``(avg_loss, edge_jaccard, node_recall, adjustment, edge_recall)``
+    Returns ``(avg_loss, edge_jaccard, node_recall, adjustment, edge_recall,
+    node_recall_tight)``
     where every metric but the loss is keyed by detection threshold; the loss is
     reported at the configured one. ``adjustment`` is the competition's
     node-count penalty, 1 - 0.1 * (T_pred - T_true) / T_true, averaged over
@@ -156,9 +194,19 @@ def evaluate(
         {base} | {t for t in getattr(args, "eval_thresholds", ()) or () if t >= base}
     )
 
+    # A second, tighter matching radius. The competition's 7 um tolerance is
+    # wider than a cell, so node_rec at it saturates — a detector that never
+    # trained already scores ~0.91 — and cannot rank two models. Re-scoring the
+    # same matches at a few um is what still discriminates.
+    tight_um = float(getattr(args, "eval_node_match_um", 0.0) or 0.0)
+    scaling = _output_stride(model)
+    if tight_um and scaling is None:
+        tight_um = 0.0
+
     model.eval()
     gt_total = 0
     gt_matched = {t: 0 for t in thresholds}
+    gt_matched_tight = {t: 0 for t in thresholds}
     total_loss = {t: 0.0 for t in thresholds}
     tp = {t: 0 for t in thresholds}
     fp = {t: 0 for t in thresholds}
@@ -203,8 +251,14 @@ def evaluate(
                 for t in thresholds:
                     # Subset of the peaks already detected, by their own score.
                     keep = det_mask[b] & (scores[b] > t)
-                    gt_matched[t] += int((matches[b][keep[: len(matches[b])]] >= 0).sum())
+                    sel = matches[b][keep[: len(matches[b])]]
+                    gt_matched[t] += int((sel >= 0).sum())
                     frame_nodes[t][(names[b], t_starts[b] + i)] = int(keep.sum())
+                    if tight_um:
+                        gt_matched_tight[t] += _matched_within(
+                            frame_det[i][0][b], det_mask[b], matches[b], keep,
+                            coords[b, i], scaling, voxel_size, tight_um,
+                        )
 
         if not eval_edges:
             continue
@@ -245,11 +299,12 @@ def evaluate(
         + [fn[t] for t in thresholds]
         + [n_pairs[t] for t in thresholds]
         + [gt_matched[t] for t in thresholds]
+        + [gt_matched_tight[t] for t in thresholds]
         + [gt_total],
         device,
     )
-    loss_a, tp_a, fp_a, fn_a, pairs_a, matched_a = (
-        flat[i * n : (i + 1) * n] for i in range(6)
+    loss_a, tp_a, fp_a, fn_a, pairs_a, matched_a, tight_a = (
+        flat[i * n : (i + 1) * n] for i in range(7)
     )
     gt_total_all = flat[-1]
 
@@ -262,6 +317,12 @@ def evaluate(
     node_recall = {
         t: matched_a[i] / max(gt_total_all, 1.0) for i, t in enumerate(thresholds)
     }
+    if tight_um:
+        node_recall_tight = {
+            t: tight_a[i] / max(gt_total_all, 1.0) for i, t in enumerate(thresholds)
+        }
+    else:
+        node_recall_tight = {}
     avg_loss = loss_a[thresholds.index(base)] / max(pairs_a[thresholds.index(base)], 1.0)
 
     world = dist.get_world_size() if (dist.is_available() and dist.is_initialized()) else 1
@@ -270,4 +331,158 @@ def evaluate(
         t: _adjustment_factor(_gather_dicts(frame_nodes[t], world), n_frames_all)
         for t in thresholds
     }
-    return avg_loss, edge_jaccard, node_recall, adjustment, edge_recall
+    return avg_loss, edge_jaccard, node_recall, adjustment, edge_recall, node_recall_tight
+
+
+def evaluate_videos(
+    model,
+    paths: list[Path],
+    args,
+    device: torch.device | None = None,
+    thresholds: tuple[float, ...] = (0.2, 0.3, 0.4),
+) -> dict[float, dict[str, float]]:
+    """Competition metrics from full-video inference, per detection threshold.
+
+    ``evaluate`` above scores detections against the GT points inside a
+    validation window. For a stage that only trains the detector that says
+    very little: node recall at the competition's 7 um tolerance saturates —
+    an untrained peak finder already scores ~0.91 — so it cannot rank two
+    detectors. This instead runs the real inference path over whole videos and
+    scores the resulting tracks the way the competition does, so
+    ``adj_edge_jaccard`` actually moves when detection improves.
+
+    Edges come from ``cfg.edge_mode``. During detection pretraining the edge
+    transformer is still at init and would only add noise, so "nearest" links
+    each child to its closest parent instead — good enough to turn a node set
+    into a track graph, and it keeps the number a function of detection alone.
+
+    Videos are sharded across ranks and the per-sample rows gathered, so every
+    rank returns the same summary.
+
+    Whole videos only, deliberately: node recall counts matched GT nodes over
+    *all* GT nodes, so predicting a prefix of the frames would divide by the
+    full total and report a fraction of the truth (20 of 100 frames reads as
+    0.12 where the real number is 1.00). Budget the cost with how many videos
+    are passed in, not with how much of each one is scored.
+    """
+    import contextlib
+    import io
+
+    import pandas as pd
+    import tracksdata as td
+
+    from params import SCALE
+    from tracking.post_process import build_graph
+    from tracking.predict import PredictConfig, predict_video_thresholds
+    from tracking_cellmot.metrics import (
+        evaluate as evaluate_graph,
+        nan_metrics_row,
+        node_recall,
+        per_sample_metrics,
+        summarise,
+    )
+
+    if device is None:
+        device = next(model.parameters()).device
+    thresholds = sorted({float(t) for t in thresholds})
+    if not paths:
+        return {}
+
+    data_dir = Path(args.data_dir)
+    meta_csv = data_dir.parent / "metadata.csv"
+    meta = pd.read_csv(meta_csv) if meta_csv.exists() else None
+
+    # Mirror what training detected with, or the thresholds mean something else.
+    cfg = PredictConfig()
+    cfg.normalization = getattr(args, "normalization", None)
+    cfg.nms = getattr(args, "nms", "greedy")
+    cfg.nms_radius_um = getattr(args, "nms_radius_um", 7.0)
+    cfg.pool_kernel_um = getattr(args, "pool_kernel_um", 5.0)
+    cfg.use_offset = bool(getattr(args, "offset_head", False))
+    cfg.edge_mode = getattr(args, "eval_edge_mode", "nearest")
+    cfg.max_link_um = float(getattr(args, "eval_max_link_um", 15.0))
+
+    world = dist.get_world_size() if (dist.is_available() and dist.is_initialized()) else 1
+    rank = dist.get_rank() if world > 1 else 0
+
+    was_training = model.training
+    model.eval()
+    core = unwrap_model(model)
+
+    rows: dict[float, list[dict]] = {t: [] for t in thresholds}
+    for path in paths[rank::world]:
+        per_threshold, _ = predict_video_thresholds(
+            core,
+            path,
+            thresholds,
+            device=device,
+            cfg=cfg,
+            window_size=args.window_size,
+            downscale_factor=getattr(args, "downscale_factor", 1),
+            progress=False,
+            return_det_logits=False,
+        )
+
+        gt = td.graph.IndexedRXGraph.from_geff(data_dir / f"{path.name}.geff")
+        gt_graph = gt[0] if isinstance(gt, tuple) else gt
+
+        n_total = float("nan")
+        if meta is not None:
+            hit = meta.loc[meta["sample_name"] == path.name, "estimated_number_of_nodes"]
+            if len(hit):
+                n_total = float(hit.values[0])
+
+        for th in thresholds:
+            coords, edges = per_threshold[th]
+            # An empty prediction is a real state early in training, and one
+            # the metric does not survive: evaluate_graph warns and returns a
+            # zero score, but node_recall then reads a match column that was
+            # never written and raises KeyError. It is a genuine zero, not
+            # missing data, so it is scored rather than skipped -- NaN here
+            # would quietly drop the worst samples out of the average.
+            if coords.shape[0] == 0 or len(edges) == 0:
+                # Every ground-truth edge is a false negative, which is what
+                # makes the Jaccard 0 rather than 0/0. Leaving the counts at
+                # zero would micro-average to NaN and take the sample out of
+                # the run summary -- the one sample that most deserves to be
+                # in it.
+                row = {**nan_metrics_row(), "num_pred_nodes": int(coords.shape[0])}
+                row.update(
+                    edge_tp=0, edge_fp=0, edge_fn=int(gt_graph.num_edges()),
+                    division_tp=0, division_fp=0, division_fn=0,
+                    node_recall=0.0, edge_jaccard=0.0, adj_edge_jaccard=0.0,
+                )
+                row["n_nodes_pred"] = int(coords.shape[0])
+                rows[th].append(row)
+                continue
+            # build_graph is chatty on some builds; keep the log readable.
+            with contextlib.redirect_stdout(io.StringIO()):
+                graph = build_graph(coords, edges)
+                res = evaluate_graph(graph, gt_graph, scale=SCALE)
+                rec = node_recall(graph, gt_graph)
+            row = per_sample_metrics(res, n_total, rec)
+            row["n_nodes_pred"] = int(coords.shape[0])
+            rows[th].append(row)
+
+    if was_training:
+        model.train()
+
+    if world > 1:
+        parts: list[dict | None] = [None] * world
+        dist.all_gather_object(parts, rows)
+        rows = {
+            t: [r for part in parts if part for r in part[t]] for t in thresholds
+        }
+
+    out: dict[float, dict[str, float]] = {}
+    for th in thresholds:
+        if not rows[th]:
+            continue
+        summary = summarise(rows[th])
+        out[th] = {
+            "node_recall": float(summary.get("node_recall", float("nan"))),
+            "edge_jaccard": float(summary.get("edge_jaccard", float("nan"))),
+            "adj_edge_jaccard": float(summary.get("adj_edge_jaccard", float("nan"))),
+            "score": float(summary.get("score", float("nan"))),
+        }
+    return out

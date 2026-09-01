@@ -195,7 +195,7 @@ def define_optimizer(
     return optimizer
 
 
-def define_scheduler(optimizer, train_loader, epochs, warmup_prop=0.0):
+def define_scheduler(optimizer, train_loader, epochs, warmup_prop=0.0, total_steps=None):
     """
     Linear warmup then linear decay to 0, stepped once per optimizer step.
 
@@ -204,6 +204,10 @@ def define_scheduler(optimizer, train_loader, epochs, warmup_prop=0.0):
         train_loader (torch.utils.data.DataLoader): Loader, used for its length.
         epochs (int): Number of training epochs.
         warmup_prop (float, optional): Proportion of steps spent warming up. Defaults to 0.
+        total_steps (int, optional): Explicit step budget, overriding
+            ``epochs * len(train_loader)``. Pass this when training is bounded
+            by iterations rather than epochs, so the decay reaches 0 exactly at
+            the last step whatever the loader's length.
 
     Returns:
         torch.optim.lr_scheduler.LambdaLR: The scheduler.
@@ -211,7 +215,9 @@ def define_scheduler(optimizer, train_loader, epochs, warmup_prop=0.0):
     if not 0.0 <= warmup_prop < 1.0:
         raise ValueError("warmup_prop must be in [0, 1)")
 
-    total_steps = max(1, epochs * len(train_loader))
+    if total_steps is None:
+        total_steps = epochs * len(train_loader)
+    total_steps = max(1, int(total_steps))
     warmup_steps = int(total_steps * warmup_prop)
 
     def lr_multiplier(step):

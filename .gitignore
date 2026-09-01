@@ -15,6 +15,7 @@ input/
 output/
 logs/
 weights/
+dataset/
 
 # Local notes
 meeting-minutes/

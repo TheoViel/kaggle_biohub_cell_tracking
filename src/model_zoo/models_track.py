@@ -1,4 +1,4 @@
-"""Cell tracking model: TemporalUNet3D + detection head + SimpleNodeTransformer."""
+"""Cell tracking model: temporal U-Net + detection head + SimpleNodeTransformer."""
 
 from __future__ import annotations
 
@@ -6,11 +6,18 @@ import torch
 import torch.nn as nn
 
 from model_zoo.simple_node_transformer import SimpleNodeTransformer
+from model_zoo.temporal_resenc_unet import TemporalResEncUNet3D
 from model_zoo.temporal_unet import TemporalUNet3D
 
 
+# Backbones the tracking model can be built on, by name. "temporal" is the plain two-conv
+# U-Net; "resenc" is the nnU-Net residual encoder at the same geometry, which is deeper at
+# equal widths. Both take the same geometry arguments and return (B, T, C, Z', Y', X').
+UNET_BACKBONES = {"temporal": TemporalUNet3D, "resenc": TemporalResEncUNet3D}
+
+
 class UNetNodeTransformer(nn.Module):
-    """TemporalUNet3D encoder + detection head + SimpleNodeTransformer edge predictor.
+    """Temporal U-Net encoder + detection head + SimpleNodeTransformer edge predictor.
 
     Forward path during training:
       1. imgs (B, W, *spatial) → UNet → (B, W, C_feat, *spatial) + W×(B,1,*spatial) det_logits
@@ -21,7 +28,7 @@ class UNetNodeTransformer(nn.Module):
 
     def __init__(
         self,
-        unet: TemporalUNet3D,
+        unet: TemporalUNet3D | TemporalResEncUNet3D,
         unet_out_channels: int,
         pos_feat_dim: int = 0,
         hidden_dim: int = 128,
@@ -31,10 +38,12 @@ class UNetNodeTransformer(nn.Module):
         edge_knn_k: int | None = None,
         edge_geom_feats: bool = True,
         edge_drift_correction: bool = False,
-        embed_unet: TemporalUNet3D | None = None,
+        embed_unet: TemporalUNet3D | TemporalResEncUNet3D | None = None,
         embed_unet_out_channels: int = 32,
         embed_dim: int = 32,
         unet_features: tuple[str, ...] = ("detection",),
+        offset_head: bool = False,
+        offset_radius: int = 2,
         verbose: int = 0,
     ):
         super().__init__()
@@ -47,6 +56,21 @@ class UNetNodeTransformer(nn.Module):
             nn.Dropout(dropout),
             nn.Conv3d(unet_out_channels, 1, kernel_size=1),
         )
+
+        # Where the cell actually is, as a vector from each voxel to its centre
+        # — the segmentation branch's centroid vote on the detection grid. The
+        # detect head answers "a cell is in this 1.625 um cell" and the grid
+        # centre is then the best guess available, which is worth about 0.8 um
+        # of error on its own and rather more when the peak lands one cell off.
+        self.offset_radius = int(offset_radius)
+        self.offset_head = None
+        if offset_head:
+            self.offset_head = nn.Sequential(
+                nn.Conv3d(unet_out_channels, unet_out_channels, kernel_size=1),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Conv3d(unet_out_channels, 3, kernel_size=1),
+            )
 
         # Second, independent UNet trained purely to tell cells apart. The
         # detection UNet cannot do that job: its loss asks only "is a cell
@@ -115,7 +139,7 @@ class UNetNodeTransformer(nn.Module):
         self,
         imgs: torch.Tensor,  # (B, W, *spatial) — already downsampled, single channel
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        """Run TemporalUNet3D on W frames.
+        """Run the temporal U-Net on W frames.
 
         Returns
         -------
@@ -138,6 +162,32 @@ class UNetNodeTransformer(nn.Module):
             print(f"UNetNodeTransformer - Encode - Detect logits shape: {[det.shape for det in det_logits]}")
 
         return unet_out, det_logits
+
+    def encode_offsets(
+        self,
+        unet_out: torch.Tensor,  # (B, W, C, *spatial) — from encode()
+    ) -> list[torch.Tensor] | None:
+        """Centroid votes per frame, in detection-grid voxels, or None.
+
+        Bounded to ``offset_radius + 1`` voxels by a tanh. Nothing in the target
+        ever asks for more — a voxel only votes for a cell inside the radius —
+        and at inference an unbounded head could throw a detection clear across
+        the field on a voxel it has no opinion about.
+
+        Takes ``unet_out`` rather than the images so the encoder runs once;
+        callers already have it from ``encode``.
+
+        Returns
+        -------
+        list of W tensors, each (B, 3, *spatial), or None if the head is off.
+        """
+        if self.offset_head is None:
+            return None
+        limit = float(self.offset_radius + 1)
+        return [
+            limit * torch.tanh(self.offset_head(unet_out[:, i]))
+            for i in range(unet_out.shape[1])
+        ]
 
     def encode_embed(
         self,
@@ -190,6 +240,13 @@ def define_track_model(
     unet_layers: list[int] | None = None,
     unet_pool_stride: int | tuple[int, int, int] = 2,
     unet_n_decode_steps: int | None = None,
+    unet_arch: str = "temporal",
+    unet_n_anisotropic: int = 2,
+    unet_blocks_per_stage: list[int] | None = None,
+    unet_temporal_attention: bool = True,
+    unet_stem: str = "stride",
+    unet_norm: str = "batch",
+    unet_hires_fusion: bool = False,
     transformer_hidden: int = 128,
     transformer_heads: int = 4,
     transformer_blocks: int = 4,
@@ -201,6 +258,8 @@ def define_track_model(
     gradient_checkpointing: bool = False,
     contrastive: dict | None = None,
     unet_features: tuple[str, ...] = ("detection",),
+    offset_head: bool = False,
+    offset_radius: int = 2,
     verbose: int = 0,
 ) -> UNetNodeTransformer:
     """Build the full tracking model (UNet + detect head + transformer).
@@ -217,18 +276,57 @@ def define_track_model(
     unet_n_decode_steps : int or None
         Number of decoder stages.  None = fully symmetric.  0 = no
         decoder (output at bottleneck resolution).
+    unet_arch : str
+        Which backbone to build, see ``UNET_BACKBONES``.  ``"temporal"``
+        is the plain two-conv U-Net, ``"resenc"`` the nnU-Net residual
+        encoder at the same geometry.
+    unet_n_anisotropic : int
+        How many downsampling steps use ``unet_pool_stride`` before the
+        rest go isotropic.  The stem's own step counts as the first.
+    unet_blocks_per_stage : list of int or None
+        Residual blocks per encoder stage.  None takes nnU-Net's
+        ``(1, 3, 4, 6, 6, ...)`` on ResEnc and the plain two-conv block on
+        ``TemporalUNet3D``; give it e.g. ``[1, 3, 4]`` to put residual depth
+        behind the temporal backbone as well.
+    unet_temporal_attention : bool
+        If False, the backbone drops its temporal attention blocks and the
+        frames of a window are encoded independently.
+    unet_stem : str
+        Temporal backbone only: ``"unshuffle"`` folds the stem's downsampling
+        block into the channel axis so no Y/X detail is dropped before the
+        first convolution; ``"stride"`` is the strided convolution it replaces.
+    unet_norm : str
+        Temporal backbone only: ``"batch"`` / ``"instance"`` / ``"group"``.
+    unet_hires_fusion : bool
+        Temporal backbone only: pool the encoder skips finer than the head's
+        grid back into the head instead of discarding them.
     """
     if unet_layers is None:
         unet_layers = [32, 64, 128]
+    if unet_arch not in UNET_BACKBONES:
+        raise ValueError(f"unknown unet_arch {unet_arch!r}, expected one of {sorted(UNET_BACKBONES)}")
 
-    unet = TemporalUNet3D(
+    backbone = UNET_BACKBONES[unet_arch]
+    # Stem layout, normalisation and skip fusion are TemporalUNet3D's; the ResEnc
+    # encoder fixes all three by construction.
+    extra = (
+        {}
+        if unet_arch == "resenc"
+        else {"stem": unet_stem, "norm": unet_norm, "hires_skip_fusion": unet_hires_fusion}
+    )
+
+    unet = backbone(
         in_channels=1,
         out_channels=unet_out_channels,
         layers=unet_layers,
+        blocks_per_stage=unet_blocks_per_stage,
         gradient_checkpointing=gradient_checkpointing,
         pool_stride=unet_pool_stride,
+        n_anisotropic=unet_n_anisotropic,
         n_decode_steps=unet_n_decode_steps,
+        temporal_attention=unet_temporal_attention,
         verbose=verbose,
+        **extra,
     )
 
     # The embedding UNet keeps the detection UNet's output stride, so node
@@ -239,14 +337,25 @@ def define_track_model(
     contrastive = contrastive or {}
     embed_unet = None
     if "contrastive" in unet_features:
-        embed_unet = TemporalUNet3D(
+        embed_layers = list(contrastive.get("unet_layers", unet_layers))
+        embed_unet = backbone(
             in_channels=1,
             out_channels=contrastive.get("unet_out_channels", 32),
-            layers=list(contrastive.get("unet_layers", unet_layers)),
+            layers=embed_layers,
+            # The contrastive branch may run a shallower encoder, in which case
+            # the depth schedule is not its to reuse.
+            blocks_per_stage=(
+                unet_blocks_per_stage
+                if unet_blocks_per_stage and len(unet_blocks_per_stage) == len(embed_layers)
+                else None
+            ),
             gradient_checkpointing=gradient_checkpointing,
             pool_stride=unet_pool_stride,
+            n_anisotropic=unet_n_anisotropic,
             n_decode_steps=unet_n_decode_steps,
+            temporal_attention=unet_temporal_attention,
             verbose=verbose,
+            **extra,
         )
 
     return UNetNodeTransformer(
@@ -263,6 +372,8 @@ def define_track_model(
         embed_unet_out_channels=contrastive.get("unet_out_channels", 32),
         embed_dim=contrastive.get("embed_dim", 32),
         unet_features=unet_features,
+        offset_head=offset_head,
+        offset_radius=offset_radius,
         dropout=transformer_dropout,
         verbose=verbose,
     )

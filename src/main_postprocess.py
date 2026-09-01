@@ -8,14 +8,45 @@ Writes <log_folder>/preds_pp/*.npz  — the same format, post-processed
 
     python main_postprocess.py --log_folder ../logs/2026-08-20/20/
 
+--pl post-processes a pseudo-labelling pass instead — the predictions
+main_predict.py --pl made on the fold's *training* embryos. It reads preds_pl
+and writes preds_pl_pp / geff_pl_pp, so the two never touch each other's
+output, and it picks its threshold from scores_pl<_th>.json rather than from
+the val scores, which were measured on different embryos:
+
+    python main_postprocess.py --log_folder ../logs/2026-08-20/20/ --pl
+
 Three stages, each switchable — see src/postprocessing/README.md for how they were
 chosen and what each is worth. Measured over the 71 validation stacks of
 logs/2026-08-20/20/, adjusted edge Jaccard:
 
     tracker as-is                       0.7592
-    --no_pp_public   (pipeline only)    0.8065   improves 68 of 71 stacks
-    (default)                           0.8197   improves 59, regresses 10
-    --ilp                               0.8203   +0.0006 for ~40 s a stack
+    --no_pp_public   (pipeline only)    0.8130
+    (default)                           0.8251
+    --ilp                               +0.0006 for ~40 s a stack, not worth it
+
+and over the 71 of logs/2026-08-26/4/preds_0.25, which is where the gap
+recovery below was measured:
+
+    tracker as-is                       0.7603
+    --no_pp_public --no_recover         0.8076
+    --no_pp_public                      0.8238
+    --no_recover                        0.8217
+    (default)                           0.8280
+
+Gap recovery (--no_recover to turn it off) puts back the detections the
+detector dropped for a run of one to three frames, by interpolating between the
+track that ends before the hole and the one that starts after it, with the
+sample's own drift removed first. It is worth +0.0161 on its own and +0.0063
+under pp_public, and costs a second re-linking pass (5.5 -> 11.1 s a stack).
+--recover_passes 2 iterates it; that is worth +0.0002 for 50% more time.
+
+The pipeline also corrects a grid-centring error in the saved coordinates: the
+detection grid is 4x coarser than the image in y and x and a cell was reported
+at its corner rather than its centre, a fixed -0.61 um shift. It is applied only
+to npz files that still carry it, detected from the coordinates themselves, so
+running this over predictions made after the fix in tracking/predict.py is safe.
+Worth +0.0065 to the pipeline alone, +0.0015 after pp_public (--no_recentre).
 
 Stacks are shared across worker processes; nothing here needs a GPU or the
 image data.
@@ -36,12 +67,14 @@ import tracksdata as td
 # that work whether this is run from src/ or from the repository root.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "postprocessing"))
 
-from params import SCALE, TRAIN_DIR  # noqa: E402
+from params import EMBRYOS, SCALE, TRAIN_DIR  # noqa: E402
+from pipeline import DEFAULTS as PIPELINE_DEFAULTS  # noqa: E402
 from stages import run_ilp, run_pipeline, run_pp_public  # noqa: E402
 from tracking.post_process import build_graph  # noqa: E402
 from tracking_cellmot.io import save_graph  # noqa: E402
 from tracking_cellmot.metrics import (  # noqa: E402
     evaluate,
+    macro_summarise,
     node_recall,
     per_sample_metrics,
     summarise,
@@ -60,15 +93,38 @@ def parse_args():
     )
     p.add_argument("--log_folder", required=True,
                    help="run folder holding preds/*.npz")
+    p.add_argument("--pl", action="store_true",
+                   help="post-process a pseudo-labelling run: read preds_pl "
+                        "instead of preds, and write preds_pl_pp / geff_pl_pp")
     p.add_argument("--preds_dir", default=None,
-                   help="override the input directory (default <log_folder>/preds)")
+                   help="override the input directory (default: preds_<th> of the "
+                        "best-scoring threshold found in <log_folder>/scores_<th>.json, "
+                        "or the preds_pl_<th> / scores_pl_<th> pair under --pl)")
+    p.add_argument("--th", type=float, default=None,
+                   help="detection threshold to post-process, naming the "
+                        "preds_<th> folder; default = the best-scoring one")
     p.add_argument("--out_dir", default=None,
                    help="override the npz output (default <log_folder>/preds_pp)")
     p.add_argument("--geff_dir", default=None,
                    help="override the geff output (default <log_folder>/geff_pp)")
 
+    p.add_argument("--no_recentre", action="store_true",
+                   help="skip the grid-centring correction (applied only to npz "
+                        "files that still need it, detected from the coordinates)")
     p.add_argument("--no_pipeline", action="store_true",
                    help="skip the re-linking and short-track pruning")
+    p.add_argument("--no_recover", action="store_true",
+                   help="skip putting back the detections missed for a frame or two")
+    p.add_argument("--recover_max_gap", type=int,
+                   default=PIPELINE_DEFAULTS["recover_max_gap"],
+                   help="longest run of missing frames to fill (default %(default)s)")
+    p.add_argument("--recover_passes", type=int,
+                   default=PIPELINE_DEFAULTS["recover_passes"],
+                   help="rounds of recover + relink (default %(default)s)")
+    p.add_argument("--recover_max_residual", type=float,
+                   default=PIPELINE_DEFAULTS["recover_max_residual"],
+                   help="um of drift-corrected motion allowed across a one-frame "
+                        "gap, scaled by span for longer ones (default %(default)s)")
     p.add_argument("--no_pp_public", action="store_true",
                    help="skip tracking.pp_public.postprocess_graph")
     p.add_argument("--ilp", action="store_true",
@@ -81,6 +137,85 @@ def parse_args():
     p.add_argument("--no_score", action="store_true",
                    help="post-process only; do not score against ground truth")
     return p.parse_args()
+
+
+def _best_threshold_preds_dir(log_folder, pl=False, th=None):
+    """The predictions folder of the best-scoring sweep threshold.
+
+    main_predict.py writes one scores_<th>.json per threshold next to
+    preds_<th>/. A --pl run names both halves after the pseudo-label split:
+    scores_pl_<th>.json beside preds_pl_<th>/, or plain scores_pl.json beside
+    preds_pl/ when a lone threshold was predicted (``_out_dir_for`` only
+    suffixes the folder for a sweep). The two families are kept apart in both
+    directions — a val run must not pick a pseudo-label threshold, and vice
+    versa — since they are scored on different embryos.
+
+    ``th`` picks a threshold explicitly instead. That needs no scores file, so
+    the folder is resolved without reading any — a run whose scores were never
+    written, or whose best threshold is not the one wanted, is still usable.
+    """
+    stem, base = ("scores_pl", "preds_pl") if pl else ("scores", "preds")
+
+    if th is None:
+        # Only files that name a threshold. The glob also matches this
+        # script's own scores_pp.json, which carries no threshold and -- being
+        # post-processed -- outscores every raw one, so it would win the
+        # comparison below and then fail on the lookup. That made a second
+        # post-processing pass over the same folder crash.
+        score_files = [
+            f for f in log_folder.glob(f"{stem}*.json")
+            if (pl or not f.stem.startswith("scores_pl"))
+            and json.loads(f.read_text()).get("threshold") is not None
+        ]
+        if not score_files:
+            raise SystemExit(
+                f"No {stem}<_th>.json under {log_folder}; "
+                "pass --th or --preds_dir explicitly"
+            )
+        # cv_score when the run scored more than one embryo -- the pooled
+        # score would pick whichever threshold suits the embryo contributing
+        # the most stacks. Older score files predate the field, so fall back.
+        best_file, best_score, best, best_key = None, float("-inf"), None, "score"
+        for f in score_files:
+            scores = json.loads(f.read_text())
+            key = "cv_score" if scores.get("cv_score") is not None else "score"
+            score = scores[key] if key == "cv_score" else scores["overall"]["score"]
+            if score is not None and score == score and score > best_score:
+                best_file, best_score, best, best_key = f, score, scores, key
+        if best is None:
+            raise SystemExit(
+                f"Every {stem}*.json under {log_folder} scored NaN; pass --th"
+            )
+        th = best["threshold"]
+        print(
+            f"-> best threshold: {th:g}  ({best_key}={best_score:.4f}, "
+            f"from {best_file.name})"
+        )
+
+        preds_dir = log_folder / f"{base}_{th:.2f}"
+        # A lone-threshold run writes the unsuffixed folder (_out_dir_for only
+        # suffixes for a sweep), so fall back to it.
+        if not preds_dir.is_dir():
+            preds_dir = log_folder / base
+        return preds_dir
+
+    print(f"-> using threshold: {th:g}")
+    preds_dir = log_folder / f"{base}_{th:.2f}"
+    if not preds_dir.is_dir():
+        # Same lone-threshold fallback, but only when the plain folder is
+        # genuinely the one asked for: silently post-processing a different
+        # threshold than --th requested would be scored as if it were this one.
+        plain = log_folder / base
+        scores_plain = log_folder / f"{stem}.json"
+        if plain.is_dir() and scores_plain.exists():
+            got = json.loads(scores_plain.read_text()).get("threshold")
+            if got is not None and abs(float(got) - th) < 1e-9:
+                return plain
+        raise SystemExit(
+            f"No {preds_dir.name}/ under {log_folder} for --th {th:g}. "
+            f"Available: {', '.join(sorted(p.name for p in log_folder.glob(f'{base}*') if p.is_dir())) or 'none'}"
+        )
+    return preds_dir
 
 
 def _to_graph(coords, edges):
@@ -129,7 +264,14 @@ def process(job):
     n_in = (len(coords), len(edges))
 
     if not cfg["no_pipeline"]:
-        coords, edges = run_pipeline(coords, edges)
+        coords, edges = run_pipeline(
+            coords, edges,
+            recentre=None if cfg["no_recentre"] else "auto",
+            recover=0 if cfg["no_recover"] else 1,
+            recover_max_gap=cfg["recover_max_gap"],
+            recover_passes=cfg["recover_passes"],
+            recover_max_residual=cfg["recover_max_residual"],
+        )
     if not cfg["no_pp_public"]:
         coords, edges = run_pp_public(coords, edges, sample=sample, **PP_PUBLIC_TUNED)
     if cfg["ilp"]:
@@ -138,7 +280,8 @@ def process(job):
     out_npz.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         out_npz,
-        coords=np.asarray(coords, dtype=np.int16),
+        # round, not truncate — see stages.run_pp_public.
+        coords=np.round(np.asarray(coords, dtype=np.float64)).astype(np.int16),
         edges=np.asarray(edges, dtype=np.float64).reshape(-1, 4),
     )
 
@@ -146,43 +289,66 @@ def process(job):
     Path(cfg["geff_dir"]).mkdir(parents=True, exist_ok=True)
     save_graph(graph, str(Path(cfg["geff_dir"]) / f"{sample}.geff"))
 
-    note = f"{n_in[0]}n/{n_in[1]}e -> {len(coords)}n/{len(edges)}e"
     if cfg["no_score"]:
-        return sample, None, note
+        return sample, None
 
     gt_path = Path(TRAIN_DIR) / f"{sample}.geff"
     if not gt_path.exists():
-        return sample, None, note + "  (no ground truth)"
+        return sample, None
 
     result = td.graph.IndexedRXGraph.from_geff(gt_path)
     gt_graph = result[0] if isinstance(result, tuple) else result
     res = evaluate(graph, gt_graph, scale=SCALE)
     recall = node_recall(graph, gt_graph)
     row = per_sample_metrics(res, _n_total(sample), recall)
+    # per_sample_metrics stops at the raw columns; 'score' and 'division_jaccard'
+    # come out of summarise, so roll this one sample up on its own — same as
+    # main_predict.py does per stack.
+    one = summarise([row])
+    row["division_jaccard"] = one["division_jaccard"]
+    row["score"] = one["score"]
     row["sample_name"] = sample
+    # A preds folder can hold several embryos at once, since main_predict runs
+    # every fold into one. Fold i holds out EMBRYOS[i], so the embryo names the
+    # fold that produced it; None when it is not one of the known embryos.
+    row["embryo"] = sample.split("_")[0]
+    row["fold"] = (
+        EMBRYOS.index(row["embryo"]) if row["embryo"] in EMBRYOS else None
+    )
     row["n_nodes_pred"] = len(coords)
     row["n_edges_pred"] = len(edges)
     row["n_nodes_estimated"] = _n_total(sample)
-    return sample, row, note
+    return sample, row
 
 
 def main():
     args = parse_args()
     log_folder = Path(args.log_folder)
-    preds_dir = Path(args.preds_dir) if args.preds_dir else log_folder / "preds"
-    out_dir = Path(args.out_dir) if args.out_dir else log_folder / "preds_pp"
-    geff_dir = Path(args.geff_dir) if args.geff_dir else log_folder / "geff_pp"
+    # Both name the input folder, so honouring one silently ignores the other.
+    if args.preds_dir and args.th is not None:
+        raise SystemExit("--th and --preds_dir both name the input; pass one")
+    # A pseudo-label pass keeps its own set of folders end to end, so it never
+    # overwrites the val predictions the run is actually scored on.
+    suffix = "_pl" if args.pl else ""
+    preds_dir = (Path(args.preds_dir) if args.preds_dir
+                 else _best_threshold_preds_dir(log_folder, pl=args.pl, th=args.th))
+    out_dir = Path(args.out_dir) if args.out_dir else log_folder / f"preds{suffix}_pp"
+    geff_dir = Path(args.geff_dir) if args.geff_dir else log_folder / f"geff{suffix}_pp"
 
     paths = sorted(preds_dir.glob("*.npz"))[: args.limit]
     if not paths:
         raise SystemExit(f"No npz files under {preds_dir}")
 
+    recover = not args.no_pipeline and not args.no_recover
     stages = [name for name, on in (
         ("pipeline", not args.no_pipeline),
+        (f"recover(gap<={args.recover_max_gap}, x{args.recover_passes}, "
+         f"r={args.recover_max_residual:g})", recover),
         ("pp_public(tuned)", not args.no_pp_public),
         ("ILP(tuned)", args.ilp),
     ) if on]
 
+    print(f"-> split     : {'train (pseudo-label)' if args.pl else 'val'}")
     print(f"-> reading   : {preds_dir}  ({len(paths)} stacks)")
     print(f"-> npz out   : {out_dir}")
     print(f"-> geff out  : {geff_dir}")
@@ -192,6 +358,11 @@ def main():
     cfg = dict(
         out_dir=str(out_dir), geff_dir=str(geff_dir),
         no_pipeline=args.no_pipeline, no_pp_public=args.no_pp_public, ilp=args.ilp,
+        no_recentre=args.no_recentre,
+        no_recover=args.no_recover,
+        recover_max_gap=args.recover_max_gap,
+        recover_passes=args.recover_passes,
+        recover_max_residual=args.recover_max_residual,
         no_score=args.no_score, skip_existing=args.skip_existing,
     )
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -199,11 +370,11 @@ def main():
 
     rows = []
     with Pool(args.jobs) as pool:
-        for i, (sample, row, note) in enumerate(
+        for i, (sample, row) in enumerate(
             pool.imap_unordered(process, [(str(p), cfg) for p in paths], chunksize=1)
         ):
-            score = f"  adjJ={row['adj_edge_jaccard']:.4f}" if row else ""
-            print(f"[{i + 1:>3d}/{len(paths)}] {sample:<16s} {note}{score}", flush=True)
+            score = f"node_recall={row['node_recall']:.3f}  adj_edge_jaccard={row['adj_edge_jaccard']:.3f}" if row else ""
+            print(f"[{i + 1:>3d}/{len(paths)}] {sample:<16s} - {score}", flush=True)
             if row:
                 rows.append(row)
 
@@ -212,10 +383,60 @@ def main():
         return
 
     df = pd.DataFrame(rows).sort_values("sample_name")
-    df.to_csv(out_dir / "metrics.csv", index=False)
+    df.to_csv(out_dir.parent / "metrics.csv", index=False)
     summary = summarise(rows)
-    with open(out_dir / "summary.json", "w") as f:
+    with open(out_dir.parent / "summary.json", "w") as f:
         json.dump(_jsonable(summary), f, indent=4, default=str)
+
+    # One summary per embryo, i.e. per fold. Kept separate rather than pooled:
+    # the embryos are annotated at very different densities and edge FP is only
+    # counted against annotated nodes, so a pooled figure averages two numbers
+    # that are not on the same scale.
+    by_embryo = {}
+    for row in rows:
+        by_embryo.setdefault(row.get("embryo", "?"), []).append(row)
+    group_summaries, macro = macro_summarise(rows)
+    per_embryo = {
+        emb: {
+            "fold": sorted(
+                {r["fold"] for r in by_embryo[emb] if r.get("fold") is not None}
+            ),
+            "n_samples": len(by_embryo[emb]),
+            **_jsonable(summary_emb),
+        }
+        for emb, summary_emb in group_summaries.items()
+    }
+
+    report_keys = (
+        "score", "edge_jaccard", "adj_edge_jaccard", "division_jaccard",
+        "node_recall", "edge_tp", "edge_fp", "edge_fn",
+        "n_nodes_pred", "n_edges_pred", "n_nodes_estimated",
+    )
+    worst = sorted(rows, key=lambda r: r["score"])[:10]
+    scores = {
+        "log_folder": str(log_folder),
+        "preds_dir": str(preds_dir),
+        "split": "train" if args.pl else "val",
+        "stages": stages,
+        "n_samples": len(rows),
+        # The headline number: the pooled "overall" score weights each embryo
+        # by its sample count, so it is close to the larger embryo's alone.
+        "cv_score": _jsonable(macro["score"]),
+        "macro": _jsonable(macro),
+        "overall": _jsonable(summary),
+        "per_embryo": per_embryo,
+        "per_sample": {
+            r["sample_name"]: _jsonable({k: r[k] for k in report_keys if k in r})
+            for r in sorted(rows, key=lambda r: r["sample_name"])
+        },
+        "worst_10": [
+            {"sample_name": r["sample_name"], "score": _jsonable(r["score"])}
+            for r in worst
+        ],
+    }
+    scores_path = out_dir.parent / "scores_pp.json"
+    with open(scores_path, "w") as f:
+        json.dump(scores, f, indent=4)
 
     print(f"\n{'=' * 60}")
     print(f"{len(rows)} stacks  ->  {out_dir}")
@@ -227,8 +448,24 @@ def main():
               "division_jaccard", "score"):
         if k in summary:
             print(f"- {k}: {summary[k]:.4f}")
-    print(f"\n-> metrics : {out_dir / 'metrics.csv'}")
-    print(f"-> summary : {out_dir / 'summary.json'}")
+    if macro["n_groups"] > 1:
+        print(f"- cv_score: {macro['score']:.4f}   (mean over "
+              f"{macro['n_groups']} embryos, not pooled)")
+
+    # Only when there is more than one, otherwise it repeats the block above.
+    if len(per_embryo) > 1:
+        cols = ("node_recall", "edge_jaccard", "adj_edge_jaccard",
+                "division_jaccard", "score")
+        print(f"\n  {'embryo':<10}{'fold':<6}{'n':<5}"
+              + "".join(f"{c:>18s}" for c in cols))
+        for emb, s in per_embryo.items():
+            fold_str = ",".join(str(f) for f in s["fold"]) or "-"
+            cells = "".join(f"{s.get(c, float('nan')):>18.4f}" for c in cols)
+            print(f"  {emb:<10}{fold_str:<6}{s['n_samples']:<5}{cells}")
+
+    print(f"\n-> metrics : {out_dir.parent / 'metrics.csv'}")
+    print(f"-> summary : {out_dir.parent / 'summary.json'}")
+    print(f"-> scores  : {scores_path}")
 
 
 if __name__ == "__main__":

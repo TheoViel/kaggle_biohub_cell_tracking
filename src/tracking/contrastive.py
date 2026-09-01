@@ -186,7 +186,7 @@ def fit_contrastive(
                 names = batch["name"]
                 if any(name not in node_cache for name in names):
                     with torch.no_grad():
-                        fresh, _, scaling = encode_nodes(
+                        fresh, _, scaling, _ = encode_nodes(
                             core_model, imgs, coords, masks, image_shape, voxel_size, args, node_features=False,
                         )
                     for b, name in enumerate(names):
@@ -288,7 +288,7 @@ def evaluate_contrastive(model, loader: DataLoader, args, device) -> float:
         voxel_size = tuple(batch["voxel_size"][0].tolist())
         window_size = imgs.shape[1]
 
-        frame_det, _, _ = encode_nodes(
+        frame_det, _, _, _ = encode_nodes(
             model, imgs, coords, masks, image_shape, voxel_size, args,
             nms=getattr(args, "nms", "greedy"),
             nms_radius_um=getattr(args, "nms_radius_um", 7.0),

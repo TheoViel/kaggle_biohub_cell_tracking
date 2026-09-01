@@ -23,6 +23,25 @@ _CACHE_SIGNATURE_KEYS = (
 )
 
 
+def resolve_run_path(path: str, fold: int, run_name: str | None = None) -> str:
+    """Point a checkpoint path at the directory of the run being trained.
+
+    Runs write to ``<output_dir>/<run_name>``, i.e. ``fold_0``, ``fold_1``, or
+    ``fold_fullfit``. A config that reuses a previous run's checkpoints wants
+    the matching one, so it writes ``fold_*`` once and this substitutes the
+    current run's own name:
+
+        .../fold_*/ckpt.pt   ->   .../fold_1/ckpt.pt   (on fold 1)
+                             ->   .../fold_fullfit/ckpt.pt  (on fullfit)
+
+    The older ``{fold}`` placeholder still works, but it can only ever name an
+    integer, so it maps fullfit onto fold 0's checkpoint rather than its own.
+    """
+    if "{fold}" in path:
+        path = path.format(fold=fold)
+    return path.replace("fold_*", run_name or f"fold_{fold}")
+
+
 def fts_cache_dir(args, fold: int) -> Path:
     """Where the node-feature caches live.
 
@@ -41,8 +60,12 @@ def fts_cache_dir(args, fold: int) -> Path:
             weights = (getattr(args, "pretraining", None) or {}).get("weights")
 
     if weights:
-        weights = weights.format(fold=fold) if "{fold}" in weights else weights
-        return Path(weights).parent / "fts_cache" / f"fold_{fold}"
+        # Same resolution as load_weights, so the cache sits beside the
+        # checkpoint actually loaded. args.output_dir is this run's own
+        # directory, whose name is the run name.
+        run_name = Path(getattr(args, "output_dir", "") or "").name or None
+        weights = resolve_run_path(weights, fold, run_name)
+        return Path(weights).parent / "fts_cache" / (run_name or f"fold_{fold}")
     return Path(args.output_dir) / "fts_cache"
 
 
@@ -206,14 +229,20 @@ def encode_nodes(
     nms: str = "maxpool",
     nms_radius_um: float = 7.0,
     node_features: bool = True,
-) -> tuple[list, list, tuple]:
+) -> tuple[list, list, tuple, list | None]:
     """UNet encode, then peak detection and GT matching on every frame.
 
-    Returns ``(frame_det, det_logits, unet_scaling)`` where ``frame_det`` holds
-    one ``(coords, pos_embed, mask, matches, unet_feat, scores)`` tuple per
-    frame, empty when ``detect`` is False (the detection-only warmup never
-    reads it). ``scores`` is each node's detection probability, which lets a
-    higher threshold be applied later by filtering instead of re-detecting.
+    Returns ``(frame_det, det_logits, unet_scaling, offset_maps)`` where
+    ``frame_det`` holds one ``(coords, pos_embed, mask, matches, unet_feat,
+    scores)`` tuple per frame, empty when ``detect`` is False (the
+    detection-only warmup never reads it). ``scores`` is each node's detection
+    probability, which lets a higher threshold be applied later by filtering
+    instead of re-detecting. ``offset_maps`` is the per-frame centroid vote, or
+    None on a model built without the head.
+
+    Node coordinates stay on the integer grid even when the vote exists: it
+    refines where a detection is *reported*, not which voxel the edge scorer
+    reads its features from, and training and inference must agree on that.
 
     ``nms`` defaults to the cheap max-pool path: greedy NMS costs one GPU round
     per emitted peak, which is fine once per evaluation but not per training
@@ -227,6 +256,7 @@ def encode_nodes(
     """
     _, window_size, d, h, w = imgs.shape
     unet_out, det_logits = core_model.encode(imgs)
+    offset_maps = core_model.encode_offsets(unet_out)
 
     d_out, h_out, w_out = unet_out.shape[-3:]
     unet_scaling = (d // d_out, h // h_out, w // w_out)
@@ -275,4 +305,4 @@ def encode_nodes(
             (det_coords, det_pos_embed, det_mask, matches, unet_feat, det_scores)
         )
 
-    return frame_det, det_logits, unet_scaling
+    return frame_det, det_logits, unet_scaling, offset_maps

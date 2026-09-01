@@ -1,7 +1,7 @@
 """Loss functions for cell tracking.
 
-Two terms:
-  L = L_edge + det_loss_weight · L_det
+Three terms:
+  L = L_edge + det_loss_weight · L_det + offset_loss_weight · L_offset
 
 L_det: penalty-reduced focal loss (CenterNet) on a Gaussian heatmap.
   - GT peaks:          positive, weight 1
@@ -9,6 +9,7 @@ L_det: penalty-reduced focal loss (CenterNet) on a Gaussian heatmap.
   - Everything else:   negative, scaled by neg_weight and discounted near peaks
   Weak positives are image local maxima brighter than half the mean GT intensity.
 L_edge: focal-BCE on softmax edge probabilities, masked to annotated rows/cols.
+L_offset: SmoothL1 on the centroid vote, over the voxels near a GT cell only.
 """
 
 from __future__ import annotations
@@ -23,6 +24,9 @@ import torch.nn.functional as F
 # the prediction, beta discounts negatives by how close they sit to a peak.
 FOCAL_ALPHA = 2.0
 FOCAL_BETA = 4.0
+# gaussian_heatmap gives exp(-d^2 / 2 sigma^2), so thresholding above this is
+# exactly d < sigma — it turns the splat into a hard ball of that radius.
+_BALL_EDGE = math.exp(-0.5)
 
 
 @torch.no_grad()
@@ -82,42 +86,48 @@ def gaussian_heatmap(
     return heat[:n_vox].view(B, Z, Y, X)
 
 
-def detection_loss(
-    det_logits: torch.Tensor,  # (B, 1, Z, Y, X) raw logits
+def build_detection_target(
+    spatial: tuple,  # (Z, Y, X), the detection-grid shape
     coords: torch.Tensor,  # (B, max_nodes, 3) GT coords in output space
     mask: torch.Tensor,  # (B, max_nodes) bool
-    neg_weight: float = 1e-3,
     unet_scaling: tuple | None = None,
     weak_weight: float = 0.3,
     weak_smoothing: float = 0.1,
     gaussian_sigma: float = 1.0,
     weak_positives: torch.Tensor | None = None,  # (B, N, 3), -1 padded
     use_weak_positives: bool = True,
-) -> torch.Tensor:
-    """Penalty-reduced focal loss on a Gaussian-splatted detection heatmap.
+    ignore_positives: torch.Tensor | None = None,  # (B, N, 3), -1 padded
+    ignore_radius: float = 0.0,  # detection-grid voxels; 0 disables
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Build the Gaussian-splatted target heatmap and per-voxel positive weight.
 
     Target
     ------
     GT points        1.0 at the peak, decaying as exp(-d^2 / 2 sigma^2)
     Weak positives   1 - weak_smoothing at the peak, same decay
+    Ignore regions   no gradient at all — neither positive nor background
     Background       0
 
-    Positive term    at peak voxels only: 1 for GT, ``weak_weight`` for weak
-    Negative term    every other voxel, scaled by ``neg_weight`` and discounted
-                     by (1 - target)^beta so a peak's own skirt is cheap
+    Ignore regions
+    --------------
+    The annotation covers a few percent of the cells, and the weak positives
+    only as many more as the labelling model was confident about. Everything
+    left over is currently trained as background, which is a gradient telling
+    the detector to suppress cells it can see. ``ignore_positives`` are the
+    peaks that were too weak to accept but too plausible to deny: within
+    ``ignore_radius`` grid voxels of one, the negative term is dropped, so
+    those voxels simply say nothing either way.
 
-    Normalised by the number of peaks, so the scale is independent of how many
-    cells the crop holds.
+    Returns ``(heat, pos_weight, ignore)``: ``heat`` is the target described
+    above, ``pos_weight`` is 1 at a GT peak / ``weak_weight`` at a weak peak /
+    0 elsewhere, and ``ignore`` (or ``None``) marks voxels within
+    ``ignore_radius`` of an uncertain peak.
 
     ``gaussian_sigma`` is in detection-grid voxels. It must be > 0 for the loss
     to shape a *peak*: at sigma = 0 the target is a lone voxel with no skirt,
     which says "this voxel is a cell" but nothing about being a local maximum,
     and the detector is free to answer with a blob.
     """
-    spatial = det_logits.shape[2:]
-    logits = det_logits[:, 0]  # (B, Z, Y, X)
-    batch_size = logits.shape[0]
-
     if unet_scaling is not None:  # adapt targets to output space
         scale = torch.tensor(unet_scaling, dtype=coords.dtype, device=coords.device)
         coords = torch.div(coords, scale, rounding_mode="floor")
@@ -127,7 +137,9 @@ def detection_loss(
     heat = gt_heat
     # Weight of the *positive* term. Only a peak voxel is a positive; its own
     # skirt is a discounted negative (see below).
-    pos_weight = (gt_heat >= 1.0).float()
+
+    th = 0.5
+    pos_weight = (gt_heat >= th).float()
 
     if use_weak_positives:
         assert weak_positives is not None, "use_weak_positives set with no weak_positives"
@@ -140,8 +152,66 @@ def detection_loss(
         # Weak peaks are cells too, so they must not be driven to 0 as
         # background; smoothing keeps their target just under a GT peak.
         heat = torch.maximum(gt_heat, weak_heat * (1.0 - weak_smoothing))
-        weak_peak = (weak_heat >= 1.0) & (gt_heat < 1.0)
+        weak_peak = (weak_heat >= th) & (gt_heat < th)
         pos_weight = pos_weight + weak_weight * weak_peak.float()
+
+    # Voxels near an uncertain peak: keep them out of the negative term. A
+    # ball, not a Gaussian — this is a "say nothing here" region, and its edge
+    # carries no meaning worth shaping.
+    ignore = None
+    if ignore_radius > 0 and ignore_positives is not None:
+        ig = ignore_positives
+        if unet_scaling is not None:
+            scale = torch.tensor(unet_scaling, dtype=coords.dtype, device=coords.device)
+            ig = torch.div(ig, scale, rounding_mode="floor")
+        ig_valid = (ignore_positives >= 0).all(dim=-1)
+        if ig_valid.any():
+            ignore = gaussian_heatmap(ig, ig_valid, spatial, ignore_radius) > _BALL_EDGE
+
+    return heat, pos_weight, ignore
+
+
+def detection_loss(
+    det_logits: torch.Tensor,  # (B, 1, Z, Y, X) raw logits
+    coords: torch.Tensor,  # (B, max_nodes, 3) GT coords in output space
+    mask: torch.Tensor,  # (B, max_nodes) bool
+    neg_weight: float = 1e-3,
+    unet_scaling: tuple | None = None,
+    weak_weight: float = 0.3,
+    weak_smoothing: float = 0.1,
+    gaussian_sigma: float = 1.0,
+    weak_positives: torch.Tensor | None = None,  # (B, N, 3), -1 padded
+    use_weak_positives: bool = True,
+    ignore_positives: torch.Tensor | None = None,  # (B, N, 3), -1 padded
+    ignore_radius: float = 0.0,  # detection-grid voxels; 0 disables
+) -> torch.Tensor:
+    """Penalty-reduced focal loss on a Gaussian-splatted detection heatmap.
+
+    Positive term    at peak voxels only: 1 for GT, ``weak_weight`` for weak
+    Negative term    every other voxel, scaled by ``neg_weight`` and discounted
+                     by (1 - target)^beta so a peak's own skirt is cheap
+
+    Normalised by the number of peaks, so the scale is independent of how many
+    cells the crop holds. See ``build_detection_target`` for how the target
+    heatmap, positive weight, and ignore mask are constructed.
+    """
+    spatial = det_logits.shape[2:]
+    logits = det_logits[:, 0]  # (B, Z, Y, X)
+    batch_size = logits.shape[0]
+
+    heat, pos_weight, ignore = build_detection_target(
+        spatial,
+        coords,
+        mask,
+        unet_scaling=unet_scaling,
+        weak_weight=weak_weight,
+        weak_smoothing=weak_smoothing,
+        gaussian_sigma=gaussian_sigma,
+        weak_positives=weak_positives,
+        use_weak_positives=use_weak_positives,
+        ignore_positives=ignore_positives,
+        ignore_radius=ignore_radius,
+    )
 
     # Penalty-reduced focal loss (CenterNet). Two properties matter here:
     #
@@ -167,12 +237,16 @@ def detection_loss(
             * neg_weight
         )
 
+        per_voxel = torch.where(pos, pos_loss, neg_loss)
+        if ignore is not None:
+            # Positives win: a GT or weak peak inside an ignore ball is still
+            # supervised, only the surrounding background falls silent.
+            per_voxel = torch.where(pos | ~ignore, per_voxel, torch.zeros_like(per_voxel))
+
         # Normalise per peak, so the loss scale does not depend on how many
         # cells a crop happens to contain.
         n_pos = pos.reshape(batch_size, -1).sum(dim=1).clamp(min=1).float()
-        per_sample = (
-            torch.where(pos, pos_loss, neg_loss).reshape(batch_size, -1).sum(dim=1)
-        )
+        per_sample = per_voxel.reshape(batch_size, -1).sum(dim=1)
         return (per_sample / n_pos).mean()
 
 
@@ -257,10 +331,42 @@ def batch_edge_loss(
         return per_sample.sum() / B
 
 
+def offset_loss(
+    offset_map: torch.Tensor,   # (B, 3, Z, Y, X) predicted vote, grid voxels
+    coords: torch.Tensor,       # (B, max_nodes, 3) GT coords in output space
+    mask: torch.Tensor,         # (B, max_nodes) bool
+    unet_scaling: tuple | None = None,
+    radius: int = 2,
+    beta: float = 1.0,
+) -> torch.Tensor:
+    """SmoothL1 on the centroid vote, over the voxels a GT cell votes for.
+
+    Supervised on ground truth only. Weak positives are image intensity maxima,
+    and they carry no opinion about where the *cell centre* is beyond the peak
+    they already sit on — training the vote toward them would teach the head to
+    reproduce the error it exists to remove. Sparse supervision is the trade:
+    about three annotated cells a frame, each claiming ``(2r + 1)^3`` voxels.
+
+    SmoothL1 rather than L2 because a vote that lands on the wrong cell is
+    wrong by a whole cell spacing, and should not dominate the batch.
+    """
+    from tracking.targets import build_offset_target
+
+    target, valid = build_offset_target(
+        coords, mask, tuple(offset_map.shape[2:]),
+        unet_scaling=unet_scaling, radius=radius,
+    )
+    if not bool(valid.any()):
+        # Keep the head attached to the graph so DDP still sees its gradients.
+        return offset_map.sum() * 0.0
+    sel = valid.unsqueeze(1).expand_as(offset_map)
+    return F.smooth_l1_loss(offset_map[sel], target[sel], beta=beta)
+
+
 class TrackingLoss(nn.Module):
     """Combined detection + edge loss.
 
-        L = L_edge + det_loss_weight · L_det
+        L = L_edge + det_loss_weight · L_det + offset_loss_weight · L_offset
 
     Parameters
     ----------
@@ -275,6 +381,19 @@ class TrackingLoss(nn.Module):
     det_gaussian_sigma : float
         Std-dev, in detection-grid voxels, of the Gaussian splatted at each
         GT point. 0 falls back to single-voxel targets.
+    det_ignore_radius : float
+        Radius, in detection-grid voxels, of the ball around each uncertain
+        peak where the negative term is dropped. 0 disables the mechanism, and
+        it does nothing without an ``ignore_positives`` source — see
+        ``weak_positives.pl_ignore_folder``.
+    offset_loss_weight : float
+        Weight for L_offset. Ignored when the model has no offset head, in
+        which case no vote is produced and the term is absent.
+    offset_radius : int
+        Grid voxels around a GT cell that vote for it. Must match the model's
+        ``offset_radius``, which bounds what the head can output.
+    offset_beta : float
+        SmoothL1 transition point, in grid voxels.
     """
 
     def __init__(
@@ -285,6 +404,10 @@ class TrackingLoss(nn.Module):
         det_weak_smoothing: float = 0.1,
         det_gaussian_sigma: float = 1.0,
         det_use_weak_positives: bool = True,
+        det_ignore_radius: float = 0.0,
+        offset_loss_weight: float = 1.0,
+        offset_radius: int = 2,
+        offset_beta: float = 1.0,
     ):
         super().__init__()
         self.det_loss_weight = det_loss_weight
@@ -293,6 +416,10 @@ class TrackingLoss(nn.Module):
         self.det_weak_smoothing = det_weak_smoothing
         self.det_gaussian_sigma = det_gaussian_sigma
         self.det_use_weak_positives = det_use_weak_positives
+        self.det_ignore_radius = det_ignore_radius
+        self.offset_loss_weight = offset_loss_weight
+        self.offset_radius = offset_radius
+        self.offset_beta = offset_beta
 
     def forward(
         self,
@@ -305,7 +432,13 @@ class TrackingLoss(nn.Module):
         weak_pos_per_frame: (
             list[torch.Tensor] | None
         ) = None,  # W × (B, N, 3), -1 padded
+        ignore_pos_per_frame: (
+            list[torch.Tensor] | None
+        ) = None,  # W × (B, N, 3), -1 padded
         unet_scaling: tuple | None = None,
+        offset_maps_per_frame: (
+            list[torch.Tensor] | None
+        ) = None,  # W × (B, 3, Z, Y, X), None when the head is off
         progress: float = 1.0,  # fraction of training elapsed, in [0, 1]
     ) -> tuple[torch.Tensor, dict[str, float]]:
         W = len(det_logits_per_frame)
@@ -327,6 +460,11 @@ class TrackingLoss(nn.Module):
                         weak_pos_per_frame[i] if weak_pos_per_frame is not None else None
                     ),
                     use_weak_positives=self.det_use_weak_positives,
+                    ignore_positives=(
+                        ignore_pos_per_frame[i]
+                        if ignore_pos_per_frame is not None else None
+                    ),
+                    ignore_radius=self.det_ignore_radius,
                 )
                 for i in range(W)
             ]
@@ -353,6 +491,23 @@ class TrackingLoss(nn.Module):
         breakdown = {
             "det": self.det_loss_weight * l_det.item(),
             "edge": l_edge.item(),
-            "total": total.item(),
         }
+
+        if offset_maps_per_frame:
+            offset_losses = [
+                offset_loss(
+                    offset_maps_per_frame[i],
+                    gt_coords_per_frame[i],
+                    gt_mask_per_frame[i],
+                    unet_scaling=unet_scaling,
+                    radius=self.offset_radius,
+                    beta=self.offset_beta,
+                )
+                for i in range(len(offset_maps_per_frame))
+            ]
+            l_offset = sum(offset_losses) / len(offset_losses)
+            total = total + self.offset_loss_weight * l_offset
+            breakdown["offset"] = self.offset_loss_weight * l_offset.item()
+
+        breakdown["total"] = total.item()
         return total, breakdown

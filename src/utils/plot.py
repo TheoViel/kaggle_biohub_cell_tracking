@@ -3,12 +3,21 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import tracksdata as td
 from matplotlib.collections import LineCollection
+from matplotlib.colors import to_rgba
+from matplotlib.markers import MarkerStyle
 
-from cellpose.utils import masks_to_outlines
+# from cellpose.utils import masks_to_outlines
 from utils.metrics import dist
 
 
 SCALE = (1.625, 0.40625, 0.40625)
+
+# Per-slice opacity multiplier for cells drawn off the plane being shown.
+# A cell is ~9 um across and a z voxel is 1.625 um, so a nucleus spans about
+# five slices: at 0.75 a cell two slices out is still clearly visible (0.56)
+# and one six slices out has all but gone (0.18), which is the distinction the
+# eye needs to make.
+DEPTH_FALLOFF = 0.75
 
 # One colour per verdict, reused by every error plot so a colour always means
 # the same thing.
@@ -19,6 +28,112 @@ KIND_COLORS = {
     "no link": "goldenrod",
     "undetected": "slategray",
 }
+
+
+def depth_rgba(dz, color, falloff=DEPTH_FALLOFF, base_alpha=1.0):
+    """``color`` as one RGBA row per point, faded by distance from the plane.
+
+    Args:
+        dz (array): Signed or unsigned slice offset of each point.
+        color: Any matplotlib colour.
+        falloff (float, optional): Opacity multiplier per slice.
+        base_alpha (float, optional): Opacity of a point sitting on the plane.
+
+    Returns:
+        np.ndarray: (N, 4) RGBA, alpha = base_alpha * falloff ** |dz|.
+    """
+    dz = np.abs(np.asarray(dz, dtype=float)).ravel()
+    alpha = np.clip(base_alpha * falloff ** dz, 0.0, 1.0)
+    red, green, blue = to_rgba(color)[:3]
+    return np.column_stack([
+        np.full(len(alpha), red),
+        np.full(len(alpha), green),
+        np.full(len(alpha), blue),
+        alpha,
+    ])
+
+
+def scatter_by_depth(
+    ax,
+    points,
+    z,
+    color,
+    tol=10,
+    falloff=DEPTH_FALLOFF,
+    base_alpha=1.0,
+    facecolor="none",
+    s=40,
+    linewidths=1.2,
+    **kwargs,
+):
+    """Draw cell centres over one z-slice, fading them out with depth.
+
+    Drawing every cell within a window of the plane at full opacity makes a
+    dense frame unreadable: a cell six slices away is painted as boldly as the
+    one you are looking at, so the picture stops saying which cells are
+    actually in this section. Fading geometrically with |dz| keeps the
+    out-of-plane context visible without letting it compete.
+
+    Points are drawn nearest first. That is for the legend, which takes its
+    swatch from the first point: ordered the other way round, every legend
+    entry comes out in the faintest colour in the set. Far points then land on
+    top of near ones, which is invisible in practice because they are the
+    transparent ones.
+
+    Args:
+        ax: Axes to draw on. The ``pyplot`` module itself also works.
+        points (array): (N, 3) cell centres as (z, y, x), in voxels.
+        z (float): The plane being displayed.
+        color: Edge colour, faded per point.
+        tol (float, optional): Slices either side of ``z`` to draw at all.
+        falloff (float, optional): Opacity multiplier per slice.
+        base_alpha (float, optional): Opacity of a point on the plane. Set it
+            here rather than passing ``alpha``, which matplotlib applies on top
+            of the per-point colours and so flattens the fade away.
+        facecolor (optional): Fill colour, faded the same way. ``"none"``
+            leaves the markers hollow, which is what keeps the image visible
+            underneath them.
+        s, linewidths, **kwargs: Passed to ``scatter``.
+
+    Returns:
+        np.ndarray: (N,) bool, which of ``points`` were drawn.
+    """
+    points = np.asarray(points, dtype=float).reshape(-1, 3)
+    if not len(points):
+        return np.zeros(0, dtype=bool)
+
+    dz = points[:, 0] - float(z)
+    near = np.abs(dz) <= tol
+    if not near.any():
+        return near
+
+    order = np.argsort(np.abs(dz[near]))
+    drawn = points[near][order]
+    dz = dz[near][order]
+
+    edge = depth_rgba(dz, color, falloff, base_alpha)
+    if not MarkerStyle(kwargs.get("marker", "o")).is_filled():
+        # An unfilled marker ("x", "+", ...) is drawn from its face colour and
+        # matplotlib warns if an edge colour is supplied as well.
+        colors = dict(facecolors=edge)
+    else:
+        colors = dict(
+            edgecolors=edge,
+            facecolors=(
+                "none" if facecolor is None or facecolor == "none"
+                else depth_rgba(dz, facecolor, falloff, base_alpha)
+            ),
+        )
+
+    ax.scatter(
+        drawn[:, 2],
+        drawn[:, 1],
+        s=s,
+        linewidths=linewidths,
+        **colors,
+        **kwargs,
+    )
+    return near
 
 
 def plot_frame(img, nodes, t=None, z=None, mask=None, tol=5):
@@ -54,220 +169,216 @@ def plot_frame(img, nodes, t=None, z=None, mask=None, tol=5):
         mask = np.where(mask == 0, np.nan, mask)
         plt.imshow(mask, cmap="hot", alpha=0.5)
 
-    plt.scatter(
-        nodes["x"],
-        nodes["y"],
-        s=20,
-        c='#eb6834',
-        edgecolors="white",
-        linewidths=0.5,
-        zorder=5,
-    )
+    if z is None:
+        # A projection over every plane: there is no depth to fade against.
+        plt.scatter(
+            nodes["x"], nodes["y"], s=20, c="#eb6834",
+            edgecolors="white", linewidths=0.5, zorder=5,
+        )
+    else:
+        scatter_by_depth(
+            plt,
+            nodes[["z", "y", "x"]].to_numpy(dtype=float),
+            z,
+            "#eb6834",
+            tol=tol,
+            facecolor="#eb6834",
+            s=20,
+            linewidths=0.5,
+            zorder=5,
+        )
     plt.title(f"t = {t}, z = {z}")
     plt.grid(False)
     plt.axis(False)
 
 
-def plot_contours(img, mask):
-    img_plot = img.copy().squeeze()
-    max_ = np.percentile(img_plot, 99)
-    min_ = np.percentile(img_plot, 1)
-    img_plot = np.clip(img_plot, min_, max_)
-    img_plot = (
-        (img_plot - img_plot.min()) / (img_plot.max() - img_plot.min()) * 255
-    ).astype(np.uint8)
-    img_plot = img_plot[..., None].repeat(3, -1)
-    outlines = masks_to_outlines(mask)
-    outX, outY = np.nonzero(outlines)
-    img_plot[outX, outY] = np.array([255, 0, 255], dtype=img.dtype)
 
-    plt.imshow(img_plot, cmap="gray")
-    plt.axis("off")
+# def show_cellpose_segmentation(img, maski, flowi, nodes=None, z=None):
+#     """Image, predicted outlines and flow side by side, with cell centres.
 
+#     ``nodes`` is (N, 3) as (z, y, x). Pass ``z`` -- the plane ``img`` is a slice
+#     of -- to fade the centres by how far they sit from it; without it they are
+#     all drawn solid.
+#     """
+#     img0 = img.copy().squeeze()
+#     img0 = img0[..., None].repeat(3, -1)
 
-def show_cellpose_segmentation(img, maski, flowi, nodes=None):
-    img0 = img.copy().squeeze()
-    img0 = img0[..., None].repeat(3, -1)
+#     plt.subplot(1, 3, 1)
+#     plt.imshow(img.squeeze(), cmap="gray")
+#     plt.title("original image")
+#     plt.axis("off")
 
-    plt.subplot(1, 3, 1)
-    plt.imshow(img.squeeze(), cmap="gray")
-    plt.title("original image")
-    plt.axis("off")
+#     plt.subplot(1, 3, 2)
+#     plot_contours(img, maski)
+#     plt.title("predicted outlines")
+#     plt.axis("off")
 
-    plt.subplot(1, 3, 2)
-    plot_contours(img, maski)
-    plt.title("predicted outlines")
-    plt.axis("off")
+#     def _nodes():
+#         """The centres, faded by depth when the plane they sit on is known."""
+#         if nodes is None:
+#             return
+#         if z is None:
+#             plt.scatter(
+#                 nodes[:, 2], nodes[:, 1], s=20, c="dodgerblue",
+#                 edgecolors="white", linewidths=0.5, zorder=5,
+#             )
+#         else:
+#             scatter_by_depth(
+#                 plt, nodes, z, "white", facecolor="dodgerblue",
+#                 s=20, linewidths=0.5, zorder=5,
+#             )
 
-    if nodes is not None:
-        plt.scatter(
-            nodes[:, 2],
-            nodes[:, 1],
-            s=20,
-            c='dodgerblue',
-            edgecolors="white",
-            linewidths=0.5,
-            zorder=5,
-        )
+#     _nodes()
 
-    plt.subplot(1, 3, 3)
-    plt.imshow(flowi)
-    
-    if nodes is not None:
-        plt.scatter(
-            nodes[:, 2],
-            nodes[:, 1],
-            s=20,
-            c='dodgerblue',
-            edgecolors="white",
-            linewidths=0.5,
-            zorder=5,
-        )
-    plt.title("predicted cell pose")
-    plt.axis("off")
+#     plt.subplot(1, 3, 3)
+#     plt.imshow(flowi)
+
+#     _nodes()
+#     plt.title("predicted cell pose")
+#     plt.axis("off")
 
 
-def lineage(graph, root):
-    """
-    Collect everything reachable from a node by following edges forward in time.
+# def lineage(graph, root):
+#     """
+#     Collect everything reachable from a node by following edges forward in time.
 
-    A trajectory is a tree rather than a chain, since a dividing cell has two
-    children, so this returns the whole subtree below root.
+#     A trajectory is a tree rather than a chain, since a dividing cell has two
+#     children, so this returns the whole subtree below root.
 
-    Args:
-        graph (tracksdata graph): Graph whose nodes carry t, z, y, x.
-        root (int): Node id to start from.
+#     Args:
+#         graph (tracksdata graph): Graph whose nodes carry t, z, y, x.
+#         root (int): Node id to start from.
 
-    Returns:
-        tuple: The node table as a DataFrame indexed by node id and ordered
-            breadth-first from root, and the list of (parent, child) node id
-            pairs joining them.
-    """
-    children = {}
-    for source, target in graph.edge_attrs(
-        attr_keys=["source_id", "target_id"]
-    ).select(["source_id", "target_id"]).iter_rows():
-        children.setdefault(int(source), []).append(int(target))
+#     Returns:
+#         tuple: The node table as a DataFrame indexed by node id and ordered
+#             breadth-first from root, and the list of (parent, child) node id
+#             pairs joining them.
+#     """
+#     children = {}
+#     for source, target in graph.edge_attrs(
+#         attr_keys=["source_id", "target_id"]
+#     ).select(["source_id", "target_id"]).iter_rows():
+#         children.setdefault(int(source), []).append(int(target))
 
-    nodes = graph.node_attrs(
-        attr_keys=["node_id", "t", "z", "y", "x"]
-    ).to_pandas().set_index("node_id")
+#     nodes = graph.node_attrs(
+#         attr_keys=["node_id", "t", "z", "y", "x"]
+#     ).to_pandas().set_index("node_id")
 
-    order, segments = [int(root)], []
-    seen = {int(root)}
-    queue = [int(root)]
-    while queue:
-        node = queue.pop(0)
-        for child in children.get(node, []):
-            segments.append((node, child))
-            # A cell has one parent, so this only guards against a malformed graph.
-            if child not in seen:
-                seen.add(child)
-                order.append(child)
-                queue.append(child)
+#     order, segments = [int(root)], []
+#     seen = {int(root)}
+#     queue = [int(root)]
+#     while queue:
+#         node = queue.pop(0)
+#         for child in children.get(node, []):
+#             segments.append((node, child))
+#             # A cell has one parent, so this only guards against a malformed graph.
+#             if child not in seen:
+#                 seen.add(child)
+#                 order.append(child)
+#                 queue.append(child)
 
-    return nodes.loc[order], segments
+#     return nodes.loc[order], segments
 
 
-def plot_trajectory(graph, root=None, cmap="viridis", show_z=True):
-    """
-    Plot one trajectory, from a starting cell down through all of its children.
+# def plot_trajectory(graph, root=None, cmap="viridis", show_z=True):
+#     """
+#     Plot one trajectory, from a starting cell down through all of its children.
 
-    Both panels draw one line per edge rather than a single polyline, so a
-    division shows up as a fork instead of a segment darting back and forth
-    between the two daughters. Colour runs along time, giving the path a
-    direction, and the xy panel is drawn in image orientation so it lines up
-    with plot_frame.
+#     Both panels draw one line per edge rather than a single polyline, so a
+#     division shows up as a fork instead of a segment darting back and forth
+#     between the two daughters. Colour runs along time, giving the path a
+#     direction, and the xy panel is drawn in image orientation so it lines up
+#     with plot_frame.
 
-    Args:
-        graph (tracksdata graph): Graph whose nodes carry t, z, y, x.
-        root (int, optional): Node id to start from. Defaults to the node in the
-            first frame with the most descendants, i.e. the longest trajectory.
-        cmap (str, optional): Colormap used to shade time.
-        show_z (bool, optional): Add a second panel of z against t, which the xy
-            view cannot show. Defaults to True.
+#     Args:
+#         graph (tracksdata graph): Graph whose nodes carry t, z, y, x.
+#         root (int, optional): Node id to start from. Defaults to the node in the
+#             first frame with the most descendants, i.e. the longest trajectory.
+#         cmap (str, optional): Colormap used to shade time.
+#         show_z (bool, optional): Add a second panel of z against t, which the xy
+#             view cannot show. Defaults to True.
 
-    Returns:
-        np.ndarray: The node ids making up the trajectory.
-    """
-    nodes = graph.node_attrs(attr_keys=["node_id", "t"]).to_pandas()
-    if len(nodes) == 0:
-        raise ValueError("graph has no nodes")
+#     Returns:
+#         np.ndarray: The node ids making up the trajectory.
+#     """
+#     nodes = graph.node_attrs(attr_keys=["node_id", "t"]).to_pandas()
+#     if len(nodes) == 0:
+#         raise ValueError("graph has no nodes")
 
-    if root is None:
-        first_frame = nodes[nodes["t"] == nodes["t"].min()]["node_id"]
-        root = max(first_frame, key=lambda node: len(lineage(graph, node)[0]))
+#     if root is None:
+#         first_frame = nodes[nodes["t"] == nodes["t"].min()]["node_id"]
+#         root = max(first_frame, key=lambda node: len(lineage(graph, node)[0]))
 
-    track, segments = lineage(graph, root)
-    times = track["t"].to_numpy()
-    index = {node: i for i, node in enumerate(track.index)}
-    child_times = np.array([track["t"].iloc[index[child]] for _, child in segments])
+#     track, segments = lineage(graph, root)
+#     times = track["t"].to_numpy()
+#     index = {node: i for i, node in enumerate(track.index)}
+#     child_times = np.array([track["t"].iloc[index[child]] for _, child in segments])
 
-    n_children = np.zeros(len(track), dtype=int)
-    for parent, _ in segments:
-        n_children[index[parent]] += 1
-    divisions = n_children > 1
+#     n_children = np.zeros(len(track), dtype=int)
+#     for parent, _ in segments:
+#         n_children[index[parent]] += 1
+#     divisions = n_children > 1
 
-    norm = plt.Normalize(times.min(), times.max())
-    axes = plt.subplots(1, 2, figsize=(14, 6))[1] if show_z else [plt.gca()]
+#     norm = plt.Normalize(times.min(), times.max())
+#     axes = plt.subplots(1, 2, figsize=(14, 6))[1] if show_z else [plt.gca()]
 
-    for ax, (horizontal, vertical) in zip(axes, [("x", "y"), ("t", "z")]):
-        points = track[[horizontal, vertical]].to_numpy(dtype=float)
-        if len(segments):
-            lines = LineCollection(
-                [[points[index[p]], points[index[c]]] for p, c in segments],
-                cmap=cmap,
-                norm=norm,
-                linewidths=2,
-                zorder=2,
-            )
-            lines.set_array(child_times)
-            ax.add_collection(lines)
+#     for ax, (horizontal, vertical) in zip(axes, [("x", "y"), ("t", "z")]):
+#         points = track[[horizontal, vertical]].to_numpy(dtype=float)
+#         if len(segments):
+#             lines = LineCollection(
+#                 [[points[index[p]], points[index[c]]] for p, c in segments],
+#                 cmap=cmap,
+#                 norm=norm,
+#                 linewidths=2,
+#                 zorder=2,
+#             )
+#             lines.set_array(child_times)
+#             ax.add_collection(lines)
 
-        ax.scatter(points[:, 0], points[:, 1], s=14, c=times, cmap=cmap, norm=norm, zorder=3)
-        ax.scatter(
-            *points[0],
-            s=140,
-            marker="o",
-            color=(0, 0, 0, 0),
-            edgecolors="limegreen",
-            linewidths=2,
-            zorder=4,
-            label="Start",
-        )
-        if divisions.any():
-            ax.scatter(
-                points[divisions, 0],
-                points[divisions, 1],
-                s=120,
-                marker="X",
-                c="orangered",
-                edgecolors="white",
-                linewidths=0.5,
-                zorder=5,
-                label="Division",
-            )
+#         ax.scatter(points[:, 0], points[:, 1], s=14, c=times, cmap=cmap, norm=norm, zorder=3)
+#         ax.scatter(
+#             *points[0],
+#             s=140,
+#             marker="o",
+#             color=(0, 0, 0, 0),
+#             edgecolors="limegreen",
+#             linewidths=2,
+#             zorder=4,
+#             label="Start",
+#         )
+#         if divisions.any():
+#             ax.scatter(
+#                 points[divisions, 0],
+#                 points[divisions, 1],
+#                 s=120,
+#                 marker="X",
+#                 c="orangered",
+#                 edgecolors="white",
+#                 linewidths=0.5,
+#                 zorder=5,
+#                 label="Division",
+#             )
 
-        ax.set_xlabel(horizontal)
-        ax.set_ylabel(vertical)
-        ax.autoscale_view()
-        ax.legend(loc="best")
+#         ax.set_xlabel(horizontal)
+#         ax.set_ylabel(vertical)
+#         ax.autoscale_view()
+#         ax.legend(loc="best")
 
-    axes[0].set_aspect("equal")
-    axes[0].invert_yaxis()  # image orientation, so it matches plot_frame
-    axes[0].set_title(
-        f"node {int(root)}: {len(track)} cells, t = {times.min()} to {times.max()}, "
-        f"{int(divisions.sum())} division(s)"
-    )
-    axes[0].set_xlim(0, 256)
-    axes[0].set_ylim(0, 256)
-    if show_z:
-        axes[1].set_title("z over time")
-        # axes[1].set_xlim(0, 100)
-        axes[1].set_ylim(0, 64)
-        plt.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cmap), ax=axes[1], label="t")
+#     axes[0].set_aspect("equal")
+#     axes[0].invert_yaxis()  # image orientation, so it matches plot_frame
+#     axes[0].set_title(
+#         f"node {int(root)}: {len(track)} cells, t = {times.min()} to {times.max()}, "
+#         f"{int(divisions.sum())} division(s)"
+#     )
+#     axes[0].set_xlim(0, 256)
+#     axes[0].set_ylim(0, 256)
+#     if show_z:
+#         axes[1].set_title("z over time")
+#         # axes[1].set_xlim(0, 100)
+#         axes[1].set_ylim(0, 64)
+#         plt.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cmap), ax=axes[1], label="t")
 
-    return track.index.to_numpy()
+#     return track.index.to_numpy()
 
 
 def link_errors(graph, gt_graph, scale=SCALE):
@@ -757,13 +868,22 @@ def plot_error_neighbourhood(graph, error, radius=10.0, img=None, scale=SCALE):
         if img is not None and horizontal == "x" and vertical == "y":
             ax.imshow(img[int(round(parent[0]))], cmap="gray", zorder=0)
 
-        for frame, style in ((t, dict(marker="o", facecolors="none", edgecolors="dodgerblue")),
-                             (t + 1, dict(marker="o", color="dimgrey"))):
+        for frame, colour in ((t, "dodgerblue"), (t + 1, "dimgrey")):
             cells = nearby[nearby["t"] == frame]
-            ax.scatter(
-                cells[horizontal], cells[vertical], s=40, linewidths=1.4, zorder=2,
-                label=f"t = {frame}", **style,
-            )
+            if vertical == "y":
+                # Looking down on a plane, so fade the cells that are not in it.
+                scatter_by_depth(
+                    ax, cells[["z", "y", "x"]].to_numpy(dtype=float),
+                    parent[0], colour, tol=radius, s=40, linewidths=1.4,
+                    zorder=2, label=f"t = {frame}",
+                )
+            else:
+                # The side view shows z on an axis, so depth is already drawn.
+                ax.scatter(
+                    cells[horizontal], cells[vertical], s=40, linewidths=1.4,
+                    zorder=2, marker="o", facecolors="none", edgecolors=colour,
+                    label=f"t = {frame}",
+                )
 
         ax.scatter(
             parent[across], parent[down], s=180, marker="o", color=(0, 0, 0, 0),
@@ -832,27 +952,19 @@ def scatter_plot_center_preds(seeds, matched_gt, unmatched_gt, frame, tol=3):
     matched_gt_centers = matched_gt[matched_gt[:, 0] == frame] if len(matched_gt) > 0 else []
     centers = seeds[np.abs(seeds[:, 0].astype(int) - frame) <= tol]
 
+    # Ground truth is selected on its exact plane, so it never fades; it goes
+    # through the same call anyway, so widening that filter would just work.
     if len(unmatched_gt_centers) > 0:
-        plt.scatter(
-            unmatched_gt_centers[:, 2],
-            unmatched_gt_centers[:, 1],
-            s=100,
-            color=(0, 0, 0, 0),
-            linewidths=2,
-            edgecolors='orangered',
-            label="Unmatched",
+        scatter_by_depth(
+            plt, unmatched_gt_centers[:, :3], frame, "orangered",
+            tol=tol, s=100, linewidths=2, label="Unmatched",
         )
 
     if len(matched_gt_centers) > 0:
-        plt.scatter(
-            matched_gt_centers[:, 2],
-            matched_gt_centers[:, 1],
-            s=100,
-            color=(0, 0, 0, 0),  # (1, 1, 1, 0.5),
-            linewidths=2,
-            edgecolors='limegreen',
-            label="Matched",
-        )        
+        scatter_by_depth(
+            plt, matched_gt_centers[:, :3], frame, "limegreen",
+            tol=tol, s=100, linewidths=2, label="Matched",
+        )
 
     # A z-plane can hold ground truth but no prediction within tol, and taking a
     # minimum over an empty distance list would raise.
@@ -869,26 +981,17 @@ def scatter_plot_center_preds(seeds, matched_gt, unmatched_gt, frame, tol=3):
         matched = []
     
     if len(matched) > 0:
-        plt.scatter(
-            centers[matched, 2],
-            centers[matched, 1],
-            s=20,
-            c='skyblue',
-            linewidths=1,
-            edgecolors='dodgerblue',
+        scatter_by_depth(
+            plt, centers[matched, :3], frame, "dodgerblue",
+            tol=tol, facecolor="skyblue", s=20, linewidths=1,
             label="Predicted Match",
         )
 
     if len(unmatched) > 0:
-        plt.scatter(
-            centers[unmatched, 2],
-            centers[unmatched, 1],
-            s=10,
-            c='orangered',
-            linewidths=1,
-            edgecolors='red',
-            label="Predicted Unmatch",
-            alpha=0.5,
+        scatter_by_depth(
+            plt, centers[unmatched, :3], frame, "red",
+            tol=tol, facecolor="orangered", s=10, linewidths=1,
+            base_alpha=0.5, label="Predicted Unmatch",
         )
 
     # A plane can be empty, and an empty legend only warns.
