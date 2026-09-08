@@ -82,6 +82,7 @@ class SyntheticDataset(Dataset):
         voxel_size: tuple[float, float, float] = VOXEL_SIZE,
         mosaic_p: float = 0.0,
         mosaic_jitter: float = 0.2,
+        load_edges: bool = True,
     ):
         self.files = list(files)
         if not self.files:
@@ -98,6 +99,9 @@ class SyntheticDataset(Dataset):
         self.voxel_size = tuple(voxel_size)
         self.mosaic_p = float(mosaic_p)
         self.mosaic_jitter = float(mosaic_jitter)
+        # Matches TrackDataset.load_edges: the two collate into one batch, so
+        # the transition matrix is either present on both or on neither.
+        self.load_edges = bool(load_edges)
 
     def __len__(self) -> int:
         return len(self.files)
@@ -149,12 +153,18 @@ class SyntheticDataset(Dataset):
             for s, gi in enumerate(sel[:n]):
                 slot_of[int(gi)] = (w, s)
 
-        targets = torch.zeros(max(W - 1, 1), M, M, dtype=torch.float32)
-        for src, tgt in edges:
-            a, b = slot_of.get(int(src)), slot_of.get(int(tgt))
-            if a is None or b is None or b[0] != a[0] + 1:
-                continue
-            targets[a[0], a[1], b[1]] = 1.0
+        # No frames when the stage does not supervise edges: a synthetic
+        # frame holds ~285 cells against max_nodes 768, so this matrix is the
+        # bulk of a sample and none of it would be read.
+        targets = torch.zeros(
+            max(W - 1, 1) if self.load_edges else 0, M, M, dtype=torch.float32
+        )
+        if self.load_edges:
+            for src, tgt in edges:
+                a, b = slot_of.get(int(src)), slot_of.get(int(tgt))
+                if a is None or b is None or b[0] != a[0] + 1:
+                    continue
+                targets[a[0], a[1], b[1]] = 1.0
 
         spatial = tuple(imgs.shape[1:])
         empty = torch.full((W, 1, 3), -1.0, dtype=torch.float32)
@@ -188,6 +198,12 @@ class SyntheticDataset(Dataset):
             "imgs": imgs.half(),
             "weak_positives": weak_coords,
             "ignore_positives": ignore_coords,
+            # Empty, exactly as the real loader emits them when no
+            # coordinates_folder is configured -- which is the only way a
+            # synthetic mix is ever built. MixedDataset collates the two, so a
+            # key the real half carries has to be here as well.
+            "pre_coords": torch.zeros(W, 0, 3, dtype=torch.float32),
+            "pre_emb": torch.zeros(W, 0, 0, dtype=torch.float32),
             "image_shape": torch.tensor((T, *spatial), dtype=torch.long),
             "voxel_size": torch.tensor(self.voxel_size, dtype=torch.float32),
             "name": f"synth_{path.stem}_t{t0}",
@@ -295,7 +311,8 @@ def mosaic_samples(
 
     # Rebuild the transition matrices from each source's own links: a mosaic
     # never links across sources, and the slots have all moved.
-    targets = torch.zeros(max(W - 1, 1), max_nodes, max_nodes, dtype=torch.float32)
+    n_target_frames = max(W - 1, 1) if samples[0]["targets"].numel() else 0
+    targets = torch.zeros(n_target_frames, max_nodes, max_nodes, dtype=torch.float32)
     for i, smp in enumerate(samples):
         t = smp["targets"]
         for w in range(min(t.shape[0], max(W - 1, 1))):

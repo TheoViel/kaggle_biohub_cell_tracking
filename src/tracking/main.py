@@ -53,6 +53,8 @@ def build_loader(
     shuffle: bool | None = None,
     stable_shard: bool = False,
     synthetic_cfg: dict | None = None,
+    nodes_cfg: dict | None = None,
+    load_edges: bool = True,
 ) -> tuple[DataLoader, DistributedSampler | None]:
     """Build a DataLoader for datasets belonging to the given embryos.
 
@@ -95,8 +97,11 @@ def build_loader(
     # handful of annotated ones in a real window.
     synth_cfg = synthetic_cfg or {}
     synth = None
-    if synth_cfg.get("dir") and synth_cfg.get("proportion", 0.0) > 0:
-        files = find_sequences(synth_cfg["dir"])
+    if (
+        synth_cfg.get("synthetic_dir")
+        and synth_cfg.get("synthetic_proportion", 0.0) > 0
+    ):
+        files = find_sequences(synth_cfg["synthetic_dir"])
         # Its own cap, not n_videos: that one counts real videos, and the two
         # sets are unrelated in size (1000 sequences against ~100 videos).
         if synth_cfg.get("max_sequences"):
@@ -111,6 +116,7 @@ def build_loader(
             normalization=normalization,
             mosaic_p=float(synth_cfg.get("mosaic_p", 0.0)),
             mosaic_jitter=float(synth_cfg.get("mosaic_jitter", 0.2)),
+            load_edges=load_edges,
         )
 
     dataset = TrackDataset(
@@ -122,12 +128,16 @@ def build_loader(
         weak_positives_cfg=weak_positives_cfg,
         aug_cfg=aug_cfg,
         clamp_max=resolve_normalization(normalization)["clamp_max"],
+        nodes_cfg=nodes_cfg,
+        load_edges=load_edges,
     )
     if synth is not None:
         if ctx is None or ctx.is_main:
-            print(f"- Synthetic: {len(files)} sequences from {synth_cfg['dir']}, "
-                  f"{synth_cfg['proportion']:.0%} of training samples")
-        dataset = MixedDataset(dataset, synth, float(synth_cfg["proportion"]))
+            print(
+                f"- Synthetic: {len(files)} sequences from {synth_cfg['synthetic_dir']}, "
+                f"{synth_cfg['synthetic_proportion']:.0%} of training samples"
+            )
+        dataset = MixedDataset(dataset, synth, float(synth_cfg["synthetic_proportion"]))
 
     if distributed is None:
         distributed = ctx is not None and ctx.distributed
@@ -186,6 +196,9 @@ def build_model(args, ctx):
         transformer_dropout=args.transformer_dropout,
         edge_knn_k=getattr(args, "edge_knn_k", None),
         edge_geom_feats=getattr(args, "edge_geom_feats", True),
+        edge_contrastive_feats=bool(getattr(args, "edge_contrastive_feats", False)),
+        contrastive_feat_dim=int(getattr(args, "contrastive_feat_dim", 0) or 0),
+        edge_attention=bool(getattr(args, "edge_attention", True)),
         edge_drift_correction=getattr(args, "edge_drift_correction", False),
         pos_feat_dim=args.pos_feat_dim,
         contrastive=getattr(args, "contrastive", None),
@@ -266,6 +279,22 @@ def load_weights(
         if len(to_load) < n_backbone:
             print(f"  WARNING: {n_backbone - len(to_load)} not loaded", end="")
             print(f", {len(mismatched)} shape mismatches" if mismatched else "")
+
+
+def _stage_aug(args, name: str) -> dict | None:
+    """The augmentation block this stage runs with.
+
+    ``main_track`` resolves each stage's ``aug_strength`` into a concrete block
+    before training starts; a stage that named no rung falls back to the
+    run-level one. Synthetic data is what motivates per-stage strength: the
+    model is in-domain on it and will happily fit the generator's own
+    regularities, so it is worth corrupting far harder than the real frames,
+    whose photometry is already whatever the microscope made it.
+    """
+    stage_block = _stage(args, name).get("augmentations")
+    if stage_block is not None:
+        return stage_block
+    return getattr(args, "augmentations", None)
 
 
 def _stage(args, name: str) -> dict:
@@ -387,8 +416,8 @@ def _check_stage_weights(args, runs: list[dict]) -> None:
             if not Path(resolved).exists():
                 raise FileNotFoundError(
                     f"{stage}.weights points at {resolved}, which does not exist "
-                    f"(run {run['name']}). Set it to null to train the stage, or "
-                    f"fix the path."
+                    f"(run {run['name']}). Set it to null to start the stage from "
+                    f"scratch, or fix the path."
                 )
 
 
@@ -447,6 +476,18 @@ def _train_one(
             print("  validation overlaps training -- the score is leaky, not a metric")
         print(f"{'=' * 60}\n")
 
+    # Stage 3 nodes off disk. Both loaders get it: the val loader has to build
+    # its nodes the same way or the score would measure a different model.
+    nodes_cfg = {
+        k: edge_cfg[k] for k in ("coordinates_folder", "contrastive_folder")
+        if edge_cfg.get(k)
+    }
+    if nodes_cfg:
+        nodes_cfg["max_nodes"] = getattr(args, "max_dets_per_sample", 768) or 768
+    # evaluate_videos reads this to score whole videos off the same folders the
+    # loader trains on, instead of running the U-Net's detection.
+    args._nodes_cfg = nodes_cfg
+
     train_video_data, train_loader, train_sampler = build_loader(
         args.data_dir,
         embryos=train_embryos,
@@ -464,13 +505,15 @@ def _train_one(
         weak_positives_cfg=(
             {} if transformer_only else getattr(args, "weak_positives", {})
         ),
-        aug_cfg=getattr(args, "augmentations", None),
+        aug_cfg=_stage_aug(args, "edge"),
         normalization=getattr(args, "normalization", None),
         crop_size=crop_size,
         # n_videos=10,  # DEBUG
         ctx=ctx,
         seed=getattr(args, "seed", 0),
+        nodes_cfg=nodes_cfg,
     )
+
     def _val_loader(n_videos: int):
         return build_loader(
             args.data_dir,
@@ -486,6 +529,7 @@ def _train_one(
             n_videos=n_videos,
             ctx=ctx,
             seed=getattr(args, "seed", 0),
+            nodes_cfg=nodes_cfg,
         )[1]
 
     val_loader = _val_loader(run["n_val_videos"])
@@ -497,7 +541,9 @@ def _train_one(
         (args.pretraining or {}).get("n_val_videos") or run["n_val_videos"]
     )
     pretrain_val_loader = (
-        val_loader if pretrain_n_val == run["n_val_videos"] else _val_loader(pretrain_n_val)
+        val_loader
+        if pretrain_n_val == run["n_val_videos"]
+        else _val_loader(pretrain_n_val)
     )
 
     if ctx.is_main:
@@ -519,32 +565,26 @@ def _train_one(
         print(f"- Model: UNetNodeTransformer  (n_parameters={n_params / 1e6:.1f}M)")
 
     # --- Stage 1: detection on synthetic data ---
-    # Every synthetic cell is labelled, where the real ground truth annotates a
-    # few percent, so this is the only stage whose detection loss sees a
-    # complete frame. It runs first and alone: mixing it into stage 1.5 meant
-    # one loader, one loss config and one schedule had to serve both, and at
-    # proportion 1 the real frames were never drawn at all.
     synth_cfg = _stage(args, "synthetic_pretraining")
     shared = {} if shared is None else shared
-    # Sharing is only sound while the stage is *purely* synthetic. Below
-    # proportion 1 it also draws real frames from this run's training
-    # embryos, and handing those weights to the next fold would put that
-    # fold's validation embryo into its training history.
-    shareable = float(synth_cfg.get("proportion", 1)) >= 1.0
-    synth_weights = synth_cfg.get("weights") or shared.get("synthetic")
+
+    shareable = float(synth_cfg.get("synthetic_proportion", 1)) >= 1.0
+    synth_cfg_weights = synth_cfg.get("weights")
+    synth_weights = synth_cfg_weights or shared.get("synthetic")
     if synth_weights:
         if ctx.is_main and synth_weights == shared.get("synthetic"):
             print(f"\n-> Stage 1: Synthetic weights reused from {synth_weights}\n")
+        elif ctx.is_main:
+            print(f"\n-> Stage 1: Synthetic weights initialised from {synth_weights}\n")
         load_weights(model, synth_weights, fold, ctx, run_name=run["name"])
 
-    if synth_cfg.get("enabled") and not synth_weights:
+    skip_synth_training = bool(shared.get("synthetic")) and not synth_cfg_weights
+    if synth_cfg.get("enabled") and not skip_synth_training:
         synth_args = _apply_stage(args, "synthetic_pretraining")
         synth_args.stage = "seg"
         synth_args.det_warmup_prop = 1.0
         synth_args.transformer_only = False
-        # Scored on *real* validation videos. Synthetic held-out data would
-        # only report that the generator is self-consistent; what matters is
-        # whether any of this transfers.
+
         synth_args.eval_video_paths = _paths_for_embryos(args.data_dir, val_embryos)[
             : int(synth_cfg.get("n_val_videos") or 1)
         ]
@@ -555,9 +595,6 @@ def _train_one(
             "lr_transformer": args.optimizer_config["lr"],
         }
 
-        # Deriving weak positives costs ~20 ms/frame and this stage's loss is
-        # configured not to read them -- every synthetic cell is already a
-        # strong positive.
         uses_weak = bool(synth_args.loss_config.get("det_use_weak_positives"))
         _, synth_loader, synth_sampler = build_loader(
             args.data_dir,
@@ -570,11 +607,15 @@ def _train_one(
             video_data=train_video_data,  # save reloading the videos
             weak_positives_cfg=getattr(args, "weak_positives", {}) if uses_weak else {},
             synthetic_cfg=synth_cfg,
-            aug_cfg=getattr(args, "augmentations", None),
+            aug_cfg=_stage_aug(args, "synthetic_pretraining"),
             normalization=getattr(args, "normalization", None),
             crop_size=synth_cfg["crop_size"],
             ctx=ctx,
             seed=getattr(args, "seed", 0),
+            # det_warmup_prop=1.0 below: the edge head is never supervised in
+            # this stage, so the transition matrices would be built, cropped
+            # and collated only to be dropped.
+            load_edges=False,
         )
 
         if ctx.is_main:
@@ -585,7 +626,7 @@ def _train_one(
             )
             print(
                 f"\n-> Stage 1: Synthetic pretraining on {synth_cfg['crop_size']} crops, "
-                f"{synth_cfg['proportion']:.0%} synthetic, {schedule}\n"
+                f"{synth_cfg['synthetic_proportion']:.0%} synthetic, {schedule}\n"
             )
 
         fit(
@@ -603,15 +644,13 @@ def _train_one(
                 {"model_state_dict": unwrap_model(model).state_dict()}, synth_ckpt
             )
         if shareable:
-            # Every rank has to wait: rank 0 writes the file and the others
-            # read it at the start of the next run.
             if ctx.distributed:
                 dist.barrier()
             shared["synthetic"] = synth_ckpt
         elif ctx.is_main:
             print(
-                f"  (proportion {synth_cfg['proportion']:.0%} draws real frames too, "
-                f"so this stage is refit per fold rather than shared)"
+                f"  (synthetic_proportion {synth_cfg['synthetic_proportion']:.0%} draws real "
+                f"frames too, so this stage is refit per fold rather than shared)"
             )
 
         del synth_loader, synth_sampler
@@ -622,10 +661,9 @@ def _train_one(
     pretraining = args.pretraining
     weights = pretraining.get("weights")
     if weights:
-        # Reuse a previous run's pretraining instead of redoing step 1.
         load_weights(model, weights, fold, ctx, run_name=run["name"])
 
-    if pretraining["enabled"] and not weights:
+    if pretraining["enabled"]:
         _, seg_loader, seg_sampler = build_loader(
             args.data_dir,
             embryos=train_embryos,
@@ -636,29 +674,23 @@ def _train_one(
             augment=True,
             video_data=train_video_data,  # save reloading the videos
             weak_positives_cfg=getattr(args, "weak_positives", {}),
-            aug_cfg=getattr(args, "augmentations", None),
-        normalization=getattr(args, "normalization", None),
+            synthetic_cfg=pretraining,
+            aug_cfg=_stage_aug(args, "pretraining"),
+            normalization=getattr(args, "normalization", None),
             crop_size=pretraining["crop_size"],
             ctx=ctx,
             seed=getattr(args, "seed", 0),
+            load_edges=False,  # detection only, as in stage 1
         )
         seg_args = _apply_stage(args, "pretraining")
         seg_args.stage = "seg"
         seg_args.det_warmup_prop = 1.0
-        # Stage 1 is the one stage that *does* train the detection UNet,
-        # so it must not inherit stage 3's freeze-everything flag.
         seg_args.transformer_only = False
-        # Score whole videos with the real inference path instead of the
-        # window-level metrics: this stage only moves detection, and window
-        # node recall at the 7 um tolerance saturates. n_val_videos here is
-        # the video budget, since each one is a full forward pass.
+
         seg_args.eval_video_paths = _paths_for_embryos(args.data_dir, val_embryos)[
             : int(pretraining.get("n_val_videos") or 1)
         ]
-        # The edge head is still at init here, so scoring links with it would
-        # measure noise. Nearest-neighbour linking turns the node set into a
-        # graph well enough to score detection, and keeps the number a
-        # function of detection alone.
+
         seg_args.eval_edge_mode = "nearest"
         seg_args.optimizer_config = {
             **args.optimizer_config,
@@ -667,13 +699,21 @@ def _train_one(
         }
 
         if ctx.is_main:
+            synth_prop = float(pretraining.get("synthetic_proportion", 0.0) or 0.0)
+            source = (
+                f"real data + {synth_prop:.0%} synthetic"
+                if pretraining.get("synthetic_dir") and synth_prop > 0
+                else "real data"
+            )
             print(
-                f"\n-> Stage 1.5: Pretraining the detection UNet on real data, "
+                f"\n-> Stage 1.5: Pretraining the detection UNet on {source}, "
                 f"{seg_loader.dataset.crop_size} crops, "
                 f"{len(seg_loader.dataset)} windows, "
-                + (f"{seg_args.iterations} iterations\n"
-                   if getattr(seg_args, "iterations", None)
-                   else f"{seg_args.epochs} epochs\n")
+                + (
+                    f"{seg_args.iterations} iterations\n"
+                    if getattr(seg_args, "iterations", None)
+                    else f"{seg_args.epochs} epochs\n"
+                )
             )
 
         fit(
@@ -696,18 +736,15 @@ def _train_one(
             torch.cuda.empty_cache()
 
     # --- Stage 2: contrastive embedding UNet, on the frozen detections ---
-    # Runs only when the transformer asks for those features; otherwise the
-    # branch was never built.
     contrastive = getattr(args, "contrastive", {}) or {}
-    # Two conditions, and they mean different things: "enabled" is the switch,
-    # while the branch only exists at all if the transformer was built to read
-    # those features. Training it otherwise would optimise a head nothing uses.
     use_contrastive = bool(contrastive.get("enabled", True)) and "contrastive" in (
         getattr(args, "unet_features", ()) or ()
     )
 
     weights = contrastive.get("weights") if use_contrastive else None
     if weights:
+        # Initialise the embedding UNet from a previous run; the stage still
+        # trains on top of it below.
         load_weights(
             model,
             weights,
@@ -716,7 +753,7 @@ def _train_one(
             prefixes=("embed_unet.", "embed_head."),
             run_name=run["name"],
         )
-    if use_contrastive and not weights:
+    if use_contrastive:
         _, emb_loader, emb_sampler = build_loader(
             args.data_dir,
             embryos=train_embryos,
@@ -727,8 +764,8 @@ def _train_one(
             augment=contrastive.get("augment", True),
             video_data=train_video_data,  # save reloading the videos
             weak_positives_cfg={},  # detection is frozen here
-            aug_cfg=getattr(args, "augmentations", None),
-        normalization=getattr(args, "normalization", None),
+            aug_cfg=_stage_aug(args, "contrastive"),
+            normalization=getattr(args, "normalization", None),
             crop_size=contrastive.get("crop_size"),
             ctx=ctx,
             seed=getattr(args, "seed", 0),
@@ -761,41 +798,29 @@ def _train_one(
     if ctx.is_main and not edge_enabled:
         print("\n-> Stage 3: skipped (edge.enabled is false)\n")
     if ctx.is_main and edge_enabled:
-        if edge_weights:
-            print(f"\n-> Stage 3: Edge transformer reused from {edge_weights}\n")
-        else:
-            schedule = (
-                f"{edge_cfg['iterations']} iterations"
-                if edge_cfg.get("iterations")
-                else f"{edge_cfg.get('epochs')} epochs"
-            )
-            frozen = ", backbone frozen" if transformer_only else ""
-            print(
-                f"\n-> Stage 3: Edge transformer on {crop_size or 'full'} crops, "
-                f"{len(train_loader.dataset)} windows, batch {edge_cfg['batch_size']}, "
-                f"{schedule}{frozen}\n"
-            )
-
-    if edge_weights:
-        # The mirror of pretraining.weights: reuse a previous run's edge head
-        # rather than retraining it. Only the transformer is taken -- the
-        # backbone came from stage 1 and may well be a different one.
-        load_weights(
-            model, edge_weights, fold, ctx,
-            prefixes=("transformer.",), run_name=run["name"],
+        schedule = (
+            f"{edge_cfg['iterations']} iterations"
+            if edge_cfg.get("iterations")
+            else f"{edge_cfg.get('epochs')} epochs"
+        )
+        frozen = ", backbone frozen" if transformer_only else ""
+        init = f", initialised from {edge_weights}" if edge_weights else ""
+        print(
+            f"\n-> Stage 3: Edge transformer on {crop_size or 'full'} crops, "
+            f"{len(train_loader.dataset)} windows, batch {edge_cfg['batch_size']}, "
+            f"{schedule}{frozen}{init}\n"
         )
 
+    if edge_weights:
+        load_weights(model, edge_weights, fold, ctx, run_name=run["name"])
+
     edge_args = _apply_stage(args, "edge")
-    # Same full-video scoring as stage 1, but through the trained edge head:
-    # this stage moves the links, so the metric has to read them. The edge
-    # stage's own n_val_videos sizes it, since each video is a full forward
-    # pass and the window-level loader is far cheaper per video.
     edge_args.eval_video_paths = _paths_for_embryos(args.data_dir, val_embryos)[
         : int(edge_cfg.get("n_val_videos") or 1)
     ]
     edge_args.eval_edge_mode = "transformer"
 
-    if edge_enabled and not edge_weights:
+    if edge_enabled:
         fit(
             model,
             train_loader,
@@ -811,7 +836,7 @@ def _train_one(
             os.path.join(fold_dir, "ckpt_final.pt"),
         )
 
-        print('\n-> Saved model weights to: ', os.path.join(fold_dir, "ckpt_final.pt"))
+        print("\n-> Saved model weights to: ", os.path.join(fold_dir, "ckpt_final.pt"))
 
     del model, train_loader, train_sampler, val_loader
     if ctx.device.type == "cuda":

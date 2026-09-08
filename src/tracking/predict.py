@@ -166,23 +166,39 @@ class _NodeRegistry:
         self.seen_pairs: set[tuple[int, int]] = set()
         self.coord_lists: list[np.ndarray] = []
         self.offset_lists: list[np.ndarray] = []
+        self.score_lists: list[np.ndarray] = []
         # coord_offset[t] = (start, end), a half-open range into the stacked array.
         self.coord_offset: dict[int, tuple[int, int]] = {}
         self.n_nodes = 0
         self.edges: list[tuple[int, int, float, float]] = []
 
-    def add_frame(self, t: int, arr: np.ndarray, offsets: np.ndarray | None = None) -> None:
+    def add_frame(
+        self,
+        t: int,
+        arr: np.ndarray,
+        offsets: np.ndarray | None = None,
+        scores: np.ndarray | None = None,
+    ) -> None:
         """Register frame t's detections, in detection-grid space.
 
         ``offsets`` is the model's centroid vote at each detection, in grid
         voxels; it is carried alongside rather than folded in, because the edge
         scorer must keep reading the integer coordinates it was trained on.
+
+        ``scores`` is the detection probability at each peak. A node that only
+        just cleared the threshold is a different thing from one the head was
+        certain of, and nothing downstream can recover the difference once the
+        coordinates are all that is kept.
         """
         self.coord_offset[t] = (self.n_nodes, self.n_nodes + len(arr))
         self.n_nodes += len(arr)
         self.coord_lists.append(arr)
         self.offset_lists.append(
             np.zeros((len(arr), 3), dtype=np.float32) if offsets is None else offsets
+        )
+        self.score_lists.append(
+            np.full(len(arr), np.nan, dtype=np.float32) if scores is None
+            else np.asarray(scores, dtype=np.float32)
         )
         self.seen_frames.add(t)
 
@@ -191,6 +207,12 @@ class _NodeRegistry:
         if not self.coord_lists:
             return np.empty((0, 4), dtype=np.int16)
         return np.concatenate(self.coord_lists)
+
+    def scores(self) -> np.ndarray:
+        """The detection probability at every node, as (N,) float32."""
+        if not self.score_lists:
+            return np.empty(0, dtype=np.float32)
+        return np.concatenate(self.score_lists)
 
     def offsets(self) -> np.ndarray:
         """The centroid vote at every detection, as (N, 3) in grid voxels."""
@@ -386,25 +408,37 @@ def predict_video_thresholds(
     progress: bool = True,
     downscale_factor: int = 1,
     return_det_logits: bool = True,
-) -> tuple[dict[float, tuple[np.ndarray, list]], torch.Tensor | None]:
-    """Run inference on a single video at several detection thresholds at once.
+    nms_radii: Sequence[float] | None = None,
+) -> tuple[dict[tuple[float, float], tuple[np.ndarray, list]], torch.Tensor | None]:
+    """Run inference on a single video over a grid of NMS radii x thresholds.
 
     Windows slide with stride ``W - 1`` so every consecutive pair is covered
     exactly once. UNet features from each window are reused for edge
     prediction on all ``W - 1`` consecutive pairs within the window.
 
-    The threshold only decides which detection peaks become nodes, so the UNet
-    forward — the cost of this function — is shared across all of them, and so
-    is the NMS (see ``detect_cells_multi_threshold``). Only the edge pass,
-    which reads a threshold's own node set, repeats. Sweeping a threshold this
-    way costs a fraction of one run per extra value, instead of a full one.
+    Neither the threshold nor the NMS radius changes the UNet forward — the
+    cost of this function — so it is shared across the whole grid. Beyond that
+    the two sweep differently:
 
-    ``cfg.det_threshold`` is ignored; ``thresholds`` replaces it.
+    * Thresholds share the NMS pass as well: one run at the lowest one answers
+      all of them (see ``detect_cells_multi_threshold``).
+    * Radii do not. Greedy NMS results do not nest across radius — a peak
+      suppressed at a small radius can free a neighbour that a larger radius
+      then keeps — so each radius gets its own pass over the same probabilities.
+
+    Only the NMS and the edge pass repeat, and both are small beside the
+    forward, so an extra radius still costs a fraction of a full run.
+
+    ``cfg.det_threshold`` and ``cfg.nms_radius_um`` are ignored;  ``thresholds``
+    and ``nms_radii`` replace them. ``nms_radii`` defaults to
+    ``[cfg.nms_radius_um]``.
 
     Returns
     -------
-    per_threshold : dict
-        threshold -> ``(coords, edges)``, each as ``predict_video`` returns them.
+    per_key : dict
+        ``(nms_radius_um, threshold)`` -> ``(coords, edges, node_probs)``.
+        ``node_probs`` is the (N,) detection probability at each node,
+        row-aligned with ``coords``.
     det_logits : torch.Tensor or None
         Stacked raw detection logits per window, or None if not requested. They
         hold a full-resolution volume per window, so ask for them deliberately.
@@ -415,6 +449,17 @@ def predict_video_thresholds(
     thresholds = sorted({float(th) for th in thresholds})
     if not thresholds:
         raise ValueError("thresholds must not be empty")
+
+    radii = sorted({float(r) for r in (nms_radii or [cfg.nms_radius_um])})
+    if not radii:
+        raise ValueError("nms_radii must not be empty")
+    if len(radii) > 1 and cfg.nms != "greedy":
+        # maxpool takes its neighbourhood from pool_kernel_um and never reads
+        # the radius, so the sweep would run N identical passes.
+        raise ValueError(
+            f"nms_radii sweeps the greedy NMS radius, but nms={cfg.nms!r}; "
+            "sweep pool_kernel_um instead, or pass --nms greedy"
+        )
 
     ds = open_dataset(ds_path, normalize=False, load_image=False)
     # Must match what training normalised with, or every intensity the detector
@@ -441,9 +486,9 @@ def predict_video_thresholds(
     out_shape: tuple[int, int, int] | None = None
     pool_k: tuple[int, int, int] | None = None
 
-    # One node registry per threshold: the node sets differ, so the indices the
-    # edges refer to do too.
-    registries = {th: _NodeRegistry() for th in thresholds}
+    # One node registry per (radius, threshold): the node sets differ, so the
+    # indices the edges refer to do too.
+    registries = {(r, th): _NodeRegistry() for r in radii for th in thresholds}
 
     # Sliding windows with stride W-1 cover every consecutive pair exactly once.
     stride = max(W - 1, 1)
@@ -525,25 +570,34 @@ def predict_video_thresholds(
         # det_logits / unet_out), matching tracking/targets.py. One NMS pass
         # answers every threshold at once.
         for f_idx, t in enumerate(frame_indices):
-            pending = [th for th, reg in registries.items() if t not in reg.seen_frames]
-            if not pending:
-                continue
-            per_threshold = detect_cells_multi_threshold(
-                det_logits[f_idx][0].sigmoid(),
-                t,
-                pending,
-                nms=cfg.nms,
-                pool_kernel=pool_k,
-                voxel_size=voxel_size_out,
-                nms_radius_um=cfg.nms_radius_um,
-            )
-            for th, arr in per_threshold.items():
-                registries[th].add_frame(
-                    t, arr, _gather_offsets(offset_maps, f_idx, arr)
+            probas = None
+            for r in radii:
+                pending = [
+                    th for th in thresholds
+                    if t not in registries[(r, th)].seen_frames
+                ]
+                if not pending:
+                    continue
+                if probas is None:  # one sigmoid for every radius
+                    probas = det_logits[f_idx][0].sigmoid()
+                per_threshold = detect_cells_multi_threshold(
+                    probas,
+                    t,
+                    pending,
+                    nms=cfg.nms,
+                    pool_kernel=pool_k,
+                    voxel_size=voxel_size_out,
+                    nms_radius_um=r,
+                    return_scores=True,
                 )
+                for th, (arr, node_scores) in per_threshold.items():
+                    registries[(r, th)].add_frame(
+                        t, arr, _gather_offsets(offset_maps, f_idx, arr), node_scores
+                    )
 
         # --- Edge prediction for each consecutive pair in the window ---
-        # Repeated per threshold: each one has its own nodes, so its own pairs.
+        # Repeated per (radius, threshold): each one has its own nodes, so its
+        # own pairs.
         for reg in registries.values():
             _predict_window_edges(
                 model, reg, frame_indices, node_feat_maps, out_shape, cfg, device,
@@ -553,14 +607,15 @@ def predict_video_thresholds(
         del unet_out
 
     results = {
-        th: (
+        key: (
             _rescale_coords(
                 reg.coords(), unet_scaling, downscale_factor,
                 offsets=reg.offsets() if use_offset else None,
             ),
             reg.edges,
+            reg.scores(),
         )
-        for th, reg in registries.items()
+        for key, reg in registries.items()
     }
     det_logits = torch.stack(det_logits_list) if return_det_logits else None
     return results, det_logits
@@ -603,6 +658,169 @@ def predict_video(
         progress=progress,
         downscale_factor=downscale_factor,
     )
-    coords, edges = results[float(cfg.det_threshold)]
+    coords, edges, _ = results[(float(cfg.nms_radius_um), float(cfg.det_threshold))]
     return coords, edges, det_logits
 
+
+
+@torch.no_grad()
+def predict_video_precomputed(
+    model: UNetNodeTransformer,
+    ds_path: str | Path,
+    coordinates_folder: str | Path,
+    contrastive_folder: str | Path | None = None,
+    device: str | torch.device = "cuda",
+    cfg=None,
+    downscale_factor: int = 1,
+    max_frames: int | None = None,
+    emb_tol: float = 1e-3,
+) -> tuple[np.ndarray, list]:
+    """``predict_video`` for a model whose nodes come from a folder.
+
+    Same contract -- returns ``(coords, edges)`` ready for ``build_graph`` --
+    and the same edge machinery, ``_select_edges`` and all, so the two paths
+    are scored by identical rules. What it drops is everything the U-Net was
+    for: no forward pass, no NMS, no detection threshold. The node set is
+    given, so the only question left is which pairs to link.
+
+    Two consequences worth stating.
+
+    *There is no threshold sweep.* Every threshold would see the same nodes, so
+    the caller gets one result rather than a dict.
+
+    *The coordinates come back exactly as the folder wrote them.* The U-Net path
+    has to undo its own downsampling in ``_rescale_coords``, which costs it half
+    a grid cell of accuracy; here the original-resolution coordinate was never
+    lost, so it is returned untouched.
+    """
+    from tracking.fit_utils import node_scaling_from_voxel
+
+    cfg = cfg or PredictConfig()
+    device = torch.device(device)
+    ds_path = Path(ds_path)
+    sample = ds_path.name
+
+    ds = open_dataset(ds_path, normalize=False, load_image=False)
+    T = ds.image_shape[0] if max_frames is None else min(ds.image_shape[0], max_frames)
+
+    with np.load(Path(coordinates_folder) / f"{sample}.npz") as d:
+        all_coords = np.asarray(d["coords"]).astype(np.float32)   # (N, 4) t,z,y,x
+
+    emb_coords = emb_feats = None
+    if contrastive_folder:
+        with np.load(Path(contrastive_folder) / f"{sample}.npz") as d:
+            emb_coords = np.asarray(d["coords"]).astype(np.float32)
+            emb_feats = np.asarray(d["embeddings"]).astype(np.float32)
+    dim = 0 if emb_feats is None else emb_feats.shape[1]
+
+    # The isotropic node grid the edge scorer was trained to measure in --
+    # derived exactly as encode_nodes_precomputed derives it.
+    scaling = np.asarray(
+        node_scaling_from_voxel(tuple(ds.scale)), dtype=np.float32
+    )
+    spatial = tuple(int(s // downscale_factor) for s in ds.image_shape[1:])
+    out_shape = tuple(int(s // sc) for s, sc in zip(spatial, scaling))
+    # Window-relative, matching training: a pair is frames 0 and 1 of a
+    # window_size=2 window, whatever its absolute index in the video.
+    pos_shape = (2,) + out_shape
+
+    times = all_coords[:, 0].astype(int)
+    reg = _NodeRegistry()
+    per_frame_emb: dict[int, np.ndarray] = {}
+    # Accumulated frame by frame rather than sliced out of all_coords at the
+    # end: the registry stacks in this order, and the edges index into it, so
+    # an npz that was not sorted by t would otherwise silently mislabel every
+    # edge endpoint.
+    orig_lists: list[np.ndarray] = []
+
+    for t in range(T):
+        rows = np.flatnonzero(times == t)
+        pts = all_coords[rows]
+        orig_lists.append(pts)
+        grid = pts.copy()
+        grid[:, 1:] = pts[:, 1:] / downscale_factor / scaling
+        reg.add_frame(t, grid)
+
+        e = np.zeros((len(rows), dim), np.float32)
+        if dim and len(rows):
+            ref_rows = np.flatnonzero(emb_coords[:, 0].astype(int) == t)
+            if len(ref_rows):
+                # Matched on the coordinate, not the row index, for the reason
+                # given in TrackDataset._precomputed_nodes.
+                dmat = np.linalg.norm(
+                    pts[:, None, 1:] - emb_coords[None, ref_rows, 1:], axis=2
+                )
+                j = dmat.argmin(axis=1)
+                ok = dmat[np.arange(len(rows)), j] <= emb_tol
+                e[ok] = emb_feats[ref_rows[j[ok]]]
+        per_frame_emb[t] = e
+
+    if getattr(model, "unet_features", ()):
+        # Those features are read off U-Net maps at the node coordinates, and
+        # there is no U-Net here. Failing now beats scoring a model on node
+        # tokens that are silently zero where it expects encoder features.
+        raise ValueError(
+            f"precomputed-node inference cannot supply unet_features "
+            f"{list(model.unet_features)}; set unet_features=[] for this path"
+        )
+    needs_emb = int(getattr(model, "contrastive_feat_dim", 0) or 0) > 0
+    nearest = getattr(cfg, "edge_mode", "transformer") == "nearest"
+    voxel_size_out = tuple(float(s) * downscale_factor * float(u)
+                           for s, u in zip(ds.scale, scaling))
+
+    coords_grid = reg.coords()
+    for t in range(T - 1):
+        s_src, e_src = reg.coord_offset[t]
+        s_tgt, e_tgt = reg.coord_offset[t + 1]
+        if e_src == s_src or e_tgt == s_tgt:
+            continue
+        c_src, c_tgt = coords_grid[s_src:e_src], coords_grid[s_tgt:e_tgt]
+        idx_src = np.arange(s_src, e_src, dtype=np.int64)
+        idx_tgt = np.arange(s_tgt, e_tgt, dtype=np.int64)
+
+        if nearest:
+            probs = _nearest_probs(c_src[:, 1:], c_tgt[:, 1:],
+                                   voxel_size_out, cfg.max_link_um)
+        else:
+            p_c_src = torch.from_numpy(c_src[:, 1:]).float().unsqueeze(0).to(device)
+            p_c_tgt = torch.from_numpy(c_tgt[:, 1:]).float().unsqueeze(0).to(device)
+            src_rel, tgt_rel = c_src.copy(), c_tgt.copy()
+            src_rel[:, 0], tgt_rel[:, 0] = 0, 1
+            p_p_src = torch.from_numpy(
+                pos_embed_numpy(src_rel, pos_shape)).float().unsqueeze(0).to(device)
+            p_p_tgt = torch.from_numpy(
+                pos_embed_numpy(tgt_rel, pos_shape)).float().unsqueeze(0).to(device)
+            m_src = torch.ones(1, len(c_src), dtype=torch.bool, device=device)
+            m_tgt = torch.ones(1, len(c_tgt), dtype=torch.bool, device=device)
+
+            emb_src = emb_tgt = v_src = v_tgt = None
+            if needs_emb:
+                emb_src = torch.from_numpy(per_frame_emb[t]).unsqueeze(0).to(device)
+                emb_tgt = torch.from_numpy(per_frame_emb[t + 1]).unsqueeze(0).to(device)
+                v_src = emb_src.abs().sum(-1) > 0
+                v_tgt = emb_tgt.abs().sum(-1) > 0
+
+            logits = model.predict_edges(
+                p_c_src.new_zeros((1, len(c_src), 0)),
+                p_c_tgt.new_zeros((1, len(c_tgt), 0)),
+                p_c_src, p_c_tgt, p_p_src, p_p_tgt, m_src, m_tgt,
+                emb_src=emb_src, emb_tgt=emb_tgt,
+                emb_valid_src=v_src, emb_valid_tgt=v_tgt,
+            )[0]
+            probs = (
+                torch.softmax(logits, dim=0) if cfg.edge_activation == "softmax"
+                else torch.sigmoid(logits)
+            ).float().cpu().numpy()
+
+        for prob, i, j in _select_edges(probs, cfg):
+            gi, gj = int(idx_src[i]), int(idx_tgt[j])
+            dist = float(np.linalg.norm(
+                coords_grid[gi, 1:] - coords_grid[gj, 1:]))
+            reg.edges.append((gi, gj, prob, dist))
+
+    # The folder's own coordinates, at original resolution, in registry order.
+    stacked = (
+        np.concatenate(orig_lists) if orig_lists
+        else np.empty((0, 4), np.float32)
+    )
+    return np.round(stacked).astype(np.int16), reg.edges

@@ -441,3 +441,125 @@ def build_matched_edge_targets(
         target[b, :n_t, :n_t1] = block
 
     return target
+
+
+def nodes_from_precomputed(
+    pre_coords: torch.Tensor,          # (B, P, 3) image-voxel space, -1 padded
+    pre_emb: torch.Tensor | None,      # (B, P, D) L2-normalised, or None
+    gt_coords: torch.Tensor,           # (B, max_nodes, 3) image-voxel space
+    mask: torch.Tensor,                # (B, max_nodes) bool
+    image_shape: tuple,
+    voxel_size: tuple | None = None,
+    node_scaling: tuple | None = None,
+    frame_index: int = 0,
+    window_size: int | None = None,
+    max_match_distance: float = 7.0,
+    max_dets_per_sample: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor],
+           torch.Tensor, torch.Tensor]:
+    """``detect_and_match`` for nodes that are given rather than detected.
+
+    Stage 3 can take its nodes from a predictions folder instead of running the
+    U-Net, in which case there is no heatmap to find peaks in and no NMS to run
+    -- the node set is fixed and the only thing still to compute is which
+    ground-truth cell each node stands for, so the edge targets can be built.
+    Everything else about the output is deliberately identical to
+    ``detect_and_match``, so the training step cannot tell the two apart.
+
+    ``node_scaling`` is how many image voxels one node-grid unit spans. The
+    U-Net path gets this for free from its own downsampling, which is chosen so
+    the detection grid comes out isotropic; without a U-Net there is nothing to
+    measure, so it is passed in. Isotropy is not cosmetic here -- ``_geom_feats``
+    and the kNN gate both read plain Euclidean distance in this space, and at
+    the raw 1.625/0.40625 um anisotropy a z-step would count four times a y-step.
+
+    Returns ``(coords, pos, mask, matches, emb, emb_valid)``, the first four
+    exactly as ``detect_and_match`` does, plus the per-node embeddings aligned
+    to them and a flag for which nodes actually carry one.
+    """
+    B = pre_coords.shape[0]
+    device = pre_coords.device
+    D = 0 if pre_emb is None else pre_emb.shape[-1]
+
+    if voxel_size is not None:
+        vs = torch.tensor(voxel_size, dtype=torch.float32, device=device)
+    else:
+        vs = torch.ones(3, dtype=torch.float32, device=device)
+    scaling = torch.tensor(
+        node_scaling if node_scaling is not None else (1.0, 1.0, 1.0),
+        dtype=torch.float32, device=device,
+    )
+    node_vs = vs * scaling
+
+    sample_coords, sample_emb, sample_matches = [], [], []
+    max_det = 0
+    nt_all = mask.sum(dim=1).long()
+
+    for b in range(B):
+        # -1 is the padding the point-set machinery uses; a real coordinate is
+        # never negative.
+        valid = (pre_coords[b] >= 0).all(dim=-1)
+        idx = torch.nonzero(valid, as_tuple=True)[0]
+        if max_dets_per_sample is not None and idx.numel() > max_dets_per_sample:
+            idx = idx[:max_dets_per_sample]
+
+        # Into the isotropic node grid the edge scorer measures distance in.
+        det_b = pre_coords[b][idx] / scaling
+        emb_b = (
+            pre_emb[b][idx] if pre_emb is not None
+            else pre_coords.new_zeros(idx.numel(), 0)
+        )
+
+        n_det = int(det_b.shape[0])
+        nt = int(nt_all[b].item())
+        gt_b = gt_coords[b, :nt]
+
+        # Greedy one-to-one nearest matching in microns, nearest pair first --
+        # the same rule detect_and_match uses, so the edge targets built from
+        # these matches mean the same thing.
+        matched = torch.full((n_det,), -1, dtype=torch.long, device=device)
+        if n_det > 0 and nt > 0:
+            dists = torch.cdist(det_b * node_vs, gt_b * vs)
+            min_d, min_i = dists.min(dim=1)
+            order = min_d.argsort()
+            gt_taken = torch.zeros(nt, dtype=torch.bool, device=device)
+            for j in order:
+                if min_d[j] > max_match_distance:
+                    break
+                gi = min_i[j]
+                if not gt_taken[gi]:
+                    matched[j] = gi
+                    gt_taken[gi] = True
+
+        sample_coords.append(det_b)
+        sample_emb.append(emb_b)
+        sample_matches.append(matched)
+        max_det = max(max_det, n_det)
+
+    max_det = max(max_det, 1)
+
+    padded_coords = torch.zeros(B, max_det, 3, device=device)
+    padded_mask = torch.zeros(B, max_det, dtype=torch.bool, device=device)
+    padded_emb = torch.zeros(B, max_det, D, device=device)
+    emb_valid = torch.zeros(B, max_det, dtype=torch.bool, device=device)
+    for b in range(B):
+        n = sample_coords[b].shape[0]
+        if n == 0:
+            continue
+        padded_coords[b, :n] = sample_coords[b]
+        padded_mask[b, :n] = True
+        if D:
+            padded_emb[b, :n] = sample_emb[b]
+            # A zero row is what the loader writes for a node the embedding
+            # folder had nothing for; it is not a legitimate unit vector, so it
+            # is exactly what marks the node as abstaining.
+            emb_valid[b, :n] = sample_emb[b].abs().sum(dim=-1) > 0
+
+    t_col = torch.full((B, max_det, 1), frame_index, device=device, dtype=torch.float32)
+    full_coords = torch.cat([t_col, padded_coords], dim=-1)
+    out_shape = tuple(
+        int(s // sc) for s, sc in zip(image_shape[-3:], scaling.tolist())
+    )
+    padded_pos = pos_embed_torch(full_coords, (window_size,) + out_shape)
+
+    return padded_coords, padded_pos, padded_mask, sample_matches, padded_emb, emb_valid

@@ -128,37 +128,58 @@ def prepare_log_folder(log_path):
     return log_folder
 
 
-def get_last_log_folder(log_path):
-    """
-    Get the path to the most recent log folder from today or the previous day.
+DATE_DIR = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
-    This function finds the most recent experiment log folder by checking today's
-    date first, and if no folders exist, checking yesterday's date. It identifies
-    the folder with the highest experiment ID number.
+
+def get_last_log_folder(log_path, contains="args.json"):
+    """
+    Get the path to the most recent experiment folder, as prepare_log_folder lays
+    them out: ``log_path/<date>/<exp_id>/``.
+
+    The dates are ISO, so they sort lexicographically, and the experiment ids are
+    numeric — the most recent run is the highest id under the latest date that
+    holds one. Every date is walked, newest first, rather than only today's:
+    prepare_log_folder creates the date folder before the run it is for, so the
+    newest one can be empty, and there is no reason the last run has to have
+    happened today.
 
     Args:
         log_path (str): Base path to the log folders directory.
+        contains (str, optional): A file the folder must hold to count as a run.
+            Defaults to args.json, which main_track writes before it trains
+            anything, so a folder created by a run that died at startup is
+            skipped rather than returned. Pass None to accept any folder.
 
     Returns:
-        str: The path to the most recent log folder.
+        str: The path to the most recent log folder, with a trailing slash.
     """
-    today = str(datetime.date.today())
-    log_today = f"{log_path}{today}/"
+    if not os.path.isdir(log_path):
+        raise FileNotFoundError(f"No log directory at {log_path}")
 
-    if not os.path.exists(log_today):
-        today = today - datetime.timedelta(days=1)
-        log_today = f"{log_path}{today}/"
+    dates = sorted(
+        (
+            d for d in os.listdir(log_path)
+            if DATE_DIR.match(d) and os.path.isdir(os.path.join(log_path, d))
+        ),
+        reverse=True,
+    )
+    for date in dates:
+        day = os.path.join(log_path, date)
+        exps = sorted(
+            (
+                int(f) for f in os.listdir(day)
+                if f.isdigit() and os.path.isdir(os.path.join(day, f))
+                and (not contains or os.path.exists(os.path.join(day, f, contains)))
+            ),
+            reverse=True,
+        )
+        if exps:
+            return os.path.join(day, str(exps[0])) + "/"
 
-    exps = []
-    for f in os.listdir(log_today):
-        try:
-            exps.append(int(f))
-        except Exception:
-            continue
-    exp_id = np.max(exps)
-
-    log_folder = log_today + f"{exp_id}/"
-    return log_folder
+    raise FileNotFoundError(
+        f"No experiment under {log_path}<date>/<id>/"
+        + (f" holding {contains}" if contains else "")
+    )
 
 
 def save_config(config, path):

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import zarr
@@ -20,6 +21,28 @@ from tracking.weak_positives import compute_weak_positives
 from tracking.weak_positives_new import compute_weak_positives as compute_weak_positives_v2
 
 
+def _valid(points: torch.Tensor) -> torch.Tensor:
+    """The real rows of a -1-padded (N, 3) point set."""
+    return points[(points >= 0).all(dim=-1)]
+
+
+def _merge_points(sets: list[torch.Tensor], n_max: int) -> torch.Tensor:
+    """Concatenate -1-padded (W, N, 3) point sets back into one (W, n_max, 3).
+
+    Earlier sets win the budget: the caller has already deduplicated the later
+    ones against them, so what gets cut when a frame overflows ``n_max`` is the
+    lower-priority source rather than an arbitrary slice of both.
+    """
+    W = sets[0].shape[0]
+    out = torch.full((W, n_max, 3), -1.0, dtype=torch.float32)
+    for f in range(W):
+        pts = torch.cat([_valid(s[f]) for s in sets])
+        n = min(len(pts), n_max)
+        if n:
+            out[f, :n] = pts[:n]
+    return out
+
+
 class TrackDataset(Dataset):
     """Fixed-size dataset of temporal tracking windows.
 
@@ -38,6 +61,8 @@ class TrackDataset(Dataset):
         weak_positives_cfg: dict | None = None,
         load_images: bool = True,
         clamp_max: float = 4.0,
+        nodes_cfg: dict | None = None,
+        load_edges: bool = True,
     ):
         all_windows = [w for _, windows in video_data for w in windows]
         if not all_windows:
@@ -47,11 +72,22 @@ class TrackDataset(Dataset):
 
         self.downscale_factor = downscale_factor
         self.load_images = load_images
+        # The detection-only stages never read the transition matrix. Skipping
+        # it drops the padded window from ~2.4 MB to ~20 KB and takes the
+        # matrix out of the crop and augmentation path with it.
+        self.load_edges = load_edges
         self.weak_positives_cfg = weak_positives_cfg
         self._weak_cache: dict[str, torch.Tensor] = {}
         # One npz per video, a few hundred KB each — cheaper to hold than to
         # re-read for every window of that video.
         self._pl_cache: dict[str, np.ndarray] = {}
+        # FOCUS-3D pseudo-labels: one json per stack, and None for the stacks
+        # that have no file or that the recall/ratio gate rejected.
+        self._focus3d_cache: dict[str, np.ndarray | None] = {}
+        # Stage 3 can take its nodes from a predictions folder instead of the
+        # U-Net's own peaks, with the NETr embeddings that go with them.
+        self.nodes_cfg = dict(nodes_cfg or {})
+        self._emb_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self.aug_cfg = {**AUG_DEFAULTS, **(aug_cfg or {})}
         self.clamp_max = clamp_max
         self.max_nodes = max_nodes
@@ -62,7 +98,7 @@ class TrackDataset(Dataset):
         for video_meta, windows in video_data:
             spatial = tuple(s // downscale_factor for s in video_meta.image_shape[1:])
             for window in windows:
-                meta = _pad_window(window, max_nodes)
+                meta = _pad_window(window, max_nodes, edges=load_edges)
                 if (
                     self.augment
                     and self.crop_size is not None
@@ -116,25 +152,154 @@ class TrackDataset(Dataset):
             self._pl_cache[key] = coords
         return coords
 
+    def _load_focus3d(self, sample_name: str) -> np.ndarray | None:
+        """FOCUS-3D pseudo-labels as (N, 4) [t, z, y, x], or None if unusable.
+
+        ``pl_focus_3D.py`` writes one json per stack holding ``nodes`` keyed by
+        frame index, plus the two sanity numbers this gate reads: ``recall``
+        against the sparse annotation and ``ratio``, predicted cells over the
+        organiser's estimate. A stack that misses annotated cells or that
+        hallucinates far more cells than the metadata expects is not a
+        pseudo-label source worth training on, so it is dropped whole rather
+        than per-frame — the failure is a segmentation-wide miscalibration, not
+        a handful of bad frames.
+
+        A stack with no json is dropped the same way: the folder covers only
+        part of the training set, so a missing file is normal and the caller
+        falls back to image peaks.
+        """
+        cfg = self.weak_positives_cfg
+        if sample_name in self._focus3d_cache:
+            return self._focus3d_cache[sample_name]
+
+        folder = Path(cfg.get("focus_3d_dir") or "../output/focus3d/")
+        if not folder.is_dir():
+            raise FileNotFoundError(
+                f"use_focus_3d is set but {folder} does not exist"
+            )
+
+        path = folder / f"predicted_nodes_{sample_name}.json"
+        coords = None
+        if path.exists():
+            with open(path) as f:
+                data = json.load(f)
+            recall = float(data.get("recall", float("nan")))
+            ratio = float(data.get("ratio", float("nan")))
+            # A NaN recall (an unannotated stack scores nothing rather than
+            # zero) fails both comparisons, so it drops out here too.
+            if (
+                recall >= float(cfg.get("focus_3d_min_recall", 0.8))
+                and ratio <= float(cfg.get("focus_3d_max_ratio", 1.5))
+            ):
+                rows = [
+                    np.concatenate(
+                        [np.full((len(pts), 1), int(t), dtype=np.float32),
+                         np.asarray(pts, dtype=np.float32).reshape(-1, 3)],
+                        axis=1,
+                    )
+                    for t, pts in data["nodes"].items()
+                    if len(pts)
+                ]
+                coords = (
+                    np.concatenate(rows) if rows
+                    else np.zeros((0, 4), dtype=np.float32)
+                )
+
+        self._focus3d_cache[sample_name] = coords
+        return coords
+
+    def _load_emb(self, folder: str, sample_name: str) -> tuple[np.ndarray, np.ndarray]:
+        """``(coords (N, 4), embeddings (N, D))`` from inference_contrastive."""
+        key = f"{folder}::{sample_name}"
+        hit = self._emb_cache.get(key)
+        if hit is None:
+            path = Path(folder) / f"{sample_name}.npz"
+            if not path.exists():
+                raise FileNotFoundError(f"No embeddings for {sample_name} at {path}")
+            with np.load(path) as d:
+                if "embeddings" not in d:
+                    raise KeyError(
+                        f"{path} has no 'embeddings' array -- contrastive_folder "
+                        "should point at inference_contrastive.py's output, not "
+                        "at the tracking predictions folder"
+                    )
+                hit = (d["coords"].astype(np.float32),
+                       d["embeddings"].astype(np.float32))
+            self._emb_cache[key] = hit
+        return hit
+
+    def _precomputed_nodes(
+        self,
+        sample_name: str,
+        frames: list[int],
+        n_max: int,
+        emb_tol: float = 1e-3,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The window's precomputed nodes and their embeddings.
+
+        Returns ``(coords (W, n_max, 3), emb (W, n_max, D))``, coords -1-padded
+        in the same convention the point-set machinery uses so they can ride
+        through augmentation with everything else, and the embeddings padded
+        with zero rows -- which is what marks a node as carrying none.
+
+        The two folders are matched by coordinate rather than by row order.
+        ``inference_contrastive`` copies the coords through unchanged, so the
+        rows normally line up exactly; matching on the values means a folder
+        built from a *different* detection run degrades to "these nodes have no
+        embedding" instead of silently pairing each node with a stranger's.
+        """
+        cfg = self.nodes_cfg
+        coords_all = self._load_pl(cfg["coordinates_folder"], sample_name)
+
+        emb_coords = emb_feats = None
+        if cfg.get("contrastive_folder"):
+            emb_coords, emb_feats = self._load_emb(
+                cfg["contrastive_folder"], sample_name
+            )
+        dim = 0 if emb_feats is None else emb_feats.shape[1]
+
+        out = torch.full((len(frames), n_max, 3), -1.0, dtype=torch.float32)
+        emb = torch.zeros(len(frames), n_max, dim, dtype=torch.float32)
+
+        for f, t in enumerate(frames):
+            pts = coords_all[coords_all[:, 0] == t][:, 1:]
+            if not len(pts):
+                continue
+            n = min(len(pts), n_max)
+            pts = pts[:n]
+            out[f, :n] = torch.from_numpy(pts) / self.downscale_factor
+
+            if dim:
+                ref = emb_coords[emb_coords[:, 0] == t]
+                if len(ref):
+                    rows = np.flatnonzero(emb_coords[:, 0] == t)
+                    d = np.linalg.norm(pts[:, None] - ref[None, :, 1:], axis=2)
+                    j = d.argmin(axis=1)
+                    ok = d[np.arange(n), j] <= emb_tol
+                    emb[f, :n][torch.from_numpy(ok)] = torch.from_numpy(
+                        emb_feats[rows[j[ok]]]
+                    )
+        return out, emb
+
     def _pl_points(
         self,
-        folder: str,
-        sample_name: str,
+        coords: np.ndarray,               # (N, 4) [t, z, y, x] at original resolution
         frames: list[int],                # absolute frame indices, stride applied
         exclude: list[torch.Tensor],      # per frame, (n, 3) points to stay clear of
         radius: float,
         n_max: int,
         voxel_size: tuple[float, float, float],
     ) -> torch.Tensor:                    # (W, N, 3), -1 padded
-        """Points from a prediction folder, minus anything near ``exclude``.
+        """Predicted points for this window, minus anything near ``exclude``.
 
-        The predictions are a tracker's own detections, so they cover the cells
-        the annotation misses — which is exactly what the weak-positive term is
-        for. Anything within ``radius`` of an excluded point is dropped: for the
-        weak set that is the GT, already supervised at full weight, and keeping
-        a duplicate there would fight the GT target with a down-weighted copy.
+        The predictions are a tracker's own detections (or FOCUS-3D's mask
+        centroids), so they cover the cells the annotation misses — which is
+        exactly what the weak-positive term is for. Anything within ``radius``
+        of an excluded point is dropped: for the weak set that is the GT,
+        already supervised at full weight, and keeping a duplicate there would
+        fight the GT target with a down-weighted copy. The same pass deduplicates
+        one prediction source against another when both are configured.
         """
-        coords = self._load_pl(folder, sample_name)
         vs = torch.tensor(voxel_size, dtype=torch.float32)
 
         out = torch.full((len(frames), n_max, 3), -1.0, dtype=torch.float32)
@@ -283,31 +448,60 @@ class TrackDataset(Dataset):
         if wp_cfg.get("use", False):
             radius = wp_cfg.get("pl_min_gt_dist_um", 7.0)
             n_max = wp_cfg["max_nodes"]
-            if wp_cfg.get("pl_folder"):
+            # None unless FOCUS-3D is on and this stack passed the gate.
+            focus3d = (
+                self._load_focus3d(vm.zarr_path.stem)
+                if wp_cfg.get("use_focus_3d")
+                else None
+            )
+            has_pl = bool(wp_cfg.get("pl_folder"))
+            if has_pl:
                 # A previous run's detections beat image peaks: they already
                 # know what a cell looks like.
                 weak_coords = self._pl_points(
-                    wp_cfg["pl_folder"], vm.zarr_path.stem, frames,
+                    self._load_pl(wp_cfg["pl_folder"], vm.zarr_path.stem), frames,
                     exclude=gt_per_frame, radius=radius, n_max=n_max,
                     voxel_size=voxel_size,
                 )
-                if wp_cfg.get("pl_ignore_folder"):
-                    # A lower-threshold sweep of the same run: too weak to
-                    # supervise as a cell, too suspicious to call background.
-                    # Anything already covered by GT or the weak set is not an
-                    # ignore region — it is a positive.
-                    covered = [
-                        torch.cat([gt, w[(w >= 0).all(dim=-1)]])
+            if focus3d is not None:
+                # The pseudo-labels win ties: where both sources fire, the
+                # tracker's own detection is the one to keep, and FOCUS-3D is
+                # left to fill in the cells it missed. Same order in the merge,
+                # so a frame that overflows n_max drops FOCUS-3D points first.
+                f3_coords = self._pl_points(
+                    focus3d, frames,
+                    exclude=[
+                        torch.cat([gt, _valid(w)])
                         for gt, w in zip(gt_per_frame, weak_coords)
-                    ]
-                    ignore_coords = self._pl_points(
-                        wp_cfg["pl_ignore_folder"], vm.zarr_path.stem, frames,
-                        exclude=covered,
-                        radius=wp_cfg.get("ignore_min_dist_um", radius),
-                        n_max=wp_cfg.get("ignore_max_nodes", n_max),
-                        voxel_size=voxel_size,
-                    )
-            elif self.load_images:
+                    ] if has_pl else gt_per_frame,
+                    radius=radius, n_max=n_max, voxel_size=voxel_size,
+                )
+                weak_coords = (
+                    _merge_points([weak_coords, f3_coords], n_max) if has_pl
+                    else f3_coords
+                )
+            if has_pl and wp_cfg.get("pl_ignore_folder"):
+                # A lower-threshold sweep of the same run: too weak to
+                # supervise as a cell, too suspicious to call background.
+                # Anything already covered by GT or the weak set is not an
+                # ignore region — it is a positive.
+                covered = [
+                    torch.cat([gt, _valid(w)])
+                    for gt, w in zip(gt_per_frame, weak_coords)
+                ]
+                ignore_coords = self._pl_points(
+                    self._load_pl(
+                        wp_cfg["pl_ignore_folder"], vm.zarr_path.stem
+                    ), frames,
+                    exclude=covered,
+                    radius=wp_cfg.get("ignore_min_dist_um", radius),
+                    n_max=wp_cfg.get("ignore_max_nodes", n_max),
+                    voxel_size=voxel_size,
+                )
+            elif not has_pl and focus3d is None and self.load_images:
+                # Image peaks are the last resort: FOCUS-3D overrides them when
+                # it has this stack, so they only run for a stack the folder
+                # does not cover or that the recall/ratio gate rejected.
                 # Image-derived peaks need the image. With load_images off
                 # (transformer-only, features cached) ``imgs`` is a (W,1,1,1)
                 # placeholder, and detection is frozen anyway — det_logits is
@@ -325,7 +519,20 @@ class TrackDataset(Dataset):
                 if derived_ignore is not None:
                     ignore_coords = derived_ignore
 
-        point_sets = [weak_coords, ignore_coords]
+        # Precomputed nodes ride through augmentation with the other point sets,
+        # so a crop or a flip moves them exactly as it moves the image. Their
+        # embeddings do not follow: NETr saw the un-augmented appearance and
+        # there is no way to recompute it here, which is one reason stage 3
+        # runs unaugmented.
+        pre_coords = torch.zeros(W, 0, 3)
+        pre_emb = torch.zeros(W, 0, 0)
+        if self.nodes_cfg.get("coordinates_folder"):
+            pre_coords, pre_emb = self._precomputed_nodes(
+                vm.zarr_path.stem, frames,
+                int(self.nodes_cfg.get("max_nodes", 768)),
+            )
+
+        point_sets = [weak_coords, ignore_coords, pre_coords]
         if self.augment:
             rng = np.random.default_rng()
             imgs, coords, point_sets, masks, targets, coord_spatial = augment_track(
@@ -340,7 +547,7 @@ class TrackDataset(Dataset):
                 cfg=self.aug_cfg,
                 rng=rng,
             )
-        weak_coords, ignore_coords = point_sets
+        weak_coords, ignore_coords, pre_coords = point_sets
 
         image_shape = (vm.image_shape[0], *coord_spatial)
         return {
@@ -352,6 +559,10 @@ class TrackDataset(Dataset):
             "imgs": imgs.half(),  # (W, Z, Y, X) full-scale float16
             "weak_positives": weak_coords,  # (W, N, 3) image-resolution voxels
             "ignore_positives": ignore_coords,  # (W, N, 3), excluded from the negative term
+            # (W, P, 3) image-voxel coords, -1 padded, and their (W, P, D)
+            # embeddings; both empty unless a coordinates_folder is configured.
+            "pre_coords": pre_coords,
+            "pre_emb": pre_emb,
             "image_shape": torch.tensor(image_shape, dtype=torch.long),
             "voxel_size": torch.tensor(voxel_size, dtype=torch.float32),
             "name": f'{vm.zarr_path.name}_t{t_start}',

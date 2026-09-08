@@ -152,12 +152,27 @@ class SimpleNodeTransformer(nn.Module):
         pair_chunk_size: int | None = 32,
         knn_k: int | None = None,
         use_geom_feats: bool = True,
+        use_contrastive_feats: bool = False,
+        use_attention: bool = True,
         drift_correction: bool = False,
     ):
         super().__init__()
         self.pair_chunk_size = pair_chunk_size
         self.knn_k = knn_k
         self.use_geom_feats = use_geom_feats
+        self.use_contrastive_feats = use_contrastive_feats
+        # Off: no cross-attention, so a node token never sees another node and
+        # the pair scorer runs on each node's own projected features plus the
+        # pairwise terms (rel, geom, contrastive). The features are then the
+        # whole model -- which is the point of the ablation, since the node
+        # features may already be contextual: NETr embeddings are produced by a
+        # transformer that attended over the frame, so attending again here may
+        # be buying nothing.
+        #
+        # Spelled as a flag rather than left to `n_blocks=0`, which reaches the
+        # same place: the block count is still the only mechanism, so there is
+        # no second code path to keep in step.
+        self.use_attention = bool(use_attention)
         self.drift_correction = drift_correction
         # feat_dim == 0 is a supported configuration (unet_features=[]): every
         # node token is then just this layer's bias, and geometry alone drives
@@ -172,7 +187,7 @@ class SimpleNodeTransformer(nn.Module):
 
         self.blocks = nn.ModuleList([
             CrossAttentionBlock(hidden_dim, n_heads, mlp_ratio, dropout)
-            for _ in range(n_blocks)
+            for _ in range(n_blocks if self.use_attention else 0)
         ])
 
         self.norm_out = nn.LayerNorm(hidden_dim)
@@ -180,8 +195,9 @@ class SimpleNodeTransformer(nn.Module):
         # Pairwise scoring input: both node embeddings, the relative offset,
         # and (optionally) explicit geometry — see _geom_feats.
         n_geom = self.N_GEOM if use_geom_feats else 0
+        n_contrastive = self.N_CONTRASTIVE if use_contrastive_feats else 0
         self.pair_mlp = nn.Sequential(
-            nn.Linear(hidden_dim * 2 + 3 + n_geom, hidden_dim),
+            nn.Linear(hidden_dim * 2 + 3 + n_geom + n_contrastive, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim // 2),
@@ -239,6 +255,79 @@ class SimpleNodeTransformer(nn.Module):
             dim=-1,
         )
 
+    N_CONTRASTIVE = 4
+
+    def _contrastive_feats(
+        self,
+        emb_t: torch.Tensor,      # (B, N_t, D)  L2-normalised parent embeddings
+        emb_t1: torch.Tensor,     # (B, N_t1, D) L2-normalised child embeddings
+        mask_t: torch.Tensor | None,
+        valid_t: torch.Tensor | None = None,    # (B, N_t)  has an embedding
+        valid_t1: torch.Tensor | None = None,   # (B, N_t1) has an embedding
+    ) -> torch.Tensor:            # (B, N_t, N_t1, N_CONTRASTIVE)
+        """``_geom_feats`` for appearance: the same four statistics on cosine
+        distance instead of Euclidean distance.
+
+        The reasoning is the geometric one transposed. The embeddings already
+        answer "which parent looks most like this child", and a raw similarity
+        scalar forces the pair MLP to rediscover the ranking from it. Stating it
+        outright leaves the head only the job of deciding when to *disagree*
+        with appearance -- which is exactly where geometry has to break the tie,
+        since two mitotic daughters look alike and sit apart.
+
+        Channels, per (parent i, child j):
+          0  cosine distance, 1 - cos, in [0, 2]
+          1  is-most-similar indicator (the appearance NN answer)
+          2  similarity rank among candidate parents, normalised to [0, 1]
+          3  log1p((d - best) / best) -- scale-free "how much worse than the
+             most similar parent", exactly 0 for that parent itself
+
+        ``valid_*`` marks nodes that actually carry an embedding. A node the
+        precomputed set had none for gets a zero vector, whose cosine distance
+        to everything is exactly 1 -- a plausible-looking middling score that
+        would quietly enter the ranking. Those pairs are forced to the neutral
+        end instead, so a missing embedding abstains rather than votes.
+        """
+        B, n_t = emb_t.shape[:2]
+        # Both sides are L2-normalised, so the inner product is the cosine.
+        d = 1.0 - torch.bmm(emb_t.float(), emb_t1.float().transpose(1, 2))
+
+        usable = mask_t if mask_t is not None else torch.ones(
+            B, n_t, dtype=torch.bool, device=d.device
+        )
+        if valid_t is not None:
+            usable = usable & valid_t
+        # A pair is scored only if both endpoints carry an embedding.
+        pair_ok = usable.unsqueeze(-1)
+        if valid_t1 is not None:
+            pair_ok = pair_ok & valid_t1.unsqueeze(1)
+
+        # Padded or embedding-less parents must not define the best match or
+        # win the ranking -- same guard as the geometric version.
+        d_rank = d.masked_fill(~usable.unsqueeze(-1), float("inf"))
+        best = d_rank.min(dim=1, keepdim=True).values            # (B, 1, N_t1)
+
+        order = d_rank.argsort(dim=1)
+        rank = torch.empty_like(order)
+        ar = torch.arange(n_t, device=d.device).view(1, -1, 1).expand_as(order)
+        rank.scatter_(1, order, ar)
+        rank = rank.float()
+
+        finite_best = torch.where(torch.isfinite(best), best, torch.zeros_like(best))
+        feats = torch.stack(
+            [
+                d,
+                (rank == 0).float(),
+                rank / max(n_t - 1, 1),
+                torch.log1p(((d - finite_best) / (finite_best + 1e-3)).clamp(min=0.0)),
+            ],
+            dim=-1,
+        )
+        # Neutral for a pair with no embedding: maximal distance, not nearest,
+        # worst rank, and no relative-excess signal.
+        neutral = torch.tensor([1.0, 0.0, 1.0, 0.0], device=d.device, dtype=feats.dtype)
+        return torch.where(pair_ok.unsqueeze(-1), feats, neutral)
+
     def _knn_keep(
         self,
         coords_t: torch.Tensor,   # (B, N_t, 3)   candidate parents
@@ -280,9 +369,18 @@ class SimpleNodeTransformer(nn.Module):
         coords_t1: torch.Tensor,
         mask_t: torch.Tensor | None = None,
         mask_t1: torch.Tensor | None = None,
+        emb_t: torch.Tensor | None = None,
+        emb_t1: torch.Tensor | None = None,
+        emb_valid_t: torch.Tensor | None = None,
+        emb_valid_t1: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Predict edge logits between detections at consecutive frames.
+
+        ``emb_*`` are L2-normalised per-node appearance embeddings, used only
+        when ``use_contrastive_feats`` is on; ``emb_valid_*`` marks the nodes
+        that actually have one. They are kept separate from ``feat_*`` because
+        the pair features need the raw embeddings, not the projected token.
 
         Accepts both unbatched (N, D) and batched (B, N, D) inputs.
         When unbatched, a batch dimension is added and removed automatically.
@@ -313,6 +411,18 @@ class SimpleNodeTransformer(nn.Module):
             feat_t1 = feat_t1.unsqueeze(0)
             coords_t = coords_t.unsqueeze(0)
             coords_t1 = coords_t1.unsqueeze(0)
+            if emb_t is not None:
+                emb_t = emb_t.unsqueeze(0)
+                emb_t1 = emb_t1.unsqueeze(0)
+            if emb_valid_t is not None:
+                emb_valid_t = emb_valid_t.unsqueeze(0)
+                emb_valid_t1 = emb_valid_t1.unsqueeze(0)
+
+        if self.use_contrastive_feats and emb_t is None:
+            raise ValueError(
+                "use_contrastive_feats is on but no embeddings were passed; "
+                "the pair scorer was built expecting N_CONTRASTIVE extra inputs"
+            )
 
         if self.drift_correction:
             # Carry the parents into the children's frame, so every geometry
@@ -326,29 +436,6 @@ class SimpleNodeTransformer(nn.Module):
 
         # Bi-directional cross-attention: t attends to t+1 and vice versa.
         for block in self.blocks:
-            # def _q_fn(
-            #     q: torch.Tensor,
-            #     kv: torch.Tensor,
-            #     mask: torch.Tensor | None,
-            #     _b: CrossAttentionBlock = block,
-            # ) -> torch.Tensor:
-            #     return _b(q, kv, kv_mask=mask)
-
-            # def _k_fn(
-            #     k: torch.Tensor,
-            #     kv: torch.Tensor,
-            #     mask: torch.Tensor | None,
-            #     _b: CrossAttentionBlock = block,
-            # ) -> torch.Tensor:
-            #     return _b(k, kv, kv_mask=mask)
-
-            # if torch.is_grad_enabled():
-            #     q = grad_ckpt(_q_fn, q, k, mask_t1, use_reentrant=False)
-            #     k = grad_ckpt(_k_fn, k, q, mask_t, use_reentrant=False)
-            # else:
-            #     q = _q_fn(q, k, mask_t1)
-            #     k = _k_fn(k, q, mask_t)
-
             q = block(q, k, kv_mask=mask_t1)
             k = block(k, q, kv_mask=mask_t)
 
@@ -371,6 +458,17 @@ class SimpleNodeTransformer(nn.Module):
             if self.use_geom_feats
             else None
         )
+        # Same reasoning: the appearance rank is over *all* parents too.
+        contrastive_all = (
+            self._contrastive_feats(emb_t, emb_t1, mask_t, emb_valid_t, emb_valid_t1)
+            if self.use_contrastive_feats
+            else None
+        )
+        if contrastive_all is not None:
+            geom_all = (
+                contrastive_all if geom_all is None
+                else torch.cat([geom_all, contrastive_all], dim=-1)
+            )
 
         for i in range(0, N_t, chunk):
             q_c = q[:, i : i + chunk, :]
@@ -395,11 +493,6 @@ class SimpleNodeTransformer(nn.Module):
                     parts.append(gg.to(qe.dtype))
                 return _pm(torch.cat(parts, dim=-1)).squeeze(-1)
 
-            # if torch.is_grad_enabled():
-            #     out = grad_ckpt(
-            #         _chunk_fn, q_c, k, coords_c, coords_t1, use_reentrant=False
-            #     )
-            # else:
             out = _chunk_fn(q_c, k, coords_c, coords_t1, geom_c)
 
             chunks.append(out)

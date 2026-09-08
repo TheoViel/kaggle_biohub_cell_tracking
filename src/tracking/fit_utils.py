@@ -5,7 +5,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from model_zoo.models_track import UNetNodeTransformer
-from tracking.targets import detect_and_match
+from tracking.targets import detect_and_match, nodes_from_precomputed
 
 
 # Everything that changes what a cached node feature *is*. Stored beside the
@@ -306,3 +306,68 @@ def encode_nodes(
         )
 
     return frame_det, det_logits, unet_scaling, offset_maps
+
+
+def node_scaling_from_voxel(voxel_size) -> tuple[float, float, float]:
+    """Image voxels per isotropic node-grid unit, from the voxel size alone.
+
+    The U-Net path gets an isotropic detection grid as a side effect of its
+    downsampling -- ``pool_stride (1, 2, 2)`` over two stages contracts Y/X by
+    4, which exactly cancels the 4x Z anisotropy of this data. With no U-Net
+    there is nothing to measure, so the same grid is derived from the physics:
+    one unit is the coarsest axis's voxel, and the finer axes are divided down
+    to match. For (1.625, 0.40625, 0.40625) this returns (1, 4, 4) -- the very
+    scaling the configured U-Net would have produced.
+    """
+    vs = [float(v) for v in voxel_size]
+    coarsest = max(vs)
+    return tuple(coarsest / v for v in vs)
+
+
+def encode_nodes_precomputed(
+    core_model: UNetNodeTransformer,
+    pre_coords: torch.Tensor,   # (B, W, P, 3) image voxels, -1 padded
+    pre_emb: torch.Tensor,      # (B, W, P, D)
+    coords: torch.Tensor,       # (B, W, M, 3) GT
+    masks: torch.Tensor,        # (B, W, M) bool
+    image_shape: tuple,
+    voxel_size: tuple,
+    args,
+) -> list:
+    """``encode_nodes`` for a stage that reads its nodes off disk.
+
+    The U-Net is never called: there is no heatmap to detect in, nothing to
+    supervise on the detection side, and the node features are the NETr
+    embeddings that arrived with the coordinates. The returned ``frame_det``
+    has the same six-tuple shape the U-Net path produces plus the embeddings
+    and their validity, so the training step reads both identically.
+
+    ``unet_feat`` comes back empty rather than absent. The embeddings are node
+    features too, but they are passed separately to ``predict_edges`` because
+    the pair scorer needs the raw vectors, not just extra token width.
+    """
+    window_size = pre_coords.shape[1]
+    scaling = node_scaling_from_voxel(voxel_size)
+
+    frame_det = []
+    for i in range(window_size):
+        det_coords, det_pos, det_mask, matches, emb, emb_valid = nodes_from_precomputed(
+            pre_coords[:, i],
+            pre_emb[:, i] if pre_emb.shape[-1] else None,
+            coords[:, i],
+            masks[:, i],
+            image_shape,
+            voxel_size=voxel_size,
+            node_scaling=scaling,
+            frame_index=i,
+            window_size=window_size,
+            max_match_distance=getattr(args, "nms_radius_um", 7.0),
+            max_dets_per_sample=getattr(args, "max_dets_per_sample", None),
+        )
+        unet_feat = det_coords.new_zeros(det_coords.shape[:2] + (0,))
+        det_scores = det_coords.new_ones(det_coords.shape[:2])
+        frame_det.append(
+            (det_coords, det_pos, det_mask, matches, unet_feat, det_scores,
+             emb, emb_valid)
+        )
+    return frame_det

@@ -17,7 +17,7 @@ import argparse
 import json
 import os
 
-from params import INPUT_FOLDER, LOG_FOLDER, TRAIN_DIR
+from params import INPUT_FOLDER, LOG_FOLDER, OUTPUT_FOLDER, TRAIN_DIR
 from tracking.main import k_fold
 from training.distributed import (
     broadcast_object,
@@ -28,17 +28,90 @@ from training.distributed import (
 from utils.logger import create_logger, prepare_log_folder
 
 
+AUG_STRENGTHS = (0, 1, 2, 3)
+
+
+def get_augs_config(strength):
+    """The augmentation block for one rung of the strength ladder.
+
+    0 leaves the image alone, 1 adds brightness, 2 adds the affine, 3 adds the
+    photometric corruptions. Stages pick a rung by ``aug_strength`` instead of
+    carrying their own copy of the block, which is what kept the copies
+    drifting apart.
+    """
+    if strength not in AUG_STRENGTHS:
+        raise ValueError(
+            f"aug_strength must be one of {AUG_STRENGTHS}, got {strength!r}"
+        )
+    augs = {
+        # Crop
+        "crop_margin": 1.5,
+        "crop_anchor_p": 0.9,
+        # Frame gap inside a window
+        "time_stride_max": 1,
+        # Flips
+        "flip_p": 0.5,
+        "rot90_p": 0.5,
+        # Affine - continuous rotate/scale/shift, resamples the crop
+        "affine_p": 0.,
+        "rot_z_deg": 0,  # in-place
+        "rot_xy_deg": 0,  # out-of-plane (<5.)
+        "scale_range": (0.9, 1.45),
+        "anisotropic_scale": 0.0,               # per-axis on top, i.e. z-spacing miscalibration
+        "shift_um": 0.0,                        # sub-voxel, decorrelates cell centres from the grid
+        "affine_interpolation": "bilinear",
+        "affine_padding": "zeros",
+        # Brightness - strength 0 = plain scalar shift instead of the heavy field
+        "brightness_p": 0.,
+        "brightness_strength": 1.0,
+        # Blur
+        "blur_p": 0.,
+        "blur_sigma_um": 1.0,
+        # Downscale then upscale
+        "lowres_p": 0.,             
+        "lowres_max_factor": 2.0,
+        # Noise
+        "noise_p": 0.,
+        # Background leveling
+        "bg_level_p": 0.,
+        "bg_level_range": (0.03, 0.30),
+        # Dimming - drags a region's cells toward the background
+        "dim_p": 0.,
+        "dim_factor_range": (0.25, 0.85),
+        # A ratio, not an absolute floor: an annotated cell's peak may not be
+        # dimmed below this multiple of its local background. Was written here
+        # as "dim_min_peak", which augment_track does not read -- so the value
+        # never applied and the default below is what has been running.
+        "dim_min_peak_ratio": 1.3,
+        "dim_radius_um": (25.0, 70.0),
+    }
+    if strength == 1:
+        augs['brightness_p'] = 0.5
+    elif strength == 2:
+        augs['affine_p'] = 0.5
+        augs['brightness_p'] = 0.5
+    elif strength == 3:
+        augs['affine_p'] = 0.5
+        augs['brightness_p'] = 0.9
+        augs['blur_p'] = 0.25
+        augs['lowres_p'] = 0.25
+        augs['noise_p'] = 0.25
+        augs['bg_level_p'] = 0.25
+        augs['dim_p'] = 0.5
+
+    return augs
+
 DEFAULTS = {
     # Data
     "data_dir": TRAIN_DIR,
     "window_size": 2,
     "crop_size": None,  # (16, 64, 64),  # None,  # (16, 64, 64),     # Crop
-    "selected_folds": [0, 1],  # , 1],
+    "selected_folds": [1],
     "fullfit": True,
     "fullfit_n_val_videos": 1,     # leaky either way, so keep the eval cheap
 
     # Model
-    "unet_arch": "resenc",          # "temporal" (two-conv) or "resenc" (nnU-Net ResEnc)
+    "unet_arch": "temporal",          # "temporal" (two-conv) or "resenc" (nnU-Net ResEnc)
     "unet_out_channels": 32,
     "unet_layers": (32, 64, 128),
     "unet_pool_stride": (1, 2, 2),    # pool Y/X only; full-scale Z preserved
@@ -49,12 +122,18 @@ DEFAULTS = {
     "unet_stem": "unshuffle",         # "unshuffle" keeps every voxel, "stride" drops 3 in 4
     "unet_norm": "batch",             # "batch" / "instance" / "group"
     "unet_hires_fusion": True,       # feed the skips finer than the head's grid into the head
+    # Node transformer
+    "edge_attention": True,  # disable
     "transformer_hidden": 128,
     "transformer_heads": 4,
     "transformer_blocks": 4,
     "transformer_dropout": 0.1,
     "pos_feat_dim": 32,  # 32
+    # Handcrafted features
     "edge_geom_feats": True,
+    "edge_contrastive_feats": False,
+    "contrastive_feat_dim": 0,
+    
     "edge_drift_correction": True,
     "edge_knn_k": None,  # 16,   # score each child only against its K nearest parents (None = all-vs-all)
     "unet_features": [],  # ["detection", "contrastive"]  # Node features the edge transformer sees
@@ -62,49 +141,12 @@ DEFAULTS = {
     # Normalisation. (x - q[low_q]) / (q[high_q] - q[low_q]), clamped
     "normalization": {"low_q": "0.001", "high_q": "0.999", "clamp_max": 4.0},
 
-    # Augmentation
-    "augmentations": {
-        # Crop
-        "crop_margin": 1.5,
-        "crop_anchor_p": 0.9,
-        # Frame gap inside a window
-        "time_stride_max": 1,
-        # Flips
-        "flip_p": 0.5,
-        "rot90_p": 0.5,
-        # Affine - continuous rotate/scale/shift, resamples the crop
-        "affine_p": 0.5,
-        "rot_z_deg": 0,  # in-place
-        "rot_xy_deg": 0,  # out-of-plane (<5.)
-        "scale_range": (0.9, 1.45),
-        "anisotropic_scale": 0.0,               # per-axis on top, i.e. z-spacing miscalibration
-        "shift_um": 0.0,                        # sub-voxel, decorrelates cell centres from the grid
-        "affine_interpolation": "bilinear",
-        "affine_padding": "zeros",
-        # Brightness - strength 0 = plain scalar shift instead of the heavy field
-        "brightness_p": 0.9,
-        "brightness_strength": 1.0,
-        # Blur
-        "blur_p": 0.25,
-        "blur_sigma_um": 1.0,
-        # Downscale then upscale
-        "lowres_p": 0.25,             
-        "lowres_max_factor": 2.0,
-        # Noise
-        "noise_p": 0.25,
-        # Background leveling
-        "bg_level_p": 0.25,
-        "bg_level_range": (0.03, 0.30),
-        # Dimming - drags a region's cells toward the background
-        "dim_p": 0.5,
-        "dim_factor_range": (0.25, 0.85),
-        "dim_min_peak": 0.15,
-        "dim_radius_um": (25.0, 70.0),
-    },
-    "mixup": {"p": 0.0, "alpha": 4.0},
+    # Augmentations fallback
+    "aug_strength": 1,
+    "mixup": {"p": 0., "alpha": 4.0},
 
     # Detection
-    "detect_and_match_threshold": 0.2,
+    "detect_and_match_threshold": 0.5,
     "nms": "greedy",
     "pool_kernel_um": 5.0,  # for maxpool NMS
     "nms_radius_um": 7.0,   # for greedy NMS
@@ -115,15 +157,16 @@ DEFAULTS = {
 
     # Stage 1 - Synthetic data pretraining
     "synthetic_pretraining": {
-        "enabled": True,
-        "dir": "../input/synthetic/v4/",  # "../input/synth_out_3/biohub_synthetic",
-        "proportion": 1,
+        "enabled": False,
+        "synthetic_dir": "../input/synthetic/v4/",
+        "synthetic_proportion": 1,
         "weights": None,
         # Data
         "mosaic_p": 0.,
         "mosaic_jitter": 0.2,  # +/- fraction of img width/height the join wanders off centre, 0 = equal quarters
         "crop_size": (32, 128, 128),
         "max_nodes": 768,       # a synthetic frame holds up to ~656 cells
+        "aug_strength": 3,
         # Training
         "iterations": 1000,
         "epochs": None,
@@ -152,8 +195,17 @@ DEFAULTS = {
         "ignore_threshold": 0.25,  # v2 only - multiplier for the ignore bar
         "ignore_nms_um": 5.0,   # v2 only - exclusion radius for the ignore pass
         "ignore_floor": 0.0,    # v2 only - absolute floor on the ignore bar; not fold-symmetric
+        # Weak positives from FOCUS-3D segmentation (pl_focus_3D.py).
+        # Override the image peaks above; combined with pl_folder when both are
+        # set, the pl_folder point winning any duplicate. A stack the folder does
+        # not cover or that fails a gate below falls back to the image peaks.
+        "use_focus_3d": True,
+        "focus_3d_dir": OUTPUT_FOLDER + "focus3d/",
+        "focus_3d_min_recall": 0.,   # drop a stack that misses annotated cells
+        "focus_3d_max_ratio": 1.75,    # drop a stack predicting far too many cells
         # Weak positives from pl_folder
-        "pl_folder": "../logs/2026-08-31/33/preds_pl_0.50/",  # "../logs/2026-08-28/13/preds_pl_0.40/",  # "../logs/2026-08-19/14/preds_pl/",
+        # "pl_folder": "../logs/2026-08-31/33/preds_pl_0.50/",  # 1st round PL
+        "pl_folder": "../logs/2026-09-01/9/preds_pl_pp/",  # 2nd round PL + PP
         "pl_ignore_folder": None,  # Expects lower threshold coords
         "ignore_min_dist_um": 7.0,  # the pl_ignore_folder path only
     },
@@ -161,13 +213,16 @@ DEFAULTS = {
     # Stage 1.5 - Pretraining
     "pretraining": {
         "enabled": True,
-        "weights": None,  # "../logs/2026-08-31/30/fold_*/ckpt_pretrain.pt",
+        "weights": "../logs/2026-09-01/9/fold_0/ckpt_synthetic.pt",
+        # Data
+        "crop_size": (32, 128, 128),
+        "aug_strength": 3,
+        "synthetic_dir": "../input/synthetic/v4/",
+        "synthetic_proportion": 0.5,
+        # Training
         "iterations": 1000,
         "epochs": None,
-        "crop_size": (32, 128, 128),
         "batch_size": 16,
-        "n_val_videos": 5,
-        "eval_every": 500,
         "loss_config": {
             "det_use_weak_positives": True,
             "det_loss_weight": 1,
@@ -175,6 +230,9 @@ DEFAULTS = {
             "det_weak_weight": 0.2,        # To balance GT share of positive weight 
             "det_weak_smoothing": 0.01,      # smoothing factor for weak positives
         },
+        # Eval
+        "n_val_videos": 5,
+        "eval_every": 500,
     },
 
     # Stage 2 - Contrastive - Built and trained only when "contrastive" is in unet_features.
@@ -197,16 +255,21 @@ DEFAULTS = {
     "edge": {
         "enabled": True,
         "transformer_only": True,
-        "det_warmup_prop": 0.,
-        "teacher_forcing_prop": 0,   # use GT points as nodes for this opening fraction of training
-        "weights": None,
+        "coordinates_folder": None,  # "../logs/2026-09-02/9/preds_0.50/",
+        "contrastive_folder": None,  # "../logs/2026-09-03/13/embeddings/",
+        "weights": None,  # "../logs/2026-09-07/1/fold_*/ckpt_pretrain.pt",
+        # Data
+        "crop_size": None,
+        # Training
         "iterations": 200,
         "epochs": None,
-        "batch_size": 16,
-        "val_batch_size": 4,
-        "eval_every": 200,
+        "batch_size": 32,
+        "val_batch_size": 32,
+        "det_warmup_prop": 0.,
+        "teacher_forcing_prop": 0,   # use GT points as nodes for this opening fraction of training
+        # Eval
+        "eval_every": 50,
         "n_val_videos": 5,
-        "crop_size": None,
     },
 
     "optimizer_config": {
@@ -234,7 +297,7 @@ DEFAULTS = {
     },
 
     # Eval
-    "eval_thresholds": [0.2, 0.3, 0.4, 0.5],
+    "eval_thresholds": [0.4, 0.5],
     "eval_node_match_um": 3.0,
 
     # Multi-GPU
@@ -300,6 +363,15 @@ def main():
             os.makedirs(args.log_path, exist_ok=True)
             log_folder = prepare_log_folder(args.log_path)
         args.output_dir = broadcast_object(log_folder, device=ctx.device)
+
+        # Resolve the ladder into a concrete block per stage. Done here rather
+        # than in tracking/main.py so that args.json records the augmentations
+        # each stage actually ran with, not the rung number that implied them.
+        args.augmentations = get_augs_config(args.aug_strength)
+        for stage in ("synthetic_pretraining", "pretraining", "contrastive", "edge"):
+            block = getattr(args, stage, None)
+            if isinstance(block, dict) and block.get("aug_strength") is not None:
+                block["augmentations"] = get_augs_config(block["aug_strength"])
 
         if ctx.is_main:
             print("-> Logging results to", args.output_dir, "\n")

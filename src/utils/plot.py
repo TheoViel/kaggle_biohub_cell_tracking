@@ -6,7 +6,7 @@ from matplotlib.collections import LineCollection
 from matplotlib.colors import to_rgba
 from matplotlib.markers import MarkerStyle
 
-# from cellpose.utils import masks_to_outlines
+from cellpose.utils import masks_to_outlines
 from utils.metrics import dist
 
 
@@ -193,49 +193,70 @@ def plot_frame(img, nodes, t=None, z=None, mask=None, tol=5):
 
 
 
-# def show_cellpose_segmentation(img, maski, flowi, nodes=None, z=None):
-#     """Image, predicted outlines and flow side by side, with cell centres.
+def plot_contours(img, mask, color=(255, 0, 0)):
+    """Show an image with its mask outlines drawn in red on top.
 
-#     ``nodes`` is (N, 3) as (z, y, x). Pass ``z`` -- the plane ``img`` is a slice
-#     of -- to fade the centres by how far they sit from it; without it they are
-#     all drawn solid.
-#     """
-#     img0 = img.copy().squeeze()
-#     img0 = img0[..., None].repeat(3, -1)
+    Args:
+        img (np.ndarray): (H, W) or (H, W, 1) image, gray or uint16.
+        mask (np.ndarray): (H, W) label mask, one integer id per cell.
+        color (tuple, optional): RGB colour for the outlines.
+    """
+    img = np.asarray(img).squeeze().astype(np.float32)
+    img = img - img.min()
+    if img.max() > 0:
+        img = img / img.max()
+    img = (img * 255).astype(np.uint8)
+    img = np.stack([img] * 3, axis=-1)
 
-#     plt.subplot(1, 3, 1)
-#     plt.imshow(img.squeeze(), cmap="gray")
-#     plt.title("original image")
-#     plt.axis("off")
+    outlines = masks_to_outlines(mask)
+    img[outlines] = color
 
-#     plt.subplot(1, 3, 2)
-#     plot_contours(img, maski)
-#     plt.title("predicted outlines")
-#     plt.axis("off")
+    plt.imshow(img)
 
-#     def _nodes():
-#         """The centres, faded by depth when the plane they sit on is known."""
-#         if nodes is None:
-#             return
-#         if z is None:
-#             plt.scatter(
-#                 nodes[:, 2], nodes[:, 1], s=20, c="dodgerblue",
-#                 edgecolors="white", linewidths=0.5, zorder=5,
-#             )
-#         else:
-#             scatter_by_depth(
-#                 plt, nodes, z, "white", facecolor="dodgerblue",
-#                 s=20, linewidths=0.5, zorder=5,
-#             )
 
-#     _nodes()
+def show_cellpose_segmentation(img, maski, flowi, nodes=None, z=None):
+    """Image, predicted outlines and flow side by side, with cell centres.
 
-#     plt.subplot(1, 3, 3)
-#     plt.imshow(flowi)
+    ``nodes`` is (N, 3) as (z, y, x). Pass ``z`` -- the plane ``img`` is a slice
+    of -- to fade the centres by how far they sit from it; without it they are
+    all drawn solid.
+    """
+    img0 = img.copy().squeeze()
+    img0 = img0[..., None].repeat(3, -1)
 
-#     _nodes()
-#     plt.title("predicted cell pose")
-#     plt.axis("off")
+    plt.subplot(1, 3, 1)
+    plt.imshow(img.squeeze(), cmap="gray")
+    plt.title("original image")
+    plt.axis("off")
+
+    plt.subplot(1, 3, 2)
+    plot_contours(img, maski)
+    plt.title("predicted outlines")
+    plt.axis("off")
+
+    def _nodes():
+        """The centres, faded by depth when the plane they sit on is known."""
+        if nodes is None:
+            return
+        if z is None:
+            plt.scatter(
+                nodes[:, 2], nodes[:, 1], s=20, c="dodgerblue",
+                edgecolors="white", linewidths=0.5, zorder=5,
+            )
+        else:
+            scatter_by_depth(
+                plt, nodes, z, "white", facecolor="dodgerblue",
+                s=20, linewidths=0.5, zorder=5,
+            )
+
+    _nodes()
+
+    plt.subplot(1, 3, 3)
+    plt.imshow(flowi)
+
+    _nodes()
+    plt.title("predicted cell pose")
+    plt.axis("off")
 
 
 # def lineage(graph, root):

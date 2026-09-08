@@ -14,6 +14,7 @@ from tracking.targets import build_matched_edge_targets
 from tracking.fit_utils import (
     collate_frame_det,
     encode_nodes,
+    encode_nodes_precomputed,
     filter_frame_det,
     split_frame_det,
 )
@@ -215,6 +216,11 @@ def evaluate(
     # (sample, frame) -> detections, deduplicated: validation windows overlap.
     frame_nodes: dict[float, dict[tuple[str, int], int]] = {t: {} for t in thresholds}
     n_frames: dict[str, int] = {}
+    # Precomputed nodes carry no detection score, so the sweep has nothing to
+    # sweep. Remember it and report only the threshold that was really scored
+    # -- leaving the others at their initialised zero would read as a failure
+    # rather than as "not evaluated".
+    collapsed_sweep = False
 
     for batch in loader:
         imgs = batch["imgs"].to(device, dtype=torch.float32, non_blocking=True)
@@ -226,7 +232,20 @@ def evaluate(
 
         B, W, d, h, w = imgs.shape
 
-        if transformer_only and fts_cache is not None:
+        # Nodes off disk: the same path stage 3 trains on. Detection scores are
+        # all 1 there, so the threshold sweep has nothing to sweep and is
+        # collapsed to the base value rather than repeating one forward per
+        # threshold over an identical node set.
+        pre_coords = batch.get("pre_coords")
+        precomputed_nodes = pre_coords is not None and pre_coords.shape[-2] > 0
+        collapsed_sweep = collapsed_sweep or precomputed_nodes
+        if precomputed_nodes:
+            frame_det = encode_nodes_precomputed(
+                model, pre_coords.to(device, non_blocking=True),
+                batch["pre_emb"].to(device, non_blocking=True),
+                coords, masks, image_shape, voxel_size, args,
+            )
+        elif transformer_only and fts_cache is not None:
             names = batch["name"]
             if any(name not in fts_cache for name in names):
                 fresh = encode_nodes(
@@ -264,7 +283,7 @@ def evaluate(
             continue
 
         # One edge forward per threshold
-        for t in thresholds:
+        for t in ([base] if precomputed_nodes else thresholds):
             fd = frame_det if t == base else filter_frame_det(frame_det, t)
             for i in range(W - 1):
                 pair_target = build_matched_edge_targets(
@@ -276,6 +295,10 @@ def evaluate(
                     fd[i][0], fd[i + 1][0],
                     fd[i][1], fd[i + 1][1],
                     fd[i][2], fd[i + 1][2],
+                    emb_src=fd[i][6] if len(fd[i]) > 6 else None,
+                    emb_tgt=fd[i + 1][6] if len(fd[i + 1]) > 6 else None,
+                    emb_valid_src=fd[i][7] if len(fd[i]) > 7 else None,
+                    emb_valid_tgt=fd[i + 1][7] if len(fd[i + 1]) > 7 else None,
                 )
                 for b in range(B):
                     ns_b = int(fd[i][2][b].sum().item())
@@ -289,6 +312,9 @@ def evaluate(
                     fp[t] += pair_fp
                     fn[t] += pair_fn
                     n_pairs[t] += 1
+
+    if collapsed_sweep:
+        thresholds = [base]
 
     # Aggregate: everything per threshold, in one reduction.
     n = len(thresholds)
@@ -373,7 +399,11 @@ def evaluate_videos(
 
     from params import SCALE
     from tracking.post_process import build_graph
-    from tracking.predict import PredictConfig, predict_video_thresholds
+    from tracking.predict import (
+        PredictConfig,
+        predict_video_precomputed,
+        predict_video_thresholds,
+    )
     from tracking_cellmot.metrics import (
         evaluate as evaluate_graph,
         nan_metrics_row,
@@ -409,19 +439,47 @@ def evaluate_videos(
     model.eval()
     core = unwrap_model(model)
 
+    # Nodes off disk: no U-Net, and every detection threshold would see the
+    # same node set, so the sweep collapses to a single result reported at the
+    # base threshold.
+    nodes_cfg = dict(getattr(args, "_nodes_cfg", None) or {})
+    precomputed = bool(nodes_cfg.get("coordinates_folder"))
+    if precomputed:
+        thresholds = [thresholds[0]]
+
     rows: dict[float, list[dict]] = {t: [] for t in thresholds}
     for path in paths[rank::world]:
-        per_threshold, _ = predict_video_thresholds(
-            core,
-            path,
-            thresholds,
-            device=device,
-            cfg=cfg,
-            window_size=args.window_size,
-            downscale_factor=getattr(args, "downscale_factor", 1),
-            progress=False,
-            return_det_logits=False,
-        )
+        if precomputed:
+            per_threshold = {
+                thresholds[0]: predict_video_precomputed(
+                    core,
+                    path,
+                    nodes_cfg["coordinates_folder"],
+                    nodes_cfg.get("contrastive_folder"),
+                    device=device,
+                    cfg=cfg,
+                    downscale_factor=getattr(args, "downscale_factor", 1),
+                )
+            }
+        else:
+            # Training-time eval sweeps thresholds only, at the run's own NMS
+            # radius, so the grid collapses back to one key per threshold.
+            per_key, _ = predict_video_thresholds(
+                core,
+                path,
+                thresholds,
+                device=device,
+                cfg=cfg,
+                window_size=args.window_size,
+                downscale_factor=getattr(args, "downscale_factor", 1),
+                progress=False,
+                return_det_logits=False,
+            )
+            # [:2] drops the node probabilities: the precomputed branch above
+            # has none, and the metrics below read neither, so both branches
+            # stay the same (coords, edges) shape.
+            per_threshold = {th: per_key[(float(cfg.nms_radius_um), th)][:2]
+                             for th in thresholds}
 
         gt = td.graph.IndexedRXGraph.from_geff(data_dir / f"{path.name}.geff")
         gt_graph = gt[0] if isinstance(gt, tuple) else gt

@@ -185,7 +185,8 @@ def detect_cells_multi_threshold(
     pool_kernel: tuple[int, ...] | None = None,
     voxel_size: tuple[float, float, float] | None = None,
     nms_radius_um: float | None = None,
-) -> dict[float, np.ndarray]:
+    return_scores: bool = False,
+) -> dict[float, np.ndarray] | dict[float, tuple[np.ndarray, np.ndarray]]:
     """``detect_cells_pooled`` at several thresholds, for the price of the lowest.
 
     Both NMS modes nest exactly across thresholds, so one pass at the lowest one
@@ -204,22 +205,35 @@ def detect_cells_multi_threshold(
     Returns
     -------
     dict  threshold -> (N, 4) int16 array with columns [t, z, y, x], as
-    ``detect_cells_pooled`` returns.
+    ``detect_cells_pooled`` returns. With ``return_scores``, the value is
+    ``(coords, scores)`` instead, where ``scores`` is the (N,) float32
+    probability the detection head gave each kept peak, row-aligned with
+    ``coords``. It is read off the same map the threshold is applied to, so it
+    costs nothing beyond carrying it.
     """
     if probas.dim() == 4:
         probas = probas[0]
     if not len(thresholds):
         return {}
 
+    def out(coords, scores):
+        return (coords, scores) if return_scores else coords
+
     peak_idx = _peak_indices(
         probas, min(thresholds), nms=nms, pool_kernel=pool_kernel,
         voxel_size=voxel_size, nms_radius_um=nms_radius_um,
     )
     if peak_idx.shape[0] == 0:
-        return {th: np.empty((0, 4), dtype=np.int16) for th in thresholds}
+        empty = np.empty((0, 4), dtype=np.int16), np.empty(0, dtype=np.float32)
+        return {th: out(*empty) for th in thresholds}
 
     scores = probas[peak_idx[:, 0], peak_idx[:, 1], peak_idx[:, 2]]
-    return {th: _stamp_time(peak_idx[scores > th], t) for th in thresholds}
+    scores_np = scores.float().cpu().numpy()
+    return {
+        th: out(_stamp_time(peak_idx[scores > th], t),
+                scores_np[(scores > th).cpu().numpy()])
+        for th in thresholds
+    }
 
 
 def build_graph(

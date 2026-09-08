@@ -3,6 +3,12 @@
 Everything here runs from a saved `preds/*.npz` (coords + edges). Nothing
 modifies `notebooks/TrackingInf.ipynb`.
 
+> This file is about the **detector's** npz, whose edges are already committed
+> and whose probabilities carry little information — which is why the pipeline
+> below re-decides every link on geometry alone. The edge transformer's graph
+> is a different problem and has its own chain: see **`README_edge.md`**, which
+> reaches **0.8547** on fold 0 against the 0.8333 this pipeline gets.
+
 A whole run — every stack of `<log_folder>/preds`, out to `preds_pp` and
 `geff_pp`, with per-stack metrics:
 

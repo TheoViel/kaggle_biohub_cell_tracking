@@ -133,8 +133,15 @@ def _get_window_data(
     )
 
 
-def _pad_window(window: FrameWindowData, max_nodes: int) -> dict:
-    """Pad GT nodes to max_nodes; return plain dict of tensors."""
+def _pad_window(window: FrameWindowData, max_nodes: int, edges: bool = True) -> dict:
+    """Pad GT nodes to max_nodes; return plain dict of tensors.
+
+    ``edges=False`` leaves the transition matrix empty for the detection-only
+    stages, which never read it. It is the expensive part of a window by a
+    wide margin: at the max_nodes=768 the synthetic mix forces, one is 2.4 MB
+    against ~20 KB for the coordinates, so a fold's 12392 windows carry 29 GB
+    of zeros that are then cropped, re-indexed and collated for nothing.
+    """
     W = window.n_frames
     M = max_nodes
 
@@ -148,8 +155,11 @@ def _pad_window(window: FrameWindowData, max_nodes: int) -> dict:
         masks[i, :n] = True
         node_counts[i] = n
 
-    targets = torch.zeros(W - 1, M, M, dtype=torch.float32)
-    for i in range(W - 1):
+    # No frames rather than no nodes: numel() is 0 either way, so nothing is
+    # allocated, but the frame loops downstream then fall through on their own
+    # instead of indexing an empty node axis.
+    targets = torch.zeros(W - 1 if edges else 0, M, M, dtype=torch.float32)
+    for i in range(targets.shape[0]):
         nt = window.node_counts[i]
         nt1 = window.node_counts[i + 1]
         targets[i, :nt, :nt1] = window.targets[i]

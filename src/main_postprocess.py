@@ -8,6 +8,11 @@ Writes <log_folder>/preds_pp/*.npz  — the same format, post-processed
 
     python main_postprocess.py --log_folder ../logs/2026-08-20/20/
 
+With no --log_folder it takes the most recent run under ../logs/, which is the
+one main_predict.py just wrote into:
+
+    python main_postprocess.py
+
 --pl post-processes a pseudo-labelling pass instead — the predictions
 main_predict.py --pl made on the fold's *training* embryos. It reads preds_pl
 and writes preds_pl_pp / geff_pl_pp, so the two never touch each other's
@@ -67,11 +72,12 @@ import tracksdata as td
 # that work whether this is run from src/ or from the repository root.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "postprocessing"))
 
-from params import EMBRYOS, SCALE, TRAIN_DIR  # noqa: E402
+from params import EMBRYOS, LOG_FOLDER, SCALE, TRAIN_DIR  # noqa: E402
 from pipeline import DEFAULTS as PIPELINE_DEFAULTS  # noqa: E402
 from stages import run_ilp, run_pipeline, run_pp_public  # noqa: E402
 from tracking.post_process import build_graph  # noqa: E402
 from tracking_cellmot.io import save_graph  # noqa: E402
+from utils.logger import get_last_log_folder  # noqa: E402
 from tracking_cellmot.metrics import (  # noqa: E402
     evaluate,
     macro_summarise,
@@ -91,8 +97,9 @@ def parse_args():
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    p.add_argument("--log_folder", required=True,
-                   help="run folder holding preds/*.npz")
+    p.add_argument("--log_folder", default=None,
+                   help="run folder holding preds/*.npz; default = the most "
+                        f"recent run under {LOG_FOLDER}")
     p.add_argument("--pl", action="store_true",
                    help="post-process a pseudo-labelling run: read preds_pl "
                         "instead of preds, and write preds_pl_pp / geff_pl_pp")
@@ -139,20 +146,49 @@ def parse_args():
     return p.parse_args()
 
 
+def _preds_dir_from_scores(scores, log_folder, base, th):
+    """The predictions folder one scores file scored.
+
+    Newer runs name it outright, which is the only thing that survives a sweep
+    over both the threshold and the NMS radius — ``preds_r5_0.40`` is not
+    derivable from the threshold. Only the basename is taken from it: a run
+    predicted into a scratch --out_dir and later moved should still resolve
+    against the folder actually being post-processed.
+
+    Older files carry no such field, so fall back to rebuilding the name, still
+    honouring the recorded radius when there is one, and then to the
+    unsuffixed folder a lone-threshold run writes.
+    """
+    named = scores.get("preds_dir")
+    if named:
+        preds_dir = log_folder / Path(named).name
+        if preds_dir.is_dir():
+            return preds_dir
+
+    radius = scores.get("nms_radius_um")
+    candidates = [log_folder / f"{base}_{th:.2f}", log_folder / base]
+    if radius is not None:
+        candidates.insert(0, log_folder / f"{base}_r{radius:g}_{th:.2f}")
+    for preds_dir in candidates:
+        if preds_dir.is_dir():
+            return preds_dir
+    return candidates[-1]
+
+
 def _best_threshold_preds_dir(log_folder, pl=False, th=None):
-    """The predictions folder of the best-scoring sweep threshold.
+    """The predictions folder of the best-scoring point of main_predict's sweep.
 
-    main_predict.py writes one scores_<th>.json per threshold next to
-    preds_<th>/. A --pl run names both halves after the pseudo-label split:
-    scores_pl_<th>.json beside preds_pl_<th>/, or plain scores_pl.json beside
-    preds_pl/ when a lone threshold was predicted (``_out_dir_for`` only
-    suffixes the folder for a sweep). The two families are kept apart in both
-    directions — a val run must not pick a pseudo-label threshold, and vice
-    versa — since they are scored on different embryos.
+    main_predict.py writes one scores file per grid point next to the folder it
+    scored: scores_<th>.json by preds_<th>/, or scores_r<radius>_<th>.json by
+    preds_r<radius>_<th>/ once the NMS radius is swept too. A --pl run names
+    both halves after the pseudo-label split (scores_pl…/preds_pl…), and the
+    two families are kept apart in both directions — a val run must not pick a
+    pseudo-label threshold, and vice versa — since they are scored on different
+    embryos.
 
-    ``th`` picks a threshold explicitly instead. That needs no scores file, so
-    the folder is resolved without reading any — a run whose scores were never
-    written, or whose best threshold is not the one wanted, is still usable.
+    ``th`` picks a threshold explicitly instead. It is matched against what the
+    scores files record rather than against their names, and a threshold that
+    several radii were swept at is ambiguous — pass --preds_dir there.
     """
     stem, base = ("scores_pl", "preds_pl") if pl else ("scores", "preds")
 
@@ -187,19 +223,38 @@ def _best_threshold_preds_dir(log_folder, pl=False, th=None):
                 f"Every {stem}*.json under {log_folder} scored NaN; pass --th"
             )
         th = best["threshold"]
+        radius = best.get("nms_radius_um")
         print(
-            f"-> best threshold: {th:g}  ({best_key}={best_score:.4f}, "
-            f"from {best_file.name})"
+            f"-> best threshold: {th:g}"
+            + (f"  nms_radius_um {radius:g}" if radius is not None else "")
+            + f"  ({best_key}={best_score:.4f}, from {best_file.name})"
         )
-
-        preds_dir = log_folder / f"{base}_{th:.2f}"
-        # A lone-threshold run writes the unsuffixed folder (_out_dir_for only
-        # suffixes for a sweep), so fall back to it.
-        if not preds_dir.is_dir():
-            preds_dir = log_folder / base
-        return preds_dir
+        return _preds_dir_from_scores(best, log_folder, base, th)
 
     print(f"-> using threshold: {th:g}")
+    # An NMS-radius sweep has one folder per radius at this threshold, so the
+    # name cannot be rebuilt from the threshold alone; ask the scores files,
+    # which know the folder they scored. Same val/pseudo-label split as above.
+    matches = set()
+    for f in log_folder.glob(f"{stem}*.json"):
+        if not pl and f.stem.startswith("scores_pl"):
+            continue
+        scores = json.loads(f.read_text())
+        got = scores.get("threshold")
+        if got is None or abs(float(got) - th) >= 1e-9:
+            continue
+        candidate = _preds_dir_from_scores(scores, log_folder, base, th)
+        if candidate.is_dir():
+            matches.add(candidate)
+    if len(matches) > 1:
+        raise SystemExit(
+            f"{len(matches)} folders under {log_folder} were scored at --th "
+            f"{th:g} ({', '.join(sorted(d.name for d in matches))}); "
+            "pass --preds_dir to pick one"
+        )
+    if matches:
+        return matches.pop()
+
     preds_dir = log_folder / f"{base}_{th:.2f}"
     if not preds_dir.is_dir():
         # Same lone-threshold fallback, but only when the plain folder is
@@ -323,7 +378,10 @@ def process(job):
 
 def main():
     args = parse_args()
-    log_folder = Path(args.log_folder)
+    # No --log_folder: the run main_predict just wrote into is nearly always the
+    # one to post-process, and naming it means reading today's date off disk.
+    log_folder = Path(args.log_folder or get_last_log_folder(LOG_FOLDER))
+    print(f"-> log folder: {log_folder}")
     # Both name the input folder, so honouring one silently ignores the other.
     if args.preds_dir and args.th is not None:
         raise SystemExit("--th and --preds_dir both name the input; pass one")
@@ -382,10 +440,12 @@ def main():
         print(f"\n-> wrote {len(paths)} stacks to {out_dir} and {geff_dir} (not scored)")
         return
 
+    metrics_file = out_dir.parent / "metrics.csv" if not args.pl else out_dir.parent / "metrics_pl.csv"
+    summary_file = out_dir.parent / "summary.json" if not args.pl else out_dir.parent / "summary_pl.json"
     df = pd.DataFrame(rows).sort_values("sample_name")
-    df.to_csv(out_dir.parent / "metrics.csv", index=False)
+    df.to_csv(metrics_file, index=False)
     summary = summarise(rows)
-    with open(out_dir.parent / "summary.json", "w") as f:
+    with open(summary_file, "w") as f:
         json.dump(_jsonable(summary), f, indent=4, default=str)
 
     # One summary per embryo, i.e. per fold. Kept separate rather than pooled:
@@ -434,8 +494,9 @@ def main():
             for r in worst
         ],
     }
-    scores_path = out_dir.parent / "scores_pp.json"
-    with open(scores_path, "w") as f:
+
+    scores_file = out_dir.parent / ("scores_pp_pl.json" if args.pl else "scores_pp.json")
+    with open(scores_file, "w") as f:
         json.dump(scores, f, indent=4)
 
     print(f"\n{'=' * 60}")
@@ -463,9 +524,9 @@ def main():
             cells = "".join(f"{s.get(c, float('nan')):>18.4f}" for c in cols)
             print(f"  {emb:<10}{fold_str:<6}{s['n_samples']:<5}{cells}")
 
-    print(f"\n-> metrics : {out_dir.parent / 'metrics.csv'}")
-    print(f"-> summary : {out_dir.parent / 'summary.json'}")
-    print(f"-> scores  : {scores_path}")
+    print(f"\n-> metrics : {metrics_file}")
+    print(f"-> summary : {summary_file}")
+    print(f"-> scores  : {scores_file}")
 
 
 if __name__ == "__main__":

@@ -37,6 +37,9 @@ class UNetNodeTransformer(nn.Module):
         dropout: float = 0.3,
         edge_knn_k: int | None = None,
         edge_geom_feats: bool = True,
+        edge_contrastive_feats: bool = False,
+        contrastive_feat_dim: int = 0,
+        edge_attention: bool = True,
         edge_drift_correction: bool = False,
         embed_unet: TemporalUNet3D | TemporalResEncUNet3D | None = None,
         embed_unet_out_channels: int = 32,
@@ -99,15 +102,30 @@ class UNetNodeTransformer(nn.Module):
             raise ValueError("unet_features asks for 'contrastive' but no embed_unet was built")
         node_feat_dim = sum(widths[name] for name in self.unet_features)
 
+        # NETr embeddings, precomputed by inference_contrastive.py and carried
+        # in with the nodes rather than read off a feature map. They enter twice
+        # and the two uses are independent: as extra node-token width here, and
+        # as the pair statistics of _contrastive_feats when
+        # edge_contrastive_feats is on. Width 0 means no embeddings at all.
+        self.contrastive_feat_dim = int(contrastive_feat_dim)
+        self.edge_contrastive_feats = bool(edge_contrastive_feats)
+        if self.edge_contrastive_feats and self.contrastive_feat_dim == 0:
+            raise ValueError(
+                "edge_contrastive_feats needs contrastive_feat_dim > 0; set it "
+                "to the embedding width the contrastive_folder holds"
+            )
+
         self.use_pos_embed = pos_feat_dim > 0
         self.transformer = SimpleNodeTransformer(
-            feat_dim=node_feat_dim + pos_feat_dim,
+            feat_dim=node_feat_dim + pos_feat_dim + self.contrastive_feat_dim,
             hidden_dim=hidden_dim,
             n_heads=n_heads,
             n_blocks=n_blocks,
             dropout=dropout,
             knn_k=edge_knn_k,
             use_geom_feats=edge_geom_feats,
+            use_contrastive_feats=self.edge_contrastive_feats,
+            use_attention=edge_attention,
             drift_correction=edge_drift_correction,
         )
 
@@ -220,16 +238,34 @@ class UNetNodeTransformer(nn.Module):
         pos_feat_tgt: torch.Tensor,   # (B, N_tgt, pos_feat_dim)
         mask_src: torch.Tensor,       # (B, N_src) bool
         mask_tgt: torch.Tensor,       # (B, N_tgt) bool
+        emb_src: torch.Tensor | None = None,   # (B, N_src, D) L2-normalised
+        emb_tgt: torch.Tensor | None = None,   # (B, N_tgt, D)
+        emb_valid_src: torch.Tensor | None = None,  # (B, N_src) has an embedding
+        emb_valid_tgt: torch.Tensor | None = None,  # (B, N_tgt)
     ) -> torch.Tensor:
-        """Run cross-attention edge predictor on pre-indexed UNet features."""
+        """Run cross-attention edge predictor on pre-indexed node features."""
+        parts_src = [unet_feat_src]
+        parts_tgt = [unet_feat_tgt]
         if self.use_pos_embed:
-            feat_src = torch.cat([unet_feat_src, pos_feat_src], dim=-1)
-            feat_tgt = torch.cat([unet_feat_tgt, pos_feat_tgt], dim=-1)
-        else:
-            feat_src = unet_feat_src
-            feat_tgt = unet_feat_tgt
+            parts_src.append(pos_feat_src)
+            parts_tgt.append(pos_feat_tgt)
+        if self.contrastive_feat_dim:
+            if emb_src is None:
+                raise ValueError(
+                    "the model was built with contrastive_feat_dim="
+                    f"{self.contrastive_feat_dim} but no embeddings were passed"
+                )
+            parts_src.append(emb_src.to(unet_feat_src.dtype))
+            parts_tgt.append(emb_tgt.to(unet_feat_tgt.dtype))
 
-        return self.transformer(feat_src, feat_tgt, coords_src, coords_tgt, mask_src, mask_tgt)
+        feat_src = torch.cat(parts_src, dim=-1) if len(parts_src) > 1 else parts_src[0]
+        feat_tgt = torch.cat(parts_tgt, dim=-1) if len(parts_tgt) > 1 else parts_tgt[0]
+
+        return self.transformer(
+            feat_src, feat_tgt, coords_src, coords_tgt, mask_src, mask_tgt,
+            emb_t=emb_src, emb_t1=emb_tgt,
+            emb_valid_t=emb_valid_src, emb_valid_t1=emb_valid_tgt,
+        )
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -252,6 +288,9 @@ def define_track_model(
     transformer_blocks: int = 4,
     edge_knn_k: int | None = None,
     edge_geom_feats: bool = True,
+    edge_contrastive_feats: bool = False,
+    contrastive_feat_dim: int = 0,
+    edge_attention: bool = True,
     edge_drift_correction: bool = False,
     pos_feat_dim: int = 0,
     transformer_dropout: float = 0.3,
@@ -367,6 +406,9 @@ def define_track_model(
         n_blocks=transformer_blocks,
         edge_knn_k=edge_knn_k,
         edge_geom_feats=edge_geom_feats,
+        edge_contrastive_feats=edge_contrastive_feats,
+        contrastive_feat_dim=contrastive_feat_dim,
+        edge_attention=edge_attention,
         edge_drift_correction=edge_drift_correction,
         embed_unet=embed_unet,
         embed_unet_out_channels=contrastive.get("unet_out_channels", 32),

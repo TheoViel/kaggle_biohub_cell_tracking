@@ -8,17 +8,25 @@ Predictions land in <log_folder>/preds/<sample>.npz (coords + edges), with
 per-sample metrics in <log_folder>/preds/metrics.csv and a run-level summary
 in summary.json.
 
-Several detection thresholds can be swept in one pass. The UNet forward is what
-this costs and it does not depend on the threshold, so the extra values come
-nearly free; each gets its own <log_folder>/preds_<threshold>/ folder and the
-run ends with a table ranking them.
+Several detection thresholds and greedy-NMS radii can be swept in one pass, as
+their full cross product. The UNet forward is what this costs and it depends on
+neither, so the extra values come nearly free; each grid point gets its own
+<log_folder>/preds_<...>/ folder and the run ends with a table ranking them.
 
-Single GPU:
+Single GPU, on the most recent run under ../logs/:
+    python main_predict.py
+
+An explicit run:
     python main_predict.py --log_folder ../logs/2026-08-14/17/
 
 Threshold sweep (one forward pass, four sets of predictions):
     python main_predict.py --log_folder ../logs/2026-08-14/17/ \
         --det_threshold 0.2,0.3,0.4,0.5
+
+Threshold x NMS radius (one forward pass, 4 x 4 = 16 sets of predictions in
+preds_r4_0.20/ ... preds_r7_0.50/):
+    python main_predict.py --log_folder ../logs/2026-08-14/17/ \
+        --det_threshold 0.2,0.3,0.4,0.5 --nms_radius_um 4,5,6,7
 
 Multi-GPU (one process per GPU, videos sharded across ranks):
     torchrun --standalone --nproc_per_node=8 main_predict.py \
@@ -39,7 +47,7 @@ import torch
 import torch.distributed as dist
 import tracksdata as td
 
-from params import EMBRYOS, SCALE, TRAIN_DIR
+from params import EMBRYOS, LOG_FOLDER, SCALE, TRAIN_DIR
 from tracking.main import _paths_for_embryos, build_model
 from tracking.post_process import build_graph
 from tracking.predict import PredictConfig, predict_video_thresholds
@@ -51,22 +59,23 @@ from tracking_cellmot.metrics import (
     summarise,
 )
 from training.distributed import cleanup_distributed, init_distributed
-from utils.logger import Config
+from utils.logger import Config, get_last_log_folder
 
 
-def _thresholds(value: str) -> list[float]:
-    """Parse "0.2,0.3,0.4" into a sorted list of detection thresholds."""
+def _floats(value: str) -> list[float]:
+    """Parse "0.2,0.3,0.4" into a sorted list of sweep values."""
     parsed = sorted({float(v) for v in str(value).split(",") if v.strip()})
     if not parsed:
-        raise argparse.ArgumentTypeError(f"no thresholds in {value!r}")
+        raise argparse.ArgumentTypeError(f"no values in {value!r}")
     return parsed
 
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--log_folder", required=True,
-                   help="run folder holding args.json and fold_<n>/ckpt_*.pt")
+    p.add_argument("--log_folder", default=None,
+                   help="run folder holding args.json and fold_<n>/ckpt_*.pt; "
+                        f"default = the most recent run under {LOG_FOLDER}")
     p.add_argument("--fold", type=int, default=None,
                    help="a single fold; default = every fold in the run's "
                         "selected_folds, whose val embryos are disjoint, so "
@@ -86,13 +95,14 @@ def parse_args():
 
     p.add_argument("--det_tta", action=argparse.BooleanOptionalAction,
                    default=PredictConfig.det_tta)
-    p.add_argument("--det_threshold", type=_thresholds, default=[PredictConfig.det_threshold],
+    p.add_argument("--det_threshold", type=_floats, default=[PredictConfig.det_threshold],
                    help="detection threshold, or a comma-separated list to sweep several "
                         "in one forward pass")
     p.add_argument("--pool_kernel_um", type=float, default=PredictConfig.pool_kernel_um)
     p.add_argument("--nms", choices=("maxpool", "greedy"), default=PredictConfig.nms)
-    p.add_argument("--nms_radius_um", type=float, default=PredictConfig.nms_radius_um,
-                   help="greedy NMS radius; default pool_kernel_um / 2")
+    p.add_argument("--nms_radius_um", type=_floats, default=[PredictConfig.nms_radius_um],
+                   help="greedy NMS radius, or a comma-separated list to sweep several "
+                        "in the same forward pass; crossed with --det_threshold")
     p.add_argument("--edge_activation", default=PredictConfig.edge_activation)
     p.add_argument("--edge_selection", default=PredictConfig.edge_selection)
     p.add_argument("--edge_threshold", type=float, default=PredictConfig.edge_threshold)
@@ -106,7 +116,7 @@ def parse_args():
 def _predict_config(args) -> PredictConfig:
     cfg = PredictConfig()
     for k in (
-        "det_tta", "pool_kernel_um", "nms", "nms_radius_um",
+        "det_tta", "pool_kernel_um", "nms",
         "edge_activation",
         "edge_selection", "edge_threshold", "max_parents_per_node",
         "max_children_per_node",
@@ -115,20 +125,36 @@ def _predict_config(args) -> PredictConfig:
     # Only meaningful on a model built with the head; a model without one
     # produces no vote and the flag is a no-op.
     cfg.use_offset = bool(getattr(args, "use_offset", True))
-    # predict_video_thresholds takes the sweep as its own argument and ignores this,
-    # but a single-threshold cfg should still read back the value it ran at.
+    # predict_video_thresholds takes both sweeps as its own arguments and
+    # ignores these, but a single-valued cfg should still read back what it ran
+    # at.
     cfg.det_threshold = args.det_threshold[0]
+    cfg.nms_radius_um = args.nms_radius_um[0]
     return cfg
 
 
-def _out_dir_for(base: Path, threshold: float, sweeping: bool) -> Path:
-    """Where one threshold's predictions go.
+def _out_dir_for(
+    base: Path, radius: float, threshold: float, sweep_th: bool, sweep_r: bool
+) -> Path:
+    """Where one grid point's predictions go.
 
-    A lone threshold keeps writing to the plain preds/ folder, which the
+    A lone setting keeps writing to the plain preds/ folder, which the
     pseudo-labelling and post-processing paths already point at; a sweep gives
-    each value its own suffixed folder instead.
+    each value its own suffixed folder instead. The radius is only named when
+    it is swept, so a threshold-only sweep keeps the preds_<thr>/ layout the
+    downstream scripts were written against.
     """
-    return base.with_name(f"{base.name}_{threshold:.2f}") if sweeping else base
+    suffix = _key_suffix(radius, threshold, sweep_th, sweep_r)
+    return base.with_name(base.name + suffix) if suffix else base
+
+
+def _key_suffix(
+    radius: float, threshold: float, sweep_th: bool, sweep_r: bool
+) -> str:
+    """The ``_r6_0.40``-style tag naming one point of the sweep grid."""
+    return (f"_r{radius:g}" if sweep_r else "") + (
+        f"_{threshold:.2f}" if sweep_th else ""
+    )
 
 
 def _jsonable(obj):
@@ -215,25 +241,40 @@ def _reconcile_arch(cfg, state, verbose=False):
 
 
 def _print_sweep(summaries: dict, per_embryo: dict | None = None):
-    """Rank the swept thresholds, best score first, so the choice is one glance.
+    """Rank the swept grid points, best score first, so the choice is one glance.
 
-    ``per_embryo`` is threshold -> embryo -> summary. When several embryos were
-    predicted they get their own table each, because their best threshold need
-    not be the pooled one — the embryos differ in cell density, so the
-    detection cutoff that balances recall against false positives differs too.
+    ``summaries`` and ``per_embryo`` are keyed by ``(nms_radius_um, threshold)``.
+    ``per_embryo`` then maps to embryo -> summary. When several embryos were
+    predicted they get their own table each, because their best grid point need
+    not be the pooled one — the embryos differ in cell density, so the detection
+    cutoff and the suppression radius that balance recall against false
+    positives differ too.
     """
     base_columns = ("score", "edge_jaccard", "adj_edge_jaccard",
                     "division_jaccard", "node_recall")
+    # A column for a dimension that was not swept would repeat one value down
+    # the whole table.
+    sweep_r = len({r for r, _ in summaries}) > 1
+    sweep_th = len({th for _, th in summaries}) > 1
+    labels = (("radius",) if sweep_r else ()) + (("thr",) if sweep_th else ())
+
+    def _label(key):
+        r, th = key
+        return "".join(
+            f"{v:>7g}" for v in
+            ((r,) if sweep_r else ()) + ((th,) if sweep_th else ())
+        )
 
     def _table(title, table: dict, rank_key="score"):
         # cv_score only exists on the pooled table; a per-embryo one would
         # print a column of NaN.
         has_cv = any("cv_score" in row for row in table.values())
         columns = (("score", "cv_score") if has_cv else ("score",)) + base_columns[1:]
-        def rank(th):
-            # NaN compares False against everything, so a failed threshold would
-            # otherwise win by being first. Sink it instead.
-            score = table[th].get(rank_key, float("nan"))
+
+        def rank(key):
+            # NaN compares False against everything, so a failed grid point
+            # would otherwise win by being first. Sink it instead.
+            score = table[key].get(rank_key, float("nan"))
             return float("-inf") if score != score else score
 
         best = max(table, key=rank)
@@ -242,23 +283,30 @@ def _print_sweep(summaries: dict, per_embryo: dict | None = None):
         print(f"\n{'=' * 78}")
         print(title)
         print(f"{'=' * 78}")
-        print("  thr  " + "".join(f"{c:>18s}" for c in columns))
-        for th in sorted(table):
-            cells = "".join(f"{table[th].get(c, float('nan')):>18.4f}" for c in columns)
-            print(f"{th:>5g}  {cells}{'   <- best' if ranked and th == best else ''}")
+        print("".join(f"{lbl:>7s}" for lbl in labels) + "  "
+              + "".join(f"{c:>18s}" for c in columns))
+        for key in sorted(table):
+            cells = "".join(f"{table[key].get(c, float('nan')):>18.4f}" for c in columns)
+            print(f"{_label(key)}  {cells}"
+                  f"{'   <- best' if ranked and key == best else ''}")
 
         if ranked:
             label = "cv_score" if rank_key == "cv_score" else "score"
-            print(f"\n-> best {label} {rank(best):.4f} at threshold {best:g}")
+            r, th = best
+            at = f"threshold {th:g}" + (f", nms_radius_um {r:g}" if sweep_r else "")
+            print(f"\n-> best {label} {rank(best):.4f} at {at}")
         else:
-            print("\n-> every threshold scored NaN; nothing to rank")
+            print("\n-> every grid point scored NaN; nothing to rank")
 
+    title = "SWEEP" if sweep_r and sweep_th else (
+        "NMS RADIUS SWEEP" if sweep_r else "THRESHOLD SWEEP"
+    )
     embryos = sorted({e for pe in (per_embryo or {}).values() for e in pe})
     # Rank by cv_score once there is more than one embryo: the pooled score
-    # would pick whichever threshold suits the embryo with more stacks.
+    # would pick whichever grid point suits the embryo with more stacks.
     multi = len(embryos) > 1
     _table(
-        "THRESHOLD SWEEP" + ("  (all embryos)" if multi else ""),
+        title + ("  (all embryos)" if multi else ""),
         summaries,
         rank_key="cv_score" if multi else "score",
     )
@@ -266,12 +314,12 @@ def _print_sweep(summaries: dict, per_embryo: dict | None = None):
     if len(embryos) > 1:
         for emb in embryos:
             table = {
-                th: pe[emb] for th, pe in per_embryo.items() if emb in pe
+                key: pe[emb] for key, pe in per_embryo.items() if emb in pe
             }
             if table:
                 folds = sorted({f for s in table.values() for f in s.get("fold", [])})
                 suffix = f"  (fold {','.join(str(f) for f in folds)})" if folds else ""
-                _table(f"THRESHOLD SWEEP  -  {emb}{suffix}", table)
+                _table(f"{title}  -  {emb}{suffix}", table)
 
 
 def _gather(obj, world_size):
@@ -284,7 +332,7 @@ def _gather(obj, world_size):
 
 
 def _predict_fold(
-    model, paths, thresholds, out_dirs, rows, meta, pred_cfg,
+    model, paths, keys, thresholds, radii, out_dirs, rows, meta, pred_cfg,
     window_size, downscale_factor, train_dir, args, ctx, device, fold,
 ):
     """Infer one fold's stacks, writing npz files and appending metric rows.
@@ -298,10 +346,10 @@ def _predict_fold(
 
     for i, path in enumerate(mine):
         name = path.name
-        # One UNet pass over the video answers every threshold. The raw
-        # detection logits are not needed here, and keeping them would hold a
-        # full-resolution volume per window in memory.
-        per_threshold, _ = predict_video_thresholds(
+        # One UNet pass over the video answers the whole threshold x radius
+        # grid. The raw detection logits are not needed here, and keeping them
+        # would hold a full-resolution volume per window in memory.
+        per_key, _ = predict_video_thresholds(
             model,
             path,
             thresholds,
@@ -312,6 +360,7 @@ def _predict_fold(
             max_frames=args.max_frames,
             progress=False,
             return_det_logits=False,
+            nms_radii=radii,
         )
 
         gt = td.graph.IndexedRXGraph.from_geff(train_dir / f"{name}.geff")
@@ -324,13 +373,19 @@ def _predict_fold(
                 n_total = float(hit.values[0])
 
         reported = []
-        for th in thresholds:
-            coords, edges = per_threshold[th]
+        for key in keys:
+            radius, th = key
+            coords, edges, node_probs = per_key[key]
 
             np.savez_compressed(
-                out_dirs[th] / f"{name}.npz",
+                out_dirs[key] / f"{name}.npz",
                 coords=coords,
                 edges=np.asarray(edges, dtype=np.float64).reshape(-1, 4),
+                # Row-aligned with coords: the detection head's probability at
+                # each peak. The threshold above only says a node cleared it,
+                # and by how much is exactly what a consumer wanting to
+                # discount a shaky detection needs.
+                node_probs=np.asarray(node_probs, dtype=np.float32).reshape(-1),
             )
 
             # build_graph is chatty on some builds; keep the log readable.
@@ -357,10 +412,12 @@ def _predict_fold(
             row["n_edges_pred"] = int(len(edges))
             row["n_nodes_estimated"] = n_total
             row["det_threshold"] = th
-            rows[th].append(row)
+            row["nms_radius_um"] = radius
+            rows[key].append(row)
 
+            tag = f"thr {th:g}" + (f" r {radius:g}" if len(radii) > 1 else "")
             reported.append(
-                f"[thr {th:g}] node_recall={rec:.3f} edge_jaccard={row['edge_jaccard']:.3f} "
+                f"[{tag}] node_recall={rec:.3f} edge_jaccard={row['edge_jaccard']:.3f} "
                 f"score={row['score']:.4f}"
             )
 
@@ -375,12 +432,21 @@ def main():
     ctx = init_distributed(None)
     device = ctx.device
 
-    log_folder = args.log_folder.rstrip("/") + "/"
+    # No --log_folder: the run that just finished is nearly always the one to
+    # predict with, and naming it means reading today's date off the filesystem.
+    log_folder = (args.log_folder or get_last_log_folder(LOG_FOLDER)).rstrip("/") + "/"
     thresholds = args.det_threshold
-    sweeping = len(thresholds) > 1
+    radii = args.nms_radius_um
+    sweep_th = len(thresholds) > 1
+    sweep_r = len(radii) > 1
+    sweeping = sweep_th or sweep_r
+    # The grid, in the order everything downstream iterates it.
+    keys = [(r, th) for r in radii for th in thresholds]
 
     base_dir = Path(args.out_dir or (log_folder + ("preds_pl" if args.pl else "preds")))
-    out_dirs = {th: _out_dir_for(base_dir, th, sweeping) for th in thresholds}
+    out_dirs = {
+        key: _out_dir_for(base_dir, *key, sweep_th, sweep_r) for key in keys
+    }
     if ctx.is_main:
         for d in out_dirs.values():
             d.mkdir(parents=True, exist_ok=True)
@@ -440,13 +506,14 @@ def main():
     if ctx.is_main:
         print(f"-> log_folder     : {log_folder}")
         print(f"-> folds          : {folds}")
-        print(f"-> thresholds     : {', '.join(f'{t:g}' for t in thresholds)}"
-              f"{'  (one forward pass)' if sweeping else ''}")
+        print(f"-> thresholds     : {', '.join(f'{t:g}' for t in thresholds)}")
+        print(f"-> nms radii (um) : {', '.join(f'{r:g}' for r in radii)}"
+              f"{'  (one forward pass for the whole grid)' if sweeping else ''}")
         print(f"-> writing to      : {', '.join(str(d) for d in out_dirs.values())}")
         if ctx.distributed:
             print(f"-> distributed    : {ctx.world_size} processes\n")
 
-    rows = {th: [] for th in thresholds}
+    rows = {key: [] for key in keys}
     all_embryos: list[str] = []
     ckpt_paths: list[str] = []
 
@@ -488,7 +555,7 @@ def main():
         model.eval().to(device)
 
         _predict_fold(
-            model, paths, thresholds, out_dirs, rows, meta, pred_cfg,
+            model, paths, keys, thresholds, radii, out_dirs, rows, meta, pred_cfg,
             window_size, downscale_factor, train_dir, args, ctx, device, fold,
         )
 
@@ -499,9 +566,9 @@ def main():
     embryos = all_embryos
     ckpt_path = ckpt_paths[0] if len(ckpt_paths) == 1 else ckpt_paths
 
-    # One gather for the whole sweep rather than one per threshold.
+    # One gather for the whole sweep rather than one per grid point.
     gathered = _gather(rows, ctx.world_size)
-    all_rows = {th: [r for part in gathered for r in part[th]] for th in thresholds}
+    all_rows = {key: [r for part in gathered for r in part[key]] for key in keys}
 
     if not ctx.is_main:
         return
@@ -514,14 +581,15 @@ def main():
     summaries = {}
     per_embryo_all = {}
 
-    for th in thresholds:
-        th_rows = all_rows[th]
-        out_dir = out_dirs[th]
+    for key in keys:
+        radius, th = key
+        th_rows = all_rows[key]
+        out_dir = out_dirs[key]
 
         df = pd.DataFrame(th_rows).sort_values("sample_name")
         df.to_csv(out_dir / "metrics.csv", index=False)
         summary = summarise(th_rows)
-        summaries[th] = summary
+        summaries[key] = summary
         with open(out_dir / "summary.json", "w") as f:
             json.dump(summary, f, indent=4, default=str)
 
@@ -544,8 +612,8 @@ def main():
             }
             for emb, summary_emb in group_summaries.items()
         }
-        per_embryo_all[th] = per_embryo
-        summaries[th]["cv_score"] = macro["score"]
+        per_embryo_all[key] = per_embryo
+        summaries[key]["cv_score"] = macro["score"]
 
         # Per-sample scores alongside the run-level roll-up.
         # The headline number. The pooled "overall" score weights each embryo
@@ -566,6 +634,11 @@ def main():
             "overall": _jsonable(summary),
             "per_embryo": per_embryo,
             "threshold": th,
+            "nms_radius_um": radius,
+            # Named outright rather than left to be rebuilt from the two above:
+            # the folder's name depends on which dimensions were swept, which a
+            # single scores file cannot tell.
+            "preds_dir": str(out_dir),
             "per_sample": {
                 r["sample_name"]: _jsonable({k: r[k] for k in report_keys if k in r})
                 for r in sorted(th_rows, key=lambda r: r["sample_name"])
@@ -580,8 +653,9 @@ def main():
             ],
         }
         stem = "scores_pl" if args.pl else "scores"
-        # A lone threshold keeps the historical scores_pl.json / scores_0.25.json names.
-        suffix = f"_{th:.2f}" if (sweeping or not args.pl) else ""
+        # A lone grid point keeps the historical scores_pl.json /
+        # scores_0.25.json names.
+        suffix = _key_suffix(radius, th, sweep_th or not args.pl, sweep_r)
         # Beside the predictions they score, which is the log folder unless --out_dir
         # sent those elsewhere. A run writing to a scratch directory should not reach
         # back into the log folder and overwrite the scores of a real one.
@@ -590,7 +664,8 @@ def main():
             json.dump(scores, f, indent=4)
 
         print(f"\n{'=' * 60}")
-        print(f"threshold {th:g}  -  {len(th_rows)} stacks  ->  {out_dir}")
+        head = f"threshold {th:g}" + (f"  nms_radius_um {radius:g}" if sweep_r else "")
+        print(f"{head}  -  {len(th_rows)} stacks  ->  {out_dir}")
         print(f"-> scores: {scores_path}")
         print(f"{'=' * 60}")
         for k in ("edge_tp", "edge_fp", "edge_fn"):

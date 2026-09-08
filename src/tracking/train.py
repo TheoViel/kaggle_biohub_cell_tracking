@@ -16,6 +16,7 @@ from tracking.eval import evaluate, evaluate_videos
 from tracking.fit_utils import (
     collate_frame_det,
     encode_nodes,
+    encode_nodes_precomputed,
     fts_cache_dir,
     set_frozen_eval,
     load_fts_cache,
@@ -211,12 +212,29 @@ def fit(
 
             bs, window_size, d, h, w = imgs.shape
 
+            # Nodes from a predictions folder: no U-Net, no detection, no
+            # augmentation to keep in step with. Set on the stage's config as
+            # `coordinates_folder`, and the loader has already read them.
+            pre_coords = batch.get("pre_coords")
+            precomputed_nodes = pre_coords is not None and pre_coords.shape[-2] > 0
+            if precomputed_nodes:
+                pre_coords = pre_coords.to(device, non_blocking=True)
+                pre_emb = batch["pre_emb"].to(device, non_blocking=True)
+
             progress = global_step / max(total_steps, 1)
             teacher_forcing = progress < getattr(args, "teacher_forcing_prop", 0.0)
             edges_enabled = transformer_only or (global_step / total_steps > args.det_warmup_prop)
 
             with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                if transformer_only:
+                if precomputed_nodes:
+                    frame_det = encode_nodes_precomputed(
+                        core_model, pre_coords, pre_emb, coords, masks,
+                        image_shape, voxel_size, args,
+                    )
+                    # Nothing on the detection side is being supervised: there
+                    # is no heatmap and no U-Net in the graph at all.
+                    det_logits, unet_scaling, offset_maps = [], None, None
+                elif transformer_only:
                     names = batch["name"]
                     if any(name not in fts_cache for name in names):
                         with torch.no_grad():
@@ -261,6 +279,13 @@ def fit(
                         )  # which node pairs are linked
 
                         # Forward of the edge scorer - score each node pair
+                        # Present only on the precomputed path; the U-Net path's
+                        # six-tuple has no embeddings to offer.
+                        emb_s = frame_det[i][6] if len(frame_det[i]) > 6 else None
+                        emb_t = frame_det[i + 1][6] if len(frame_det[i + 1]) > 6 else None
+                        val_s = frame_det[i][7] if len(frame_det[i]) > 7 else None
+                        val_t = frame_det[i + 1][7] if len(frame_det[i + 1]) > 7 else None
+
                         edge_log = core_model.predict_edges(
                             unet_feat_src=frame_det[i][4],  # frame i UNet features
                             unet_feat_tgt=frame_det[i + 1][4],  # frame i+1 UNet features
@@ -270,6 +295,10 @@ def fit(
                             pos_feat_tgt=frame_det[i + 1][1],  # frame i+1 pos-embed
                             mask_src=frame_det[i][2],  # frame i mask
                             mask_tgt=frame_det[i + 1][2],  # frame i+1 mask
+                            emb_src=emb_s,
+                            emb_tgt=emb_t,
+                            emb_valid_src=val_s,
+                            emb_valid_tgt=val_t,
                         )
                         edge_logits_list.append(edge_log)
                         edge_targets_list.append(pair_target)
@@ -334,6 +363,12 @@ def fit(
                     getattr(args, "eval_every", 0) > 0
                     and (global_step % args.eval_every == 0 or is_last_step)
                 )
+                # Full-video inference runs the U-Net's own detection, which a
+                # model taking its nodes (and their embeddings) from a folder
+                # has no way to feed. Scoring it would need the predict path to
+                # read those folders too -- see the note in predict.py. The
+                # window-level `evaluate` above does use the precomputed nodes
+                # and still runs, so the stage is not flying blind.
                 if eval_due and eval_video_paths:
                     # Score the real thing: full-video inference through the
                     # actual predict path, then the competition metrics. The

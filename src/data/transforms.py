@@ -69,10 +69,61 @@ def has_feasible_track_crop(
     crop_size: tuple[int, int, int],
     spatial: tuple[int, int, int],
 ) -> bool:
-    """Return whether a crop can contain both endpoints of a GT transition."""
-    return _feasible_track_edges(
+    """Return whether a crop can be anchored on this window's annotation."""
+    return _feasible_anchor_boxes(
         coords, masks, targets, crop_size, spatial
     ).shape[0] > 0
+
+
+def _feasible_anchor_boxes(
+    coords: torch.Tensor,
+    masks: torch.Tensor,
+    targets: torch.Tensor,
+    crop_size: tuple[int, int, int],
+    spatial: tuple[int, int, int],
+) -> torch.Tensor:
+    """(n, 2, 3) ``[lower, upper]`` corners of the boxes a crop may anchor on.
+
+    With a transition matrix each box spans a linked pair, so a crop that
+    contains one can teach an edge. Detection-only stages carry no matrix —
+    ``targets`` arrives empty — and there the box is a single annotated cell:
+    an edge that is never supervised cannot be a placement criterion, and
+    demanding one would throw away every window whose links happen not to fit.
+    """
+    if targets.numel():
+        edges = _feasible_track_edges(coords, masks, targets, crop_size, spatial)
+        if edges.shape[0] == 0:
+            return coords.new_zeros((0, 2, 3))
+        frame, source_idx, target_idx = edges.unbind(dim=1)
+        source = coords[frame, source_idx]
+        target = coords[frame + 1, target_idx]
+        return torch.stack(
+            [torch.minimum(source, target), torch.maximum(source, target)], dim=1
+        )
+
+    nodes = _feasible_track_nodes(coords, masks, spatial)
+    if nodes.shape[0] == 0:
+        return coords.new_zeros((0, 2, 3))
+    points = coords[nodes[:, 0], nodes[:, 1]]
+    return torch.stack([points, points], dim=1)
+
+
+def _feasible_track_nodes(
+    coords: torch.Tensor,
+    masks: torch.Tensor,
+    spatial: tuple[int, int, int],
+) -> torch.Tensor:
+    """(n, 2) ``[frame, node]`` of the annotated cells inside the volume.
+
+    No crop_size test: a single cell fits in any crop, which is the whole
+    reason the detection-only stages can anchor on one.
+    """
+    nodes = torch.nonzero(masks, as_tuple=False)
+    if nodes.shape[0] == 0:
+        return nodes
+    voxels = torch.floor(coords[nodes[:, 0], nodes[:, 1]]).to(torch.long)
+    image = torch.tensor(spatial, dtype=torch.long, device=coords.device)
+    return nodes[((voxels >= 0) & (voxels < image)).all(dim=1)]
 
 
 def _feasible_track_edges(
@@ -238,21 +289,19 @@ def random_crop_track(
         )
 
     if anchor:
-        feasible_edges = _feasible_track_edges(
+        boxes = _feasible_anchor_boxes(
             coords, masks, targets, crop_size, coord_spatial
         )
-        if feasible_edges.shape[0] == 0:
+        if boxes.shape[0] == 0:
             raise ValueError(
-                "Cannot make a track-centred crop: no linked GT cells at t and t + 1 "
+                "Cannot make an annotation-centred crop: no GT cells "
+                f"{'linked at t and t + 1 ' if targets.numel() else ''}"
                 f"fit inside crop_size {crop_size}"
             )
 
-        edge_idx = int(rng.integers(feasible_edges.shape[0]))
-        frame_idx, source_idx, target_idx = feasible_edges[edge_idx].tolist()
-        source_voxel = torch.floor(coords[frame_idx, source_idx]).to(torch.long)
-        target_voxel = torch.floor(coords[frame_idx + 1, target_idx]).to(torch.long)
-        lower_anchor = torch.minimum(source_voxel, target_voxel)
-        upper_anchor = torch.maximum(source_voxel, target_voxel)
+        box = boxes[int(rng.integers(boxes.shape[0]))]
+        lower_anchor = torch.floor(box[0]).to(torch.long)
+        upper_anchor = torch.floor(box[1]).to(torch.long)
 
         room = _resolve_halo(
             halo, crop_size, coord_spatial,
@@ -558,10 +607,11 @@ def affine_track(
     one interpolation and keeps the corners filled.
 
     The output is anchored on a GT transition, as ``random_crop_track`` anchors
-    it, so the window still contains a linked pair to learn an edge from.
-    Returns ``None`` if no draw kept one — the caller has to fall back to a
-    plain crop rather than to the untransformed window, whose shape would not
-    collate with the rest of the batch.
+    it, so the window still contains a linked pair to learn an edge from — or
+    on a single annotated cell when ``targets`` is empty, which is all a
+    detection-only stage needs. Returns ``None`` if no draw kept one — the
+    caller has to fall back to a plain crop rather than to the untransformed
+    window, whose shape would not collate with the rest of the batch.
 
     ``halo`` widens the output by up to that many voxels on each side, keeping
     ``out_size`` concentric within it, so a later centre-crop recovers the
@@ -574,7 +624,7 @@ def affine_track(
     keep_size = tuple(out_size) if out_size is not None else shape_in
     vs = torch.tensor(voxel_size, dtype=torch.float32)
 
-    edges = _feasible_track_edges(coords, masks, targets, keep_size, shape_in)
+    boxes = _feasible_anchor_boxes(coords, masks, targets, keep_size, shape_in)
 
     for _ in range(max_tries):
         a = sample_affine(rng, rot_z_deg, rot_xy_deg, scale_range, anisotropic_scale)
@@ -589,11 +639,8 @@ def affine_track(
                 centre = torch.as_tensor(
                     rng.uniform(0.0, 1.0, size=3) * np.asarray(shape_in), dtype=torch.float32
                 )
-            elif edges.shape[0]:
-                frame_idx, source_idx, target_idx = edges[
-                    int(rng.integers(edges.shape[0]))
-                ].tolist()
-                centre = 0.5 * (coords[frame_idx, source_idx] + coords[frame_idx + 1, target_idx])
+            elif boxes.shape[0]:
+                centre = boxes[int(rng.integers(boxes.shape[0]))].mean(dim=0)
             if anchor:
                 centre = centre + torch.tensor(
                     [rng.uniform(-centre_jitter, centre_jitter) * n for n in keep_size],
@@ -1237,6 +1284,31 @@ AUG_DEFAULTS: dict = {
 }
 
 
+def resolve_aug_cfg(cfg: dict | None) -> dict:
+    """``AUG_DEFAULTS`` overridden by ``cfg``, rejecting names it does not know.
+
+    An unrecognised key used to be dropped on the floor: ``augment_track``
+    merges over the defaults and reads the ones it knows, so a renamed or
+    mistyped setting left the default silently in place and the run looked
+    fine. That is how ``dim_min_peak`` sat in the config doing nothing while
+    the code read ``dim_min_peak_ratio``.
+    """
+    cfg = dict(cfg or {})
+    unknown = sorted(set(cfg) - set(AUG_DEFAULTS))
+    if unknown:
+        import difflib
+
+        hints = []
+        for key in unknown:
+            close = difflib.get_close_matches(key, AUG_DEFAULTS, n=1, cutoff=0.6)
+            hints.append(f"{key!r}" + (f" (did you mean {close[0]!r}?)" if close else ""))
+        raise KeyError(
+            "unknown augmentation setting(s): " + ", ".join(hints)
+            + f". Known keys: {sorted(AUG_DEFAULTS)}"
+        )
+    return {**AUG_DEFAULTS, **cfg}
+
+
 def augment_track(
     imgs: torch.Tensor,
     coords: torch.Tensor,
@@ -1262,7 +1334,7 @@ def augment_track(
     off afterwards is free here in a way it is not at inference: the crop is
     ours to choose. See ``work_crop_size``.
     """
-    cfg = {**AUG_DEFAULTS, **(cfg or {})}
+    cfg = resolve_aug_cfg(cfg)
 
     # Anchored on an annotation, or placed anywhere in the volume. Drawn once
     # and shared by whichever crop path runs.

@@ -228,6 +228,39 @@ def load_ground_truth(sample):
 
 
 @st.cache_data(show_spinner=False)
+def _estimated_nodes():
+    """sample_name -> estimated_number_of_nodes, from the dataset metadata."""
+    import pandas as pd
+
+    df = pd.read_csv(ROOT / "input" / "metadata.csv")
+    return dict(zip(df["sample_name"], df["estimated_number_of_nodes"].astype(float)))
+
+
+@st.cache_data(show_spinner=False)
+def sample_metrics(experiment, sample):
+    """This sample's competition metrics for an experiment, or None if it can't be scored.
+
+    Computed straight off the geffs with the same metric predict_track.sh
+    scores with, rather than read from a scores_*.json, so every experiment
+    can be scored here, not just the one that last had a json exported for it.
+
+    Returns node_recall, edge_tp/fp/fn, edge_jaccard and adj_edge_jaccard (the
+    node-count-penalised score); adj_edge_jaccard is NaN where the node-count
+    metadata is missing, in which case edge_jaccard is the score to read.
+    """
+    gt_graph = _load_geff(TRAIN_DIR / f"{sample}.geff")
+    pred_graph = _load_geff(PREDICTIONS_DIR / experiment / f"{sample}.geff")
+    if gt_graph is None or pred_graph is None or gt_graph.num_nodes() == 0:
+        return None
+
+    from tracking_cellmot.metrics import evaluate as evaluate_graph, node_recall, per_sample_metrics
+
+    n_total = _estimated_nodes().get(sample, float("nan"))
+    result = evaluate_graph(pred_graph, gt_graph, scale=SCALE, max_distance=MAX_MATCH_DISTANCE)
+    return per_sample_metrics(result, n_total, node_recall(pred_graph, gt_graph))
+
+
+@st.cache_data(show_spinner=False)
 def truth_frames(sample):
     """Timepoints that have at least one annotated ground-truth cell."""
     return sorted(t for t, centres in load_ground_truth(sample)[0].items() if len(centres))
@@ -431,6 +464,33 @@ def truth_trails(experiment, sample, t, length, keep):
             child = source
 
     return segments, wrong
+
+
+@st.cache_data(show_spinner=False)
+def edge_mistake_frames(experiment, sample):
+    """Timepoints t whose GT edge into t + 1 was not reproduced, or where a
+    wrong link was drawn in its place -- an edge FN or FP, judged the same way
+    truth_trails colours its lineages, just walked over every GT edge instead
+    of only the ones kept for drawing.
+    """
+    _, _, ids, parent = load_ground_truth(sample)
+    row_of = {
+        int(node): (frame, i)
+        for frame, nodes in ids.items()
+        for i, node in enumerate(nodes)
+    }
+    mistakes = set()
+    for child, source in parent.items():
+        child_t, child_row = row_of.get(int(child), (None, None))
+        source_t, source_row = row_of.get(int(source), (None, None))
+        if child_t is None or source_t is None or child_t != source_t + 1:
+            continue  # a gap in the annotation, not ours to score
+        kind, instead = _verdict(experiment, sample, source_t, source_row, child_row)
+        if kind != "correct":
+            mistakes.add(child_t)  # edge FN
+        if instead is not None:
+            mistakes.add(child_t)  # edge FP: linked here instead
+    return sorted(mistakes)
 
 
 def _near(centres, z, tol):
@@ -670,23 +730,65 @@ def view(sample, experiment, frames, depth, tol, trail, show_truth, show_trails)
     display, controls = st.columns(DISPLAY_SHARE)
 
     with controls:
+        if experiment is not None:
+            metrics = sample_metrics(experiment, sample)
+            score = metrics.get("adj_edge_jaccard") if metrics else None
+            # Node-count metadata is missing for some samples; the un-adjusted
+            # Jaccard is still a real score, just without the penalty applied.
+            if score is None or score != score:
+                score = metrics.get("edge_jaccard") if metrics else None
+            st.markdown(" ")
+            st.markdown(f"#### Score : {np.round(score, 3) if score is not None else '—'} ")
+            if metrics:
+                st.caption(
+                    f"node recall: {metrics['node_recall']:.3f}  ·  "
+                    f"edge jaccard: {metrics['edge_jaccard']:.3f}"
+                )
+                st.caption(
+                    f"edge tp: {metrics['edge_tp']}  ·  "
+                    f"edge fp: {metrics['edge_fp']}  ·  "
+                    f"edge fn: {metrics['edge_fn']}"
+                )
+
         st.markdown("#### Navigate")
         # Keyed by sample, so that changing sample starts afresh at a sensible
         # frame and slice instead of holding a position that meant something in
         # the stack before it.
         t = _stepper("t", frames, frames[0], f"t {sample}", "Left", "Right")
+
+        # Follow t to the nearest annotated slice, so scrubbing time keeps GT
+        # in view instead of leaving z wherever it was for the last frame.
+        # Only on an actual change of t, so dragging z doesn't fight back.
+        z_key = f"z {sample}"
+        synced_key = f"_z_synced_t {sample}"
+        if st.session_state.get(synced_key) != t:
+            st.session_state[synced_key] = t
+            gt_zs = truth_zs(sample, t)
+            if gt_zs:
+                current_z = st.session_state.get(
+                    z_key, busiest_slice(experiment, sample, t, depth)
+                )
+                st.session_state[z_key] = min(gt_zs, key=lambda candidate: abs(candidate - current_z))
+
         z = _stepper(
             "z", list(range(depth)), busiest_slice(experiment, sample, frames[0], depth),
-            f"z {sample}", "Down", "Up",
+            z_key, "Down", "Up",
         )
 
         st.markdown("#### Ground truth")
         gt_frames = truth_frames(sample)
         if gt_frames:
-            st.caption(
-                f"t with GT ({len(gt_frames)}/{len(frames)}): "
-                + ", ".join(map(str, gt_frames))
-            )
+            if experiment is not None:
+                bad_frames = edge_mistake_frames(experiment, sample)
+                st.caption(
+                    f"t with edge FP/FN ({len(bad_frames)}/{len(gt_frames)}): "
+                    + (", ".join(map(str, bad_frames)) if bad_frames else "none")
+                )
+            else:
+                st.caption(
+                    f"t with GT ({len(gt_frames)}/{len(frames)}): "
+                    + ", ".join(map(str, gt_frames))
+                )
             gt_zs = truth_zs(sample, t)
             st.caption(
                 f"z with GT at t={t}: " + ", ".join(map(str, gt_zs))
@@ -721,6 +823,12 @@ def main():
 
     with st.sidebar:
         st.header("Predictions")
+        if st.button("🔄 Refresh sample list",
+                     help="Rescan output/predictions for new or changed .geff files."):
+            list_experiments.clear()
+            list_samples.clear()
+            list_all_samples.clear()
+            st.rerun()
         experiments = list_experiments()
         experiment = None
         if experiments:
@@ -744,11 +852,12 @@ def main():
         sample = st.selectbox("sample_name", samples)
 
         st.header("Display")
-        tol = st.slider("z tolerance (slices)", 0, 10, 3,
+        tol = st.slider("z tolerance (slices)", 0, 10, 5,
                         help="How far off the slice a cell can be and still be drawn, faded.")
         show_truth = st.checkbox("ground truth", value=True)
         show_trails = st.checkbox("tracks", value=True)
-        trail = st.slider("track length (frames)", 1, 40, 10, disabled=not show_trails)
+        trail = st.slider("track length (frames)", 1, 100, 100, disabled=not show_trails,
+                          help="100 covers the full track: predicted_trails stops early on its own once a lineage runs out of parents.")
 
     frames = list_frames(sample)
     depth = load_volume(sample, frames[0]).shape[0]
