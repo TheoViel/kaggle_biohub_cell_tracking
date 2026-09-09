@@ -363,6 +363,7 @@ def _rescale_coords(
     unet_scaling: tuple[int, int, int] | None,
     downscale_factor: int,
     offsets: np.ndarray | None = None,
+    det_stride: tuple[float, float, float] | None = None,
 ) -> np.ndarray:
     """Scale detection-grid coords back to original resolution.
 
@@ -381,14 +382,29 @@ def _rescale_coords(
     the head is absent — the centre of the span is o = (s - 1) / (2s), which is
     exactly the mean offset of a cell placed uniformly in it — so this is the
     same formula with a measured o in place of an assumed one.
+
+    ``det_stride`` is the span, in image voxels, of the cell a detection
+    actually names. That is the node-grid stride only while the heatmap shares
+    the node grid; with an extra decoder stage the peak comes off a finer map
+    and names a smaller cell, so the correction is half of *that* span.
+    Assuming ``unet_scaling`` there would over-shift every detection by the
+    difference — a whole image voxel in y and x at the configured geometry,
+    which is most of what the finer head was added to recover.
     """
     coords = coords.astype(np.float32)
     if unet_scaling is not None:
         scaling = np.array(unet_scaling, dtype=np.float32)
         if offsets is not None:
-            coords[:, 1:] = (coords[:, 1:] + offsets) * scaling
+            # The vote is measured from the corner of the node voxel it was
+            # read at, so it replaces the within-voxel position rather than
+            # adding to it. A no-op back when every coordinate was an integer.
+            coords[:, 1:] = (np.floor(coords[:, 1:]) + offsets) * scaling
         else:
-            coords[:, 1:] = coords[:, 1:] * scaling + (scaling - 1.0) / 2.0
+            span = (
+                scaling if det_stride is None
+                else np.array(det_stride, dtype=np.float32)
+            )
+            coords[:, 1:] = coords[:, 1:] * scaling + (span - 1.0) / 2.0
     if downscale_factor > 1:
         coords[:, 1:] = coords[:, 1:] * downscale_factor + (downscale_factor - 1.0) / 2.0
     # round, not truncate: the centres are half-integers now, and int16() would
@@ -483,6 +499,7 @@ def predict_video_thresholds(
     # the encoder downsamples (Z, Y, X). Constant across windows since
     # every frame in the video has the same spatial shape.
     unet_scaling: tuple[int, int, int] | None = None
+    det_stride: tuple[float, float, float] | None = None
     out_shape: tuple[int, int, int] | None = None
     pool_k: tuple[int, int, int] | None = None
 
@@ -523,7 +540,7 @@ def predict_video_thresholds(
 
         imgs = imgs.unsqueeze(0).to(device)  # (1, W, Z, Y, X)
 
-        unet_out, det_logits = model.encode(imgs)
+        unet_out, det_logits, _ = model.encode(imgs)
         offset_maps = model.encode_offsets(unet_out) if use_offset else None
         if return_det_logits:
             det_logits_list.append(torch.stack(det_logits, 0).detach().cpu())
@@ -544,7 +561,21 @@ def predict_video_thresholds(
             voxel_size_out = tuple(
                 s * downscale_factor * u for s, u in zip(ds.scale, unet_scaling)
             )
-            pool_k = pool_kernel_from_um(cfg.pool_kernel_um, voxel_size_out)
+            # The heatmap may sit on a finer grid than the node features do, in
+            # which case NMS runs there and the peaks are divided back onto the
+            # node grid — exactly what detect_and_match does in training.
+            d_det, h_det, w_det = det_logits[0].shape[-3:]
+            det_scaling = np.array(
+                [d_det // d_out, h_det // h_out, w_det // w_out], dtype=np.float32
+            )
+            voxel_size_det = tuple(
+                v / float(s) for v, s in zip(voxel_size_out, det_scaling)
+            )
+            # In image voxels, for the half-cell centring _rescale_coords applies.
+            det_stride = tuple(
+                float(u) / float(s) for u, s in zip(unet_scaling, det_scaling)
+            )
+            pool_k = pool_kernel_from_um(cfg.pool_kernel_um, voxel_size_det)
 
             # print("UNET SCALING: ", unet_scaling)
             # print("OUT SHAPE: ", out_shape)
@@ -555,7 +586,7 @@ def predict_video_thresholds(
         if cfg.det_tta:
             for dims in [(-1,), (-2,), (-2, -1)]:
                 imgs_flip = imgs.flip(dims)
-                _, det_flip = model.encode(imgs_flip)
+                _, det_flip, _ = model.encode(imgs_flip)
                 for f in range(W):
                     det_logits[f] = det_logits[f] + det_flip[f].flip(dims)
                 del imgs_flip, det_flip
@@ -586,11 +617,15 @@ def predict_video_thresholds(
                     pending,
                     nms=cfg.nms,
                     pool_kernel=pool_k,
-                    voxel_size=voxel_size_out,
+                    voxel_size=voxel_size_det,
                     nms_radius_um=r,
                     return_scores=True,
                 )
                 for th, (arr, node_scores) in per_threshold.items():
+                    # Onto the node grid, which is what the registry, the offset
+                    # head and the edge scorer all read.
+                    arr = arr.astype(np.float32)
+                    arr[:, 1:] /= det_scaling
                     registries[(r, th)].add_frame(
                         t, arr, _gather_offsets(offset_maps, f_idx, arr), node_scores
                     )
@@ -611,6 +646,7 @@ def predict_video_thresholds(
             _rescale_coords(
                 reg.coords(), unet_scaling, downscale_factor,
                 offsets=reg.offsets() if use_offset else None,
+                det_stride=det_stride,
             ),
             reg.edges,
             reg.scores(),

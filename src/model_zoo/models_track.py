@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from model_zoo.simple_node_transformer import SimpleNodeTransformer
 from model_zoo.temporal_resenc_unet import TemporalResEncUNet3D
@@ -59,6 +60,24 @@ class UNetNodeTransformer(nn.Module):
             nn.Dropout(dropout),
             nn.Conv3d(unet_out_channels, 1, kernel_size=1),
         )
+
+        # A backbone with extra decoder stages hands back a second, finer map,
+        # and the heatmap is what wants that resolution: a peak on the coarse
+        # grid is only ever located to within its own 1.625 um cell. The head
+        # above then moves from being *the* detector to being a first pass over
+        # it — still supervised, on the target it has always had, and its answer
+        # is handed forward rather than thrown away. `detect_head_fine` sees the
+        # fine features, the coarse head's hidden activations and the coarse
+        # logit itself, so it starts from a decision it only has to refine.
+        self.deep_supervision = bool(getattr(unet, "n_extra_decode_steps", 0))
+        self.detect_head_fine = None
+        if self.deep_supervision:
+            self.detect_head_fine = nn.Sequential(
+                nn.Conv3d(2 * unet_out_channels + 1, unet_out_channels, kernel_size=1),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Conv3d(unet_out_channels, 1, kernel_size=1),
+            )
 
         # Where the cell actually is, as a vector from each voxel to its centre
         # — the segmentation branch's centroid vote on the detection grid. The
@@ -156,30 +175,60 @@ class UNetNodeTransformer(nn.Module):
     def encode(
         self,
         imgs: torch.Tensor,  # (B, W, *spatial) — already downsampled, single channel
-    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor] | None]:
         """Run the temporal U-Net on W frames.
+
+        ``unet_out`` is the node-feature map and never moves: it stays on the
+        grid ``unet.output_stride`` names, which is the isotropic one the edge
+        scorer measures distances in. With deep supervision the heatmap alone
+        moves onto the finer grid, and ``det_logits_ds`` is the coarse head's
+        answer on the old grid, kept so it can still be supervised.
 
         Returns
         -------
         unet_out : (B, W, C_feat, *spatial)
-        det_logits : list of W tensors, each (B, 1, *spatial)
+        det_logits : list of W tensors, each (B, 1, *fine_spatial)
+        det_logits_ds : list of W tensors on ``unet_out``'s grid, or None when
+            the model has no extra decoder branch (then det_logits is on that
+            grid too).
         """
         if self.verbose >= 1:
             print(f"UNetNodeTransformer - Encode - Input shape: {imgs.shape}")
 
         window = imgs.unsqueeze(2)          # (B, W, 1, *spatial)
-        unet_out = self.unet(window)        # (B, W, C_feat, *spatial)
+        out = self.unet(window)             # (B, W, C_feat, *spatial)
+        unet_out, fine_out = out if self.deep_supervision else (out, None)
 
         if self.verbose >= 1:
             print(f"UNetNodeTransformer - Encode - UNet output shape: {unet_out.shape}")
 
         W = unet_out.shape[1]
-        det_logits = [self.detect_head(unet_out[:, i]) for i in range(W)]
+        if fine_out is None:
+            det_logits, det_logits_ds = [
+                self.detect_head(unet_out[:, i]) for i in range(W)
+            ], None
+        else:
+            det_logits, det_logits_ds = [], []
+            for i in range(W):
+                # Split at the head's own hidden layer, so the coarse head keeps
+                # the exact parameters (and names) it has always had.
+                hidden = self.detect_head[:3](unet_out[:, i])
+                ds_logit = self.detect_head[3](hidden)
+                carry = F.interpolate(
+                    torch.cat([hidden, ds_logit], dim=1),
+                    size=fine_out.shape[-3:],
+                    mode="trilinear",
+                    align_corners=False,
+                )
+                det_logits.append(
+                    self.detect_head_fine(torch.cat([fine_out[:, i], carry], dim=1))
+                )
+                det_logits_ds.append(ds_logit)
 
         if self.verbose >= 1:
             print(f"UNetNodeTransformer - Encode - Detect logits shape: {[det.shape for det in det_logits]}")
 
-        return unet_out, det_logits
+        return unet_out, det_logits, det_logits_ds
 
     def encode_offsets(
         self,
@@ -276,6 +325,7 @@ def define_track_model(
     unet_layers: list[int] | None = None,
     unet_pool_stride: int | tuple[int, int, int] = 2,
     unet_n_decode_steps: int | None = None,
+    unet_n_extra_decode_steps: int = 0,
     unet_arch: str = "temporal",
     unet_n_anisotropic: int = 2,
     unet_blocks_per_stage: list[int] | None = None,
@@ -319,7 +369,14 @@ def define_track_model(
         pool only in Y/X when passing full-scale 3D images.
     unet_n_decode_steps : int or None
         Number of decoder stages.  None = fully symmetric.  0 = no
-        decoder (output at bottleneck resolution).
+        decoder (output at bottleneck resolution).  This sets the grid the
+        *node features* live on, and with them everything the edge scorer
+        measures, so it is the one to leave alone.
+    unet_n_extra_decode_steps : int
+        Decoder stages built past that grid, feeding the detection head a finer
+        heatmap while the node features stay put.  The head on the coarse grid
+        is kept and supervised on the target it already had, and its output is
+        fed forward into the fine head.  Temporal backbone only.
     unet_arch : str
         Which backbone to build, see ``UNET_BACKBONES``.  ``"temporal"``
         is the plain two-conv U-Net, ``"resenc"`` the nnU-Net residual
@@ -394,6 +451,7 @@ def define_track_model(
         pool_stride=unet_pool_stride,
         n_anisotropic=unet_n_anisotropic,
         n_decode_steps=unet_n_decode_steps,
+        n_extra_decode_steps=unet_n_extra_decode_steps,
         temporal_attention=unet_temporal_attention,
         verbose=verbose,
         **extra,

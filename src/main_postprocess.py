@@ -21,7 +21,7 @@ the val scores, which were measured on different embryos:
 
     python main_postprocess.py --log_folder ../logs/2026-08-20/20/ --pl
 
-Three stages, each switchable — see src/postprocessing/README.md for how they were
+Four stages, each switchable — see src/postprocessing/README.md for how they were
 chosen and what each is worth. Measured over the 71 validation stacks of
 logs/2026-08-20/20/, adjusted edge Jaccard:
 
@@ -45,6 +45,28 @@ track that ends before the hole and the one that starts after it, with the
 sample's own drift removed first. It is worth +0.0161 on its own and +0.0063
 under pp_public, and costs a second re-linking pass (5.5 -> 11.1 s a stack).
 --recover_passes 2 iterates it; that is worth +0.0002 for 50% more time.
+
+Divisions (--no_divisions to turn it off) give a parent a second child where the
+geometry says a cell divided, ported from main_edge_postprocess.py. Everything
+before it re-decides links one-to-one and so cannot express a fork at all, which
+left the division term — 0.1 of the competition score — sitting near zero. It is
+the last stage because every earlier one re-solves the links from scratch, and
+because it only ever adds edges. Over the 71 validation stacks of
+logs/2026-09-09/2/preds_r6_0.40, cv score:
+
+    no divisions                        0.8489   div tp/fp/fn   0/0/26
+    pp_public's own safe_divisions      0.8502                  1/51/25
+    (default)                           0.8580                  4/16/22
+
+pp_public's safe_divisions is the same public repair without the divergence,
+mutual-nearest-neighbour and symmetry gates, so the two are alternatives rather
+than a stack; PP_PUBLIC_TUNED turns it off. The one gate that does not carry
+over is the model's own probability for the pair, which needs a scored candidate
+graph that this pipeline's npz does not hold — see DIVISIONS_TUNED.
+
+Caveat worth keeping in view: fold 0 holds out 44b6, which has 26 annotated
+divisions in 71 stacks, and the tuning above moves 3 of them. The settings sit
+on a broad plateau rather than a spike, but they are chosen on small counts.
 
 The pipeline also corrects a grid-centring error in the saved coordinates: the
 detection grid is 4x coarser than the image in y and x and a cell was reported
@@ -74,7 +96,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "postprocessing"))
 
 from params import EMBRYOS, LOG_FOLDER, SCALE, TRAIN_DIR  # noqa: E402
 from pipeline import DEFAULTS as PIPELINE_DEFAULTS  # noqa: E402
-from stages import run_ilp, run_pipeline, run_pp_public  # noqa: E402
+from stages import run_divisions, run_ilp, run_pipeline, run_pp_public  # noqa: E402
 from tracking.post_process import build_graph  # noqa: E402
 from tracking_cellmot.io import save_graph  # noqa: E402
 from utils.logger import get_last_log_folder  # noqa: E402
@@ -87,8 +109,47 @@ from tracking_cellmot.metrics import (  # noqa: E402
 )
 
 # Tuned on a 10-stack subset spanning the difficulty range; src/postprocessing/exp_pp_public.py.
-PP_PUBLIC_TUNED = dict(filter_short_tracks=1, min_track_len=4, relink_tight_um=6.5)
+#
+# safe_divisions is pp_public's own division repair, and it is off because the
+# `divisions` stage below is the same 946 repair with the gates it lacks. Left
+# on it ran 1 true positive against 51 false ones over the 71 stacks of
+# 2026-09-09/2 -- see src/postprocessing/exp_divisions_pp.py.
+PP_PUBLIC_TUNED = dict(
+    filter_short_tracks=1, min_track_len=4, relink_tight_um=6.5, safe_divisions=0,
+)
 ILP_TUNED = dict(appear=0.02, disappear=0.02, division=1.0, timeout=900.0)
+
+# The division stage, ported from main_edge_postprocess.py. Every gate but one
+# carries over unchanged; `min_prob` cannot, because it reads the model's
+# probability for the parent/second-child pair and this pipeline's npz holds
+# committed edges only, with no scored candidate graph. 0.0 disables that gate
+# -- see stages.run_divisions.
+DIVISIONS_TUNED = dict(
+    min_prob=0.0,
+    max_parent_um=9.0,
+    max_existing_child_um=10.0,
+    max_sister_um=14.0,
+    # 0 -- off -- not the edge chain's 0.6. Measured on the 71 stacks of
+    # 2026-09-09/2: the gate rejects 3 of the 4 true divisions this stage can
+    # otherwise find (tp 4 -> 1), for 13 fewer false positives, and that trade
+    # loses. It is a plateau rather than a spike: tau=0 and tau=1.5 (high enough
+    # that the ratio, bounded by 2, almost never trips) both score 0.858 and the
+    # dip is the 0.5-1.0 middle. The gate asks the parent to sit between its
+    # daughters, and on this data it often does not. It survives in the edge
+    # chain because `min_prob` is doing the rejecting there.
+    symmetry_tau=0.0,
+    # 2.25 and 3.0 are within 0.0001 of each other (6/35/20 against 4/16/22);
+    # 3.0 is the conservative end of that tie, and 3.5 gives a third of it back.
+    diverge_um=3.0,
+    # Not optional. Without it: 2 true against 90 false, and the stage is worth
+    # +0.0009 instead of +0.0091.
+    require_divergence=True,
+    require_mutual_nn=True,
+    # Neither cap binds at these settings -- doubling global_frac_cap changes
+    # nothing -- so the tighter value stands.
+    frame_frac_cap=0.0076,
+    global_frac_cap=0.00375,
+)
 
 _META = None
 
@@ -136,6 +197,31 @@ def parse_args():
                    help="skip tracking.pp_public.postprocess_graph")
     p.add_argument("--ilp", action="store_true",
                    help="run the ILP solver as a final pass (slow, worth ~+0.0006)")
+
+    p.add_argument("--no_divisions", action="store_true",
+                   help="skip the division proposal stage; the chain then scores "
+                        "near 0 on the division term, which is 0.1 of the score")
+    p.add_argument("--div_max_parent_um", type=float,
+                   default=DIVISIONS_TUNED["max_parent_um"])
+    p.add_argument("--div_max_existing_child_um", type=float,
+                   default=DIVISIONS_TUNED["max_existing_child_um"])
+    p.add_argument("--div_max_sister_um", type=float,
+                   default=DIVISIONS_TUNED["max_sister_um"])
+    p.add_argument("--div_symmetry_tau", type=float,
+                   default=DIVISIONS_TUNED["symmetry_tau"],
+                   help="reject when the parent sits beside one daughter rather "
+                        "than between the two (default %(default)s)")
+    p.add_argument("--div_diverge_um", type=float,
+                   default=DIVISIONS_TUNED["diverge_um"],
+                   help="um the grandchildren must have separated beyond the "
+                        "sisters by t+2 (default %(default)s)")
+    p.add_argument("--div_no_divergence", action="store_true",
+                   help="drop the divergence requirement")
+    p.add_argument("--div_no_mutual_nn", action="store_true")
+    p.add_argument("--div_frame_frac_cap", type=float,
+                   default=DIVISIONS_TUNED["frame_frac_cap"])
+    p.add_argument("--div_global_frac_cap", type=float,
+                   default=DIVISIONS_TUNED["global_frac_cap"])
 
     p.add_argument("--jobs", type=int, default=8, help="worker processes")
     p.add_argument("--limit", type=int, default=None, help="cap the stacks (debugging)")
@@ -331,6 +417,11 @@ def process(job):
         coords, edges = run_pp_public(coords, edges, sample=sample, **PP_PUBLIC_TUNED)
     if cfg["ilp"]:
         coords, edges = run_ilp(coords, edges, **ILP_TUNED)
+    # Last: it only ever adds edges, so nothing downstream needs to see it, and
+    # every earlier stage re-decides links from scratch -- pp_public's
+    # motion_relink most of all -- which would throw the fork away.
+    if cfg["divisions"]:
+        coords, edges = run_divisions(coords, edges, **cfg["div"])
 
     out_npz.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
@@ -404,6 +495,8 @@ def main():
          f"r={args.recover_max_residual:g})", recover),
         ("pp_public(tuned)", not args.no_pp_public),
         ("ILP(tuned)", args.ilp),
+        (f"divisions(diverge={args.div_diverge_um:g}, "
+         f"cap={args.div_global_frac_cap:g})", not args.no_divisions),
     ) if on]
 
     print(f"-> split     : {'train (pseudo-label)' if args.pl else 'val'}")
@@ -421,6 +514,19 @@ def main():
         recover_max_gap=args.recover_max_gap,
         recover_passes=args.recover_passes,
         recover_max_residual=args.recover_max_residual,
+        divisions=not args.no_divisions,
+        div=dict(
+            DIVISIONS_TUNED,
+            max_parent_um=args.div_max_parent_um,
+            max_existing_child_um=args.div_max_existing_child_um,
+            max_sister_um=args.div_max_sister_um,
+            symmetry_tau=args.div_symmetry_tau,
+            diverge_um=args.div_diverge_um,
+            require_divergence=not args.div_no_divergence,
+            require_mutual_nn=not args.div_no_mutual_nn,
+            frame_frac_cap=args.div_frame_frac_cap,
+            global_frac_cap=args.div_global_frac_cap,
+        ),
         no_score=args.no_score, skip_existing=args.skip_existing,
     )
     out_dir.mkdir(parents=True, exist_ok=True)

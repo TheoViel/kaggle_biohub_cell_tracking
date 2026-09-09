@@ -366,7 +366,9 @@ def offset_loss(
 class TrackingLoss(nn.Module):
     """Combined detection + edge loss.
 
-        L = L_edge + det_loss_weight · L_det + offset_loss_weight · L_offset
+        L = L_edge
+            + det_loss_weight · (L_det + det_ds_weight · L_det_ds)
+            + offset_loss_weight · L_offset
 
     Parameters
     ----------
@@ -386,6 +388,11 @@ class TrackingLoss(nn.Module):
         peak where the negative term is dropped. 0 disables the mechanism, and
         it does nothing without an ``ignore_positives`` source — see
         ``weak_positives.pl_ignore_folder``.
+    det_ds_weight : float
+        Weight for the deep-supervision detection term, relative to L_det. Only
+        applies on a model whose backbone decodes past the node grid, where the
+        coarse head keeps being trained on the target it had before the extra
+        stage was added.
     offset_loss_weight : float
         Weight for L_offset. Ignored when the model has no offset head, in
         which case no vote is produced and the term is absent.
@@ -405,6 +412,7 @@ class TrackingLoss(nn.Module):
         det_gaussian_sigma: float = 1.0,
         det_use_weak_positives: bool = True,
         det_ignore_radius: float = 0.0,
+        det_ds_weight: float = 1.0,
         offset_loss_weight: float = 1.0,
         offset_radius: int = 2,
         offset_beta: float = 1.0,
@@ -417,6 +425,7 @@ class TrackingLoss(nn.Module):
         self.det_gaussian_sigma = det_gaussian_sigma
         self.det_use_weak_positives = det_use_weak_positives
         self.det_ignore_radius = det_ignore_radius
+        self.det_ds_weight = det_ds_weight
         self.offset_loss_weight = offset_loss_weight
         self.offset_radius = offset_radius
         self.offset_beta = offset_beta
@@ -439,20 +448,29 @@ class TrackingLoss(nn.Module):
         offset_maps_per_frame: (
             list[torch.Tensor] | None
         ) = None,  # W × (B, 3, Z, Y, X), None when the head is off
+        det_logits_ds_per_frame: (
+            list[torch.Tensor] | None
+        ) = None,  # W × (B, 1, Z, Y, X) on the node grid, None without deep supervision
+        det_stride: tuple | None = None,  # image voxels per heatmap voxel
         progress: float = 1.0,  # fraction of training elapsed, in [0, 1]
     ) -> tuple[torch.Tensor, dict[str, float]]:
         W = len(det_logits_per_frame)
 
-        # An empty det_logits_per_frame means the detector is frozen
-        # (transformer-only training): nothing to supervise on the voxel grid.
-        if W:
-            det_losses = [
+        def _det_term(logits_per_frame, scaling):
+            """The detection loss averaged over the window, on one grid.
+
+            The GT points are the same either way; ``scaling`` is what places
+            them, so the two heads are trained on the same cells splatted at
+            each head's own resolution. That second target is the cost of the
+            finer head, and it is why the coarse one can be kept unchanged.
+            """
+            return sum(
                 detection_loss(
-                    det_logits_per_frame[i],
+                    logits_per_frame[i],
                     gt_coords_per_frame[i].clone(),
                     gt_mask_per_frame[i],
                     self.det_neg_weight,
-                    unet_scaling=unet_scaling,
+                    unet_scaling=scaling,
                     weak_weight=self.det_weak_weight,
                     weak_smoothing=self.det_weak_smoothing,
                     gaussian_sigma=self.det_gaussian_sigma,
@@ -466,9 +484,19 @@ class TrackingLoss(nn.Module):
                     ),
                     ignore_radius=self.det_ignore_radius,
                 )
-                for i in range(W)
-            ]
-            l_det = sum(det_losses) / W
+                for i in range(len(logits_per_frame))
+            ) / len(logits_per_frame)
+
+        # An empty det_logits_per_frame means the detector is frozen
+        # (transformer-only training): nothing to supervise on the voxel grid.
+        if W:
+            # unet_scaling stays the node grid, which the offset head and the
+            # deep-supervision heatmap both live on; only the main heatmap can
+            # be finer, and det_stride is what says so.
+            l_det = _det_term(
+                det_logits_per_frame,
+                unet_scaling if det_stride is None else det_stride,
+            )
         else:
             l_det = torch.zeros((), device=edge_logits_per_pair[0].device)
 
@@ -492,6 +520,13 @@ class TrackingLoss(nn.Module):
             "det": self.det_loss_weight * l_det.item(),
             "edge": l_edge.item(),
         }
+
+        if det_logits_ds_per_frame:
+            l_det_ds = _det_term(det_logits_ds_per_frame, unet_scaling)
+            total = total + self.det_loss_weight * self.det_ds_weight * l_det_ds
+            breakdown["det_ds"] = (
+                self.det_loss_weight * self.det_ds_weight * l_det_ds.item()
+            )
 
         if offset_maps_per_frame:
             offset_losses = [

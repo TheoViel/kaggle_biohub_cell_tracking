@@ -183,6 +183,7 @@ def build_model(args, ctx):
         ),
         unet_n_anisotropic=getattr(args, "unet_n_anisotropic", 2),
         unet_n_decode_steps=getattr(args, "unet_n_decode_steps", None),
+        unet_n_extra_decode_steps=int(getattr(args, "unet_n_extra_decode_steps", 0) or 0),
         unet_temporal_attention=bool(getattr(args, "unet_temporal_attention", True)),
         unet_spatial_attention=getattr(args, "unet_spatial_attention", "none"),
         unet_spatial_attention_stages=int(
@@ -246,7 +247,9 @@ def load_weights(
     path: str,
     fold: int,
     ctx,
-    prefixes: tuple[str, ...] = ("unet.", "detect_head.", "offset_head."),
+    prefixes: tuple[str, ...] = (
+        "unet.", "detect_head.", "detect_head_fine.", "offset_head.",
+    ),
     run_name: str | None = None,
 ) -> None:
     """Load the segmentation backbone from a checkpoint, in place.
@@ -258,6 +261,12 @@ def load_weights(
 
     Tensors whose shape no longer matches are skipped as well, so a backbone
     config change degrades to a partial load rather than an exception.
+
+    ``detect_head_fine`` is named separately because ``startswith`` does not see
+    it inside ``detect_head.`` — the dot is what makes them different prefixes.
+    A new detection-side module that is not listed here loads silently as random
+    weights, so the log below names every module the filter dropped rather than
+    only counting the ones it kept.
 
     ``path`` may contain ``fold_*`` (or the older ``{fold}`` placeholder), so a
     single config entry can point at the per-run checkpoints a previous run
@@ -290,6 +299,17 @@ def load_weights(
         if len(to_load) < n_backbone:
             print(f"  WARNING: {n_backbone - len(to_load)} not loaded", end="")
             print(f", {len(mismatched)} shape mismatches" if mismatched else "")
+        # Weights the checkpoint has and this model wants, dropped only because
+        # no prefix names them. The count above cannot see these — it filters
+        # the model by the same prefixes — so they would otherwise stay at init
+        # with the log reporting a clean 184/184.
+        dropped = sorted({
+            key.split(".")[0]
+            for key in state
+            if key in current and not key.startswith(prefixes)
+        })
+        if dropped:
+            print(f"  Skipped modules (not in prefixes): {', '.join(dropped)}")
 
 
 def _stage_aug(args, name: str) -> dict | None:

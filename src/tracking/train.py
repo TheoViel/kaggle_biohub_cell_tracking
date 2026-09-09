@@ -234,22 +234,25 @@ def fit(
                     # Nothing on the detection side is being supervised: there
                     # is no heatmap and no U-Net in the graph at all.
                     det_logits, unet_scaling, offset_maps = [], None, None
+                    det_logits_ds, det_stride = None, None
                 elif transformer_only:
                     names = batch["name"]
                     if any(name not in fts_cache for name in names):
                         with torch.no_grad():
-                            fresh, _, _, _ = encode_nodes(
+                            fresh = encode_nodes(
                                 core_model, imgs, coords, masks, image_shape,
                                 voxel_size, args,
-                            )
+                            )[0]
                         for b, name in enumerate(names):
                             fts_cache[name] = split_frame_det(fresh, b)
                     frame_det = collate_frame_det([fts_cache[n] for n in names])
                     # The detector is frozen here, so neither the heatmap nor
                     # the vote is being supervised.
                     det_logits, unet_scaling, offset_maps = [], None, None
+                    det_logits_ds, det_stride = None, None
                 else:
-                    frame_det, det_logits, unet_scaling, offset_maps = encode_nodes(
+                    (frame_det, det_logits, unet_scaling, offset_maps,
+                     det_logits_ds, det_stride) = encode_nodes(
                         core_model,
                         imgs,
                         coords,
@@ -312,6 +315,10 @@ def fit(
                     edge_targets_list,
                     det_mask_pairs,
                     unet_scaling=unet_scaling,
+                    # The heatmap's own grid, finer than the node grid when the
+                    # backbone decodes past it; equal otherwise.
+                    det_stride=det_stride,
+                    det_logits_ds_per_frame=det_logits_ds,
                     weak_pos_per_frame=(
                         [weak_pos[:, i] for i in range(window_size)]
                         if weak_pos is not None else None
@@ -429,8 +436,11 @@ def fit(
                 log(
                     f"epoch {epoch + 1:02d}/{n_epochs:02d}  (step {global_step:04d}/{total_steps})  "
                     f"lr={lr_str}  loss={avg['total']:.4f}"
-                    + (f" (det={avg['det']:.3f} off={avg['offset']:.3f})"
-                       if "offset" in avg else "")
+                    + (f" (det={avg['det']:.3f}"
+                       + (f" ds={avg['det_ds']:.3f}" if "det_ds" in avg else "")
+                       + (f" off={avg['offset']:.3f}" if "offset" in avg else "")
+                       + ")"
+                       if ("offset" in avg or "det_ds" in avg) else "")
                     + f"  t={elapsed:.0f}s \t{val_message}"
                 )
                 interval_losses = dict.fromkeys(interval_losses, 0.0)
@@ -461,6 +471,9 @@ def _model_config(args) -> dict:
         "unet_pool_stride": list(getattr(args, "unet_pool_stride", [2, 2, 2])),
         "unet_n_anisotropic": getattr(args, "unet_n_anisotropic", 2),
         "unet_n_decode_steps": getattr(args, "unet_n_decode_steps", None),
+        # 0 is the pre-upgrade architecture, so a checkpoint written before this
+        # key existed still rebuilds the model it was saved from.
+        "unet_n_extra_decode_steps": int(getattr(args, "unet_n_extra_decode_steps", 0) or 0),
         "unet_temporal_attention": bool(getattr(args, "unet_temporal_attention", True)),
         # "none" is the pre-upgrade architecture, so a checkpoint written before
         # these keys existed still rebuilds the model it was saved from.

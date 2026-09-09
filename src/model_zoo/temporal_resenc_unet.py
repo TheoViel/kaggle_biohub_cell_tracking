@@ -116,9 +116,16 @@ class TemporalResEncUNet3D(nn.Module):
         stem_stride: int | tuple[int, int, int] | None = None,
         n_stages: int = 3,
         n_decode_steps: int | None = None,
+        n_extra_decode_steps: int = 0,
         verbose: int = 0,
     ) -> None:
         super().__init__()
+
+        if int(n_extra_decode_steps) > 0:
+            raise NotImplementedError(
+                "n_extra_decode_steps is implemented on TemporalUNet3D only; "
+                "build the ResEnc backbone with unet_n_extra_decode_steps=0"
+            )
 
         if layers is None:
             layers = [min(MAX_FEATURES_3D, BASE_NUM_FEATURES * 2**i) for i in range(n_stages)]
@@ -186,6 +193,9 @@ class TemporalResEncUNet3D(nn.Module):
         self.output_stride = cumulative_stride(
             self.encoder.stem_stride, self.encoder.strides[: n_stages - self.n_decode_steps]
         )
+        # No extra decoder branch here, so the finer output is the only output.
+        self.n_extra_decode_steps = 0
+        self.fine_output_stride = self.output_stride
 
         self.apply(init_weights_he)
         self.apply(init_last_norm_before_add_to_zero)

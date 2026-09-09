@@ -106,7 +106,7 @@ DEFAULTS = {
     "data_dir": TRAIN_DIR,
     "window_size": 2,
     "crop_size": None,  # (16, 64, 64),  # None,  # (16, 64, 64),     # Crop
-    "selected_folds": [],
+    "selected_folds": [1],
     "fullfit": True,
     "fullfit_n_val_videos": 1,     # leaky either way, so keep the eval cheap
 
@@ -116,14 +116,11 @@ DEFAULTS = {
     "unet_layers": (32, 64, 128),
     "unet_pool_stride": (1, 2, 2),    # pool Y/X only; full-scale Z preserved
     "unet_n_anisotropic": 2,          # downsampling steps using unet_pool_stride
-    "unet_n_decode_steps": 1,         # 1 decoder stage → output at 1/4 Y/X, full-scale Z
+    # Decoder
+    "unet_n_decode_steps": 1,         # 1 decoder stage → node features at 1/4 Y/X, full-scale Z
+    "unet_n_extra_decode_steps": 1,  # Extra decoder stage for the detection head
     "unet_temporal_attention": True,  # False = encode each frame independently
-    # Convolutional attention on the spatial axes, inside the backbone. The
-    # temporal blocks only mix a voxel with itself across the window's frames,
-    # so without this nothing in the encoder lets two places interact past the
-    # convolution stack's own receptive field. "pooled" attends globally over
-    # convolutionally reduced keys, "window" locally inside fixed windows,
-    # "cbam" only re-weights; "none" is the pre-upgrade architecture.
+    # Attention
     "unet_spatial_attention": "none",   # "none" / "pooled" / "window" / "cbam"
     "unet_spatial_attention_stages": 1,   # deepest N encoder stages, 0 = off
     "unet_spatial_attention_heads": 4,
@@ -168,7 +165,7 @@ DEFAULTS = {
 
     # Stage 1 - Synthetic data pretraining
     "synthetic_pretraining": {
-        "enabled": True,
+        "enabled": False,
         "synthetic_dir": "../input/synthetic/v4/",
         "synthetic_proportion": 1,
         "weights": None,
@@ -224,7 +221,7 @@ DEFAULTS = {
     # Stage 1.5 - Pretraining
     "pretraining": {
         "enabled": True,
-        "weights": None,  # "../logs/2026-09-01/9/fold_0/ckpt_synthetic.pt",
+        "weights": "../logs/2026-09-09/0/fold_0/ckpt_synthetic.pt",
         # Data
         "crop_size": (32, 128, 128),
         "aug_strength": 3,
@@ -268,14 +265,14 @@ DEFAULTS = {
         "transformer_only": True,
         "coordinates_folder": None,  # "../logs/2026-09-02/9/preds_0.50/",
         "contrastive_folder": None,  # "../logs/2026-09-03/13/embeddings/",
-        "weights": None,  # "../logs/2026-09-07/1/fold_*/ckpt_pretrain.pt",
+        "weights": None,  # "../logs/2026-09-09/0/fold_0/ckpt_pretrain.pt"
         # Data
         "crop_size": None,
         # Training
         "iterations": 200,
         "epochs": None,
-        "batch_size": 32,
-        "val_batch_size": 32,
+        "batch_size": 8,
+        "val_batch_size": 8,
         "det_warmup_prop": 0.,
         "teacher_forcing_prop": 0,   # use GT points as nodes for this opening fraction of training
         # Eval
@@ -302,6 +299,7 @@ DEFAULTS = {
         "det_weak_weight": 0.2,        # To balance GT share of positive weight 
         "det_weak_smoothing": 0.01,      # smoothing factor for weak positives
         "det_gaussian_sigma": 1.0,
+        "det_ds_weight": 1.0,          # deep-supervision heatmap, relative to the fine one
         "det_ignore_radius": 0.0,      # Ignore radius around ignored_peaks
         "offset_loss_weight": 1.0,     # Offset loss weight
         "offset_beta": 1.0,            # SmoothL1 knee, grid voxels

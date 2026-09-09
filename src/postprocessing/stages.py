@@ -186,6 +186,41 @@ def run_pipeline(coords, edges, **kw):
     return postprocess(coords, edges, **kw)
 
 
+# --------------------------------------------------------------------------
+# divisions
+# --------------------------------------------------------------------------
+
+def run_divisions(coords, edges, cand=None, **kw):
+    """``edge_pp.propose_divisions`` on a graph with no candidate array.
+
+    The tracker's npz carries committed edges only, so the one gate that stage
+    was built around -- the model's own probability for the parent/second-child
+    pair -- has nothing to read. ``min_prob=0`` is what turns it off: an absent
+    pair scores 0.0, and ``0.0 < 0.0`` is false, so every pair passes and the
+    geometry decides alone.
+
+    What is left is still more than ``pp_public``'s own
+    ``add_safe_divisions_postlink``, which is the same 946 repair with only the
+    three distance gates. ``require_divergence`` is the one that matters -- it
+    asks the two sisters' own children to have separated by ``t + 2``, which is
+    what tells a division from two detections of one cell -- and it is why
+    pp_public's version ran at 1 true positive against 51 false ones on
+    2026-09-09/2 while this one runs at 4 against 16. The two are alternatives,
+    not a stack; see ``PP_PUBLIC_TUNED`` in main_postprocess.py.
+
+    ``symmetry_tau`` also lives here but the tuned config leaves it off; the
+    reasoning is with the constant.
+
+    Only edges are added, never nodes, so this can run last.
+    """
+    from edge_pp import propose_divisions
+
+    edges = np.asarray(edges, dtype=float).reshape(-1, 4)
+    if cand is None:
+        cand = np.empty((0, 5))
+    return coords, propose_divisions(coords, edges, cand, **kw)
+
+
 def run_suppress(coords, edges, **kw):
     """Restore the detector's per-frame spacing floor; see suppress.py."""
     from suppress import suppress_rivals
