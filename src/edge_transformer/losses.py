@@ -176,6 +176,7 @@ def edge_loss(
     degree_weight: float = 0.0,
     edge_index: torch.Tensor | None = None,   # (B, E, 2), needed by both extras
     edge_mask: torch.Tensor | None = None,    # (B, E) bool, needed by degree_weight
+    weight: torch.Tensor | None = None,       # (B, E) per-edge, 1.0 = annotated
     n_nodes: int | None = None,
 ) -> EdgeLossOut:
     """Mean over samples of each sample's mean over its supervised edges.
@@ -185,6 +186,16 @@ def edge_loss(
     three annotated cells supervises three times the edges of one with a single
     cell -- and pooling would weight those windows by their annotation density,
     which is a property of the labelling effort, not of the data.
+
+    ``weight`` prices each edge, which is how pseudo-labels enter at less than
+    an annotated edge's worth. It is applied at *both* levels, and has to be:
+    weighting only within a window would let a window carrying nothing but
+    pseudo-labels count as much as a fully annotated one, which is the opposite
+    of discounting them. So the inner mean is weighted, and each window then
+    enters the outer mean by its own mean weight -- 1 for an annotated window,
+    ``pl_weight`` for a purely pseudo-labelled one, between for a mixture. With
+    no ``weight`` every supervised edge is worth 1 and both levels collapse back
+    to the plain means above, exactly.
     """
     logits = logits.squeeze(-1) if logits.dim() == 3 else logits
     supervised = supervised & torch.isfinite(logits.detach())
@@ -199,12 +210,28 @@ def edge_loss(
             loss = loss * (1.0 + (pos_weight - 1.0) * target)
 
         n = supervised.sum(dim=1)
-        per_sample = (loss * supervised).sum(dim=1) / n.clamp(min=1)
+        w = supervised.to(loss.dtype)
+        if weight is not None:
+            w = w * weight.to(loss.dtype)
+        w_sum = w.sum(dim=1)
+        per_sample = (loss * w).sum(dim=1) / w_sum.clamp(min=1e-8)
         # A window the annotation cannot reach contributes nothing and is not
         # counted; the sum still keeps every parameter attached to the graph,
         # which is what DDP needs on a step that would otherwise be skipped.
-        scored = (n > 0).to(per_sample.dtype)
-        total = (per_sample * scored).sum() / scored.sum().clamp(min=1)
+        #
+        # `scored` is the window's mean weight -- 1 for an annotated window,
+        # pl_weight for a purely pseudo-labelled one -- and the denominator
+        # counts supervised windows rather than summing those weights. That
+        # distinction is the whole discount: dividing by the sum would cancel
+        # the weights out of any batch whose windows are *all* pseudo-labelled,
+        # which is most of them once pseudo-labels unlock the windows the
+        # annotation never reached. Counting instead lets such a batch
+        # contribute pl_weight as much as an annotated one, which is what
+        # trusting it less means. With no `weight` every scored window is 1 and
+        # this is the plain mean it always was.
+        scored = w_sum / n.clamp(min=1).to(loss.dtype)
+        n_scored = (n > 0).to(loss.dtype).sum()
+        total = (per_sample * scored).sum() / n_scored.clamp(min=1e-8)
 
         if rank_weight and edge_index is not None and n_nodes:
             total = total + rank_weight * competitor_rank_loss(

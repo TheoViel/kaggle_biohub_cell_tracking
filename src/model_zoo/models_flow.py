@@ -108,6 +108,11 @@ def define_flow_model(
     unet_n_anisotropic: int = 2,
     unet_n_decode_steps: int | None = None,
     unet_temporal_attention: bool = False,
+    unet_spatial_attention: str = "none",
+    unet_spatial_attention_stages: int = 1,
+    unet_spatial_attention_heads: int = 4,
+    unet_spatial_attention_reduction=4,
+    unet_spatial_attention_window=(4, 8, 8),
     unet_blocks_per_stage=None,
     unet_stem: str = "unshuffle",
     unet_norm: str = "batch",
@@ -143,6 +148,14 @@ def define_flow_model(
             "hires_skip_fusion": unet_hires_fusion,
         }
     )
+    # Both backbones take these; "none" leaves the model unchanged. Kept here so
+    # a segmentation run can pretrain the same blocks the tracking model wants.
+    extra["spatial_attention"] = unet_spatial_attention
+    extra["spatial_attention_stages"] = unet_spatial_attention_stages
+    extra["spatial_attention_heads"] = unet_spatial_attention_heads
+    extra["spatial_attention_reduction"] = unet_spatial_attention_reduction
+    extra["spatial_attention_window"] = tuple(unet_spatial_attention_window)
+
     unet = backbone(
         in_channels=in_channels,
         out_channels=unet_out_channels,

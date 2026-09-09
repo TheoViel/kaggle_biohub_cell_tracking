@@ -37,4 +37,4 @@ echo
 echo Predictions done ! Postprocessing...
 echo
 
-# python main_postprocess.py "${LOG_ARGS[@]}"   # --pl
+python main_postprocess.py "${LOG_ARGS[@]}"   # --pl

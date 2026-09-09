@@ -29,6 +29,52 @@ EDGE_PAIR_BUDGET = 32_000_000
 MAX_WINDOWS_PER_BATCH = 16
 
 
+def fuse_directions(
+    forward: list[float],
+    reverse: list[float],
+    mode: str = "harmonic",
+    weight: float = 0.5,
+    eps: float = 1e-6,
+) -> float:
+    """One probability for a pair, from its forward and time-reversed readings.
+
+    Averaging happens twice, and the two are not the same question. Several
+    windows may cover the same frame pair (``window_size > 2``), and those are
+    the same model asked the same way under different context -- so they are
+    meaned within a direction. The two *directions* are the model asked
+    differently, and how to combine those is the choice ``mode`` makes:
+
+    ``"mean"``      the weighted arithmetic mean, which is what plain averaging
+                    of both passes does, and what this did before.
+    ``"harmonic"``  the weighted harmonic mean, ``1 / ((1-w)/p_f + w/p_r)``.
+
+    The harmonic mean is the one worth having. It is dominated by the *smaller*
+    of the two -- a pair one direction likes and the other does not comes out
+    near the doubter's value rather than halfway -- so it asks for mutual
+    support instead of an average opinion. That matters here precisely because
+    the two passes agree closely on average: an arithmetic mean of two nearly
+    equal numbers is nearly the number itself and changes almost nothing, while
+    a disagreement-penalising rule still moves the pairs that disagree, which
+    are the ones in doubt.
+
+    A pair seen in only one direction keeps that direction's value. It is not
+    evidence against the pair: the reverse pass re-estimates the drift from the
+    other end, so a borderline pair can fall either side of the candidate radius
+    and simply not be proposed. Scoring the missing view as zero would delete
+    links over a rounding difference in the drift estimate.
+    """
+    f = float(np.mean(forward)) if forward else None
+    r = float(np.mean(reverse)) if reverse else None
+    if f is None or r is None:
+        return f if f is not None else (r if r is not None else 0.0)
+
+    if mode == "mean":
+        return (1.0 - weight) * f + weight * r
+    if mode == "harmonic":
+        return 1.0 / ((1.0 - weight) / max(f, eps) + weight / max(r, eps))
+    raise ValueError(f"unknown tta fusion {mode!r}; use 'harmonic' or 'mean'")
+
+
 def _plan_batches(sizes: list[int], max_windows: int, budget: int) -> list[list[int]]:
     """Group window indices into forwards: near-equal sizes, bounded memory.
 
@@ -55,6 +101,9 @@ def score_video(
     video_idx: int,
     device: torch.device,
     fp16: bool = True,
+    tta: bool = False,
+    tta_fusion: str = "harmonic",
+    tta_weight: float = 0.5,
     max_windows_per_batch: int = MAX_WINDOWS_PER_BATCH,
 ) -> dict[tuple[int, int], tuple[float, float]]:
     """Every candidate edge of a video, as ``(src, tgt) -> (probability, distance)``.
@@ -66,6 +115,15 @@ def score_video(
     several windows, under different context each time; the probabilities are
     averaged rather than taken from one arbitrary window. At the default window
     of 2 there is exactly one score per pair and the averaging is a no-op.
+
+    ``tta`` adds a second reading of every window with time reversed. The
+    candidate set is symmetric under the reversal -- ``build_candidates`` unions
+    the k-nearest in both directions, so the same pairs are proposed either way
+    -- and a flipped window's edges are mapped back to real time before they are
+    accumulated. It costs one extra forward per window and is worth most on a
+    model trained with ``time_flip_p``, which is what makes the reversed view
+    something it has seen before. ``tta_fusion`` and ``tta_weight`` decide how
+    the two directions are combined; see :func:`fuse_directions`.
 
     Windows are batched dynamically: sorted by candidate count, then grouped so
     a batch is padded only out to its *own* widest member rather than to any
@@ -84,14 +142,21 @@ def score_video(
 
     was_training = model.training
     model.eval()
-    total: dict[tuple[int, int], list[float]] = {}
+    # Forward and reversed readings kept apart: several windows may cover one
+    # frame pair and those are meaned within a direction, while the two
+    # directions are combined by `fuse_directions`, which is a different rule.
+    total: dict[tuple[int, int], tuple[list[float], list[float]]] = {}
     dist_of: dict[tuple[int, int], float] = {}
 
     # keep_annotated=False: a real deployment has no ground truth to spare an
     # annotated node from the per-frame cap, and scoring this the way training
     # validates it would credit the model with a recall it cannot reach
     # standalone. See EdgeDataset.build's docstring.
-    items = [dataset.build(video_idx, t, keep_annotated=False) for t in starts]
+    items = [
+        dataset.build(video_idx, t, keep_annotated=False, time_flip=flip)
+        for t in starts
+        for flip in ((False, True) if tta else (False,))
+    ]
     items = [it for it in items if it["edge_index"].shape[0]]
 
     sizes = [int(it["edge_index"].shape[0]) for it in items]
@@ -118,15 +183,26 @@ def score_video(
             glob = item["node_global"].numpy()
             pos = item["node_pos"].numpy()
             d = np.linalg.norm(pos[edges[:, 0]] - pos[edges[:, 1]], axis=1)
+            # A reversed window proposes the same pair the other way round, so
+            # its edges are turned back before they are keyed -- otherwise the
+            # two views would accumulate into two separate, half-observed edges
+            # and `link_video` would see a graph pointing both ways in time.
+            flipped = item["time_flip"]
             # Rows past this window's own edge count are padding; ignore them.
             for e, (src, tgt) in enumerate(edges):
-                key = (int(glob[src]), int(glob[tgt]))
-                total.setdefault(key, []).append(float(probs[slot, e]))
+                a, b = int(glob[src]), int(glob[tgt])
+                key = (b, a) if flipped else (a, b)
+                seen = total.setdefault(key, ([], []))
+                seen[1 if flipped else 0].append(float(probs[slot, e]))
                 dist_of[key] = float(d[e])
 
     if was_training:
         model.train()
-    return {k: (float(np.mean(v)), dist_of[k]) for k, v in total.items()}
+    return {
+        k: (fuse_directions(fwd, rev, mode=tta_fusion, weight=tta_weight),
+            dist_of[k])
+        for k, (fwd, rev) in total.items()
+    }
 
 
 def link_video(

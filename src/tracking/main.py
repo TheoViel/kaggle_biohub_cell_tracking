@@ -184,6 +184,17 @@ def build_model(args, ctx):
         unet_n_anisotropic=getattr(args, "unet_n_anisotropic", 2),
         unet_n_decode_steps=getattr(args, "unet_n_decode_steps", None),
         unet_temporal_attention=bool(getattr(args, "unet_temporal_attention", True)),
+        unet_spatial_attention=getattr(args, "unet_spatial_attention", "none"),
+        unet_spatial_attention_stages=int(
+            getattr(args, "unet_spatial_attention_stages", 1)
+        ),
+        unet_spatial_attention_heads=int(getattr(args, "unet_spatial_attention_heads", 4)),
+        unet_spatial_attention_reduction=getattr(
+            args, "unet_spatial_attention_reduction", 4
+        ),
+        unet_spatial_attention_window=tuple(
+            getattr(args, "unet_spatial_attention_window", (4, 8, 8))
+        ),
         # Defaults here are the pre-upgrade architecture, so a run logged before
         # these keys existed still rebuilds the model its checkpoint was saved from.
         unet_blocks_per_stage=getattr(args, "unet_blocks_per_stage", None),
@@ -341,6 +352,8 @@ def _training_runs(args) -> list[dict]:
     """
     runs = []
     for fold, val_embryo in enumerate(EMBRYOS):
+        if args.selected_folds is None:
+            continue
         if fold in args.selected_folds:
             runs.append(
                 {

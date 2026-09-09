@@ -177,6 +177,222 @@ class _TemporalAttention(nn.Module):
         return x + h
 
 
+def _heads_for(channels: int, n_heads: int) -> int:
+    """The largest head count <= ``n_heads`` that divides ``channels``.
+
+    The stage widths are powers of two and the requested head count usually
+    divides them, but ``hires_skip_fusion`` and the unshuffle stem both produce
+    widths that are not, and a mismatch there would only surface as a reshape
+    error deep in a forward pass.
+    """
+    for h in range(min(n_heads, channels), 0, -1):
+        if channels % h == 0:
+            return h
+    return 1
+
+
+def _pad_to_multiple(x: torch.Tensor, multiple: tuple[int, int, int]) -> torch.Tensor:
+    """Pad Z/Y/X up so each is a whole number of ``multiple``, by replication.
+
+    Replication rather than zeros: a zero voxel is a *dark* voxel here, which is
+    a meaningful value the attention would then average over. Repeating the edge
+    adds nothing the volume does not already say.
+    """
+    sz, sy, sx = x.shape[-3:]
+    mz, my, mx = multiple
+    pz, py, px = (-sz) % mz, (-sy) % my, (-sx) % mx
+    if pz or py or px:
+        x = F.pad(x, (0, px, 0, py, 0, pz), mode="replicate")
+    return x
+
+
+class _PooledSelfAttention3d(nn.Module):
+    """Self-attention with a convolutional spatial reduction on the keys.
+
+    PVT's spatial-reduction attention, in 3D. Every voxel of the stage is a
+    query, but the keys and values are read from a *strided convolution* of the
+    same feature map, so the token count they carry falls by ``reduction`` per
+    axis. That is what makes a global receptive field affordable: at the default
+    geometry the bottleneck is 32x32x32, and full self-attention there is
+    32768^2 = 1.07e9 pairs per head per frame, where reducing by 4 leaves
+    32768 x 512 = 16.8M.
+
+    The projections are convolutions rather than linear layers, which is the
+    "convolutional" half of the name and is not cosmetic: the K/V convolution
+    has a 4x4x4 receptive field, so each key summarises a neighbourhood instead
+    of sampling one voxel out of 64.
+
+    The output projection is zero-initialised, so the block is exactly the
+    identity at initialisation. Every stage of this pipeline fine-tunes from a
+    pretrained checkpoint loaded with ``strict=False`` (tracking/main.py), so a
+    freshly-inserted block must not perturb what those weights already do.
+    """
+
+    def __init__(self, channels: int, n_heads: int = 4, reduction=4) -> None:
+        super().__init__()
+        self.n_heads = _heads_for(channels, n_heads)
+        self.reduction = _to_3tuple(reduction)
+        self.scale = (channels // self.n_heads) ** -0.5
+
+        self.norm = _norm("group", channels)
+        self.q = nn.Conv3d(channels, channels, kernel_size=1, bias=False)
+        # The spatial reduction is a learned pooling -- kernel == stride == the
+        # reduction -- and it is separable: a depthwise convolution over the
+        # 4x4x4 block, then a 1x1 projection to K and V. PVT writes this as one
+        # dense convolution, which at these widths costs C * 2C * 64 = 2.1M
+        # parameters, over half the backbone again for a single block. The
+        # separable form keeps the same receptive field for 41k.
+        self.kv = nn.Sequential(
+            nn.Conv3d(
+                channels, channels, kernel_size=self.reduction, stride=self.reduction,
+                groups=channels, bias=False,
+            ),
+            nn.Conv3d(channels, 2 * channels, kernel_size=1, bias=False),
+        )
+        self.proj = nn.Conv3d(channels, channels, kernel_size=1)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (N, C, Z, Y, X)
+        n, c = x.shape[:2]
+        spatial = x.shape[2:]
+        h = self.norm(x)
+
+        q = self.q(h).reshape(n, self.n_heads, c // self.n_heads, -1).transpose(-2, -1)
+        k, v = self.kv(_pad_to_multiple(h, self.reduction)).chunk(2, dim=1)
+        k = k.reshape(n, self.n_heads, c // self.n_heads, -1).transpose(-2, -1)
+        v = v.reshape(n, self.n_heads, c // self.n_heads, -1).transpose(-2, -1)
+
+        out = F.scaled_dot_product_attention(q, k, v)
+        out = out.transpose(-2, -1).reshape(n, c, *spatial)
+        return x + self.proj(out)
+
+
+class _WindowSelfAttention3d(nn.Module):
+    """Self-attention inside non-overlapping windows.
+
+    Swin's partition without the shift: the volume is cut into ``window``-sized
+    blocks and every voxel attends to the ones sharing its block. Cost is linear
+    in the volume — 4x8x8 windows are 256 tokens each, whatever the stage size —
+    but the receptive field stops at the window, and because the windows never
+    move, the seams between them are never crossed. It is here to be measured
+    against the pooled variant, which buys a global field for a similar price.
+
+    Zero-initialised output projection, for the reason in
+    :class:`_PooledSelfAttention3d`.
+    """
+
+    def __init__(self, channels: int, n_heads: int = 4, window=(4, 8, 8)) -> None:
+        super().__init__()
+        self.n_heads = _heads_for(channels, n_heads)
+        self.window = _to_3tuple(window)
+
+        self.norm = _norm("group", channels)
+        self.qkv = nn.Conv3d(channels, 3 * channels, kernel_size=1, bias=False)
+        self.proj = nn.Conv3d(channels, channels, kernel_size=1)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (N, C, Z, Y, X)
+        n, c = x.shape[:2]
+        spatial = x.shape[2:]
+        # A stage smaller than the window attends over what is there rather than
+        # padding a window's worth of replicated voxels into the softmax.
+        window = tuple(min(w, s) for w, s in zip(self.window, spatial))
+
+        h = _pad_to_multiple(self.norm(x), window)
+        padded = h.shape[-3:]
+        nz, ny, nx = (p // w for p, w in zip(padded, window))
+        wz, wy, wx = window
+        ws = wz * wy * wx
+
+        qkv = self.qkv(h)
+        # (N, 3C, Z, Y, X) -> one attention batch per window
+        qkv = qkv.reshape(n, 3 * c, nz, wz, ny, wy, nx, wx)
+        qkv = qkv.permute(0, 2, 4, 6, 1, 3, 5, 7).reshape(n * nz * ny * nx, 3 * c, ws)
+        q, k, v = qkv.chunk(3, dim=1)
+
+        def heads(t):
+            return t.reshape(-1, self.n_heads, c // self.n_heads, ws).transpose(-2, -1)
+
+        out = F.scaled_dot_product_attention(heads(q), heads(k), heads(v))
+        out = out.transpose(-2, -1).reshape(n, nz, ny, nx, c, wz, wy, wx)
+        out = out.permute(0, 4, 1, 5, 2, 6, 3, 7).reshape(n, c, *padded)
+        out = out[:, :, : spatial[0], : spatial[1], : spatial[2]]
+        return x + self.proj(out)
+
+
+class _CBAM3d(nn.Module):
+    """Convolutional channel + spatial attention gating (CBAM), in 3D.
+
+    Not self-attention: there is no voxel-to-voxel interaction at all. A channel
+    gate is pooled from the whole volume and a spatial gate from a convolution
+    over the channel-mean and channel-max maps, and both re-weight the features
+    in place. It is here as the cheap end of the same axis — if the gains of the
+    two attention blocks above are really about re-weighting rather than about
+    voxels talking to each other, this finds that out for almost no compute.
+
+    The gates enter through a zero-initialised scalar, ``x * (1 + gamma * (g -
+    1))``, so the block is the identity at initialisation for the same reason as
+    the others. Applying ``g`` directly would multiply a pretrained feature map
+    by ~0.25 at step 0.
+    """
+
+    def __init__(self, channels: int, reduction: int = 8, kernel_size: int = 7) -> None:
+        super().__init__()
+        hidden = max(4, channels // reduction)
+        self.channel_mlp = nn.Sequential(
+            nn.Conv3d(channels, hidden, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(hidden, channels, kernel_size=1),
+        )
+        self.spatial_conv = nn.Conv3d(
+            2, 1, kernel_size=kernel_size, padding=kernel_size // 2, bias=False
+        )
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        pooled = self.channel_mlp(F.adaptive_avg_pool3d(x, 1))
+        pooled = pooled + self.channel_mlp(F.adaptive_max_pool3d(x, 1))
+        gate = torch.sigmoid(pooled)
+
+        h = x * gate
+        stats = torch.cat([h.mean(dim=1, keepdim=True), h.amax(dim=1, keepdim=True)], dim=1)
+        gate = gate * torch.sigmoid(self.spatial_conv(stats))
+        return x * (1 + self.gamma * (gate - 1))
+
+
+SPATIAL_ATTENTION_KINDS = ("none", "pooled", "window", "cbam")
+
+
+def spatial_attention_block(
+    kind: str,
+    channels: int,
+    n_heads: int = 4,
+    reduction=4,
+    window=(4, 8, 8),
+) -> nn.Module:
+    """One spatial attention block by name, or ``nn.Identity`` for ``"none"``.
+
+    ``"pooled"`` attends globally over convolutionally reduced keys,
+    ``"window"`` attends locally inside fixed windows, ``"cbam"`` only
+    re-weights. See each class for what it costs and what it can see.
+    """
+    if kind in (None, "none"):
+        return nn.Identity()
+    if kind == "pooled":
+        return _PooledSelfAttention3d(channels, n_heads=n_heads, reduction=reduction)
+    if kind == "window":
+        return _WindowSelfAttention3d(channels, n_heads=n_heads, window=window)
+    if kind == "cbam":
+        return _CBAM3d(channels)
+    raise ValueError(
+        f"unknown spatial_attention {kind!r}, expected one of {list(SPATIAL_ATTENTION_KINDS)}"
+    )
+
+
 class TemporalUNet3D(nn.Module):
     """Minimal 3D temporal U-Net.
 
@@ -206,6 +422,26 @@ class TemporalUNet3D(nn.Module):
     temporal_attention : bool
         If False, drop the temporal attention blocks entirely and treat the
         window as a batch of independent frames.
+    spatial_attention : {"none", "pooled", "window", "cbam"}
+        A convolutional attention block on the *spatial* axes, run after each
+        stage's convolutions and its temporal block. The temporal blocks mix a
+        voxel with itself across the frames of the window and never with its
+        neighbours; this is the other half. See ``spatial_attention_block``.
+    spatial_attention_stages : int
+        How many of the *deepest* encoder stages carry one. 1 (default) is the
+        bottleneck alone, which is where the tokens are fewest and the context
+        richest; 0 is off. The finer stages are much larger — at the default
+        geometry the stage above the bottleneck holds 8x the voxels — so this
+        is the knob that decides what the block costs.
+    spatial_attention_heads : int
+        Attention heads, reduced to a divisor of the stage width if it is not
+        one already.
+    spatial_attention_reduction : int or (int, int, int)
+        ``"pooled"`` only: the stride of the convolution the keys and values are
+        read through, per axis.
+    spatial_attention_window : (int, int, int)
+        ``"window"`` only: the window each voxel attends inside, clamped per
+        axis to the stage that carries it.
     pool_stride : int or (int, int, int)
         The anisotropic downsampling stride, applied to the first
         ``n_anisotropic`` steps.  ``(1, 2, 2)`` pools Y/X only, keeping Z at
@@ -244,6 +480,11 @@ class TemporalUNet3D(nn.Module):
         gradient_checkpointing: bool = False,
         skip_fullres_temporal: bool = True,
         temporal_attention: bool = True,
+        spatial_attention: str = "none",
+        spatial_attention_stages: int = 1,
+        spatial_attention_heads: int = 4,
+        spatial_attention_reduction: int | tuple[int, int, int] = 4,
+        spatial_attention_window: tuple[int, int, int] = (4, 8, 8),
         pool_stride: int | tuple[int, int, int] = 2,
         n_anisotropic: int = 2,
         stem: str = "stride",
@@ -296,8 +537,12 @@ class TemporalUNet3D(nn.Module):
                 return _conv_block(c_in, c_out, stride=stride, norm=norm)
             return _res_stage(c_in, c_out, n_blocks, stride=stride, norm=norm)
 
+        # The deepest `spatial_attention_stages` stages carry a spatial block.
+        first_spatial = n_stages - max(0, int(spatial_attention_stages))
+
         self.encoder_blocks = nn.ModuleList()
         self.temporal_blocks = nn.ModuleList()
+        self.spatial_blocks = nn.ModuleList()
         for i, ch in enumerate(layers):
             stride = stem_conv_stride if i == 0 else (1, 1, 1)
             self.encoder_blocks.append(
@@ -307,6 +552,15 @@ class TemporalUNet3D(nn.Module):
                 self.temporal_blocks.append(nn.Identity())
             else:
                 self.temporal_blocks.append(_TemporalAttention(ch))
+            self.spatial_blocks.append(
+                spatial_attention_block(
+                    spatial_attention if i >= first_spatial else "none",
+                    ch,
+                    n_heads=spatial_attention_heads,
+                    reduction=spatial_attention_reduction,
+                    window=spatial_attention_window,
+                )
+            )
             prev = ch
 
         # One pool per stage; stage 0's step already belongs to the stem, so its
@@ -380,8 +634,8 @@ class TemporalUNet3D(nn.Module):
         x = self.stem(x)
 
         skips: list[torch.Tensor] = []
-        for i, (pool, block, temporal) in enumerate(
-            zip(self.pools, self.encoder_blocks, self.temporal_blocks)
+        for i, (pool, block, temporal, spatial) in enumerate(
+            zip(self.pools, self.encoder_blocks, self.temporal_blocks, self.spatial_blocks)
         ):
             if self.verbose >= 1:
                 print(f"TemporalUNet3D - Encoder Block {i} - Input shape: {x.shape}")
@@ -391,6 +645,9 @@ class TemporalUNet3D(nn.Module):
             # Attention mixes the frames of one window, so it needs the time axis back.
             if not isinstance(temporal, nn.Identity):
                 x = temporal(x.reshape(B, T, *x.shape[1:])).reshape(B * T, *x.shape[1:])
+            # The spatial block works one frame at a time, so it stays folded.
+            if not isinstance(spatial, nn.Identity):
+                x = self._run(spatial, x)
             if i < len(self.encoder_blocks) - 1:
                 skips.append(x)
 

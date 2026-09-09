@@ -54,6 +54,28 @@ class EdgeDataset(Dataset):
             every frame otherwise biases every distance and every rank feature.
         require_links: keep only windows the ground truth can supervise. Off for
             prediction, where every frame pair has to be scored.
+        time_flip_p: probability of running a window backwards -- the frames
+            relabelled in reverse, so what was the parent becomes the child.
+            Unlike the spatial flips this is *not* an exact symmetry, and the
+            asymmetry is worth stating: reversed, a dividing parent becomes two
+            cells merging into one, which forward time never contains and which
+            is the one structural fact this ground truth obeys without exception
+            (6358/6358 children have exactly one parent). Divisions are 0.09% of
+            parents here, so the corruption is small, but it is a corruption --
+            the augmentation trades a little of that prior for a doubling of the
+            motion patterns each window shows. Off by default.
+        division_weight: what each link of a *dividing* parent is worth. Divisions
+            are 0.13% of the annotation, so at weight 1 the model barely learns
+            them -- see edge_transformer/targets.py.
+        pl_weight: what a pseudo-labelled edge is worth against an annotated
+            one, 0 to ignore them. The pseudo-labels themselves come from
+            ``video.pl_links`` (``data.pseudo_links``), already vetoed against
+            the annotation; this is only the price. They are the model's own
+            output from a previous round, so they carry its mistakes as well as
+            its knowledge -- the weight is how much of that risk is accepted in
+            exchange for reaching the ~99% of the graph the annotation cannot.
+            The per-frame cap still protects only *annotated* endpoints, so a
+            capped frame samples pseudo-labelled ones like any other node.
         use_conf_score: feed the detector's per-node confidence -- the
             ``node_probs`` array ``main_predict.py`` writes -- to the model, as
             a node feature and as three edge features. The detection threshold
@@ -78,6 +100,9 @@ class EdgeDataset(Dataset):
         flip_p: float = 0.5,
         rot_p: float = 0.5,
         jitter_um: float = 0.3,
+        time_flip_p: float = 0.0,
+        pl_weight: float = 0.0,
+        division_weight: float = 1.0,
         seed: int = 0,
     ):
         self.videos = videos
@@ -94,6 +119,9 @@ class EdgeDataset(Dataset):
         self.flip_p = float(flip_p)
         self.rot_p = float(rot_p)
         self.jitter_um = float(jitter_um)
+        self.time_flip_p = float(time_flip_p)
+        self.pl_weight = float(pl_weight)
+        self.division_weight = float(division_weight)
         self.seed = int(seed)
 
         self.windows = build_windows(videos, self.window_size, require_links)
@@ -138,6 +166,7 @@ class EdgeDataset(Dataset):
 
     def build(
         self, video_idx: int, t_start: int, rng=None, keep_annotated: bool = True,
+        time_flip: bool | None = None,
     ) -> dict:
         """The candidate graph for one window, as plain tensors.
 
@@ -153,6 +182,10 @@ class EdgeDataset(Dataset):
         ``predict.score_video`` always passes ``False`` for exactly that reason;
         this default only serves ``__getitem__``, i.e. training and its
         window-level (not video-level) validation.
+
+        ``time_flip`` runs the window backwards -- see ``time_flip_p``. ``None``
+        draws it, which is what training wants; prediction passes it explicitly
+        because TTA needs both directions of the *same* window, not a coin toss.
         """
         if rng is None:
             # Prediction has to be reproducible: when the per-frame cap bites it
@@ -198,6 +231,18 @@ class EdgeDataset(Dataset):
         node_row = np.concatenate(node_row)
         node_global = np.concatenate(node_global)
 
+        # The window is assembled forwards above -- `forced` and `node_of` both
+        # read video.links[t], which is indexed by real frame -- and reversed
+        # here, once, by relabelling the frame each node sits in. Everything
+        # after this point derives direction from `frame_idx` alone: the drift
+        # is estimated the new way round, `build_candidates` proposes parent ->
+        # child in the new ordering, and delta_t stays +1. Only the ground truth
+        # has to be told, which is the swap below.
+        if time_flip is None:
+            time_flip = self.augment and rng.random() < self.time_flip_p
+        if time_flip:
+            frame_idx = (len(frames) - 1) - frame_idx
+
         pos_um = to_microns(video.coords[rows, 1:4])
         emb = None if video.emb is None else video.emb[rows]
         # Left out of _augment_positions on purpose: the augmentations are rigid
@@ -221,7 +266,20 @@ class EdgeDataset(Dataset):
         n_nodes = len(pos_um)
 
         links = window_links(video, frames, node_of)
-        target, supervised, n_missed = edge_targets(edges, links, n_nodes)
+        pl = (
+            window_links(video, frames, node_of, video.pl_links)
+            if self.pl_weight > 0 and video.pl_links else []
+        )
+        # window_links speaks real time, so under a flip each link points the
+        # other way through the window. A dividing parent becomes two links into
+        # one node, which forward time never contains -- see time_flip_p.
+        if time_flip:
+            links = [(b, a) for a, b in links]
+            pl = [(b, a) for a, b in pl]
+        target, supervised, weight, n_missed = edge_targets(
+            edges, links, n_nodes, pl_links=pl, pl_weight=self.pl_weight,
+            division_weight=self.division_weight,
+        )
 
         return {
             "node_feats": torch.from_numpy(
@@ -244,10 +302,15 @@ class EdgeDataset(Dataset):
             ),
             "edge_target": torch.from_numpy(target),
             "edge_supervised": torch.from_numpy(supervised),
+            "edge_weight": torch.from_numpy(weight),
             "n_missed_links": int(n_missed),
             "n_links": len(links),
+            "n_pl_links": len(pl),
             "video_idx": int(video_idx),
             "t_start": int(t_start),
+            # Read by predict.score_video to put a flipped window's edges back
+            # into real time before averaging them with the forward pass.
+            "time_flip": bool(time_flip),
             "name": f"{video.name}_t{t_start}",
         }
 
@@ -320,7 +383,8 @@ def collate_graphs(items: list[dict]) -> dict:
         return torch.stack(out)
 
     node_keys = ("node_feats", "node_pos", "node_t", "node_row", "node_global")
-    edge_keys = ("edge_index", "edge_pos", "edge_feats", "edge_target")
+    edge_keys = ("edge_index", "edge_pos", "edge_feats", "edge_target",
+                 "edge_weight")
 
     batch = {k: pad([b[k] for b in items], n_max) for k in node_keys}
     batch.update({k: pad([b[k] for b in items], e_max) for k in edge_keys})
@@ -334,7 +398,7 @@ def collate_graphs(items: list[dict]) -> dict:
         [b["edge_supervised"] for b in items], e_max
     ) & batch["edge_mask"]
 
-    for key in ("n_missed_links", "n_links", "video_idx", "t_start"):
+    for key in ("n_missed_links", "n_links", "n_pl_links", "video_idx", "t_start"):
         batch[key] = torch.tensor([b[key] for b in items])
     batch["name"] = [b["name"] for b in items]
     return batch

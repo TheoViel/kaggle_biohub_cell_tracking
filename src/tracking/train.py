@@ -462,6 +462,21 @@ def _model_config(args) -> dict:
         "unet_n_anisotropic": getattr(args, "unet_n_anisotropic", 2),
         "unet_n_decode_steps": getattr(args, "unet_n_decode_steps", None),
         "unet_temporal_attention": bool(getattr(args, "unet_temporal_attention", True)),
+        # "none" is the pre-upgrade architecture, so a checkpoint written before
+        # these keys existed still rebuilds the model it was saved from.
+        "unet_spatial_attention": getattr(args, "unet_spatial_attention", "none"),
+        "unet_spatial_attention_stages": int(
+            getattr(args, "unet_spatial_attention_stages", 1)
+        ),
+        "unet_spatial_attention_heads": int(
+            getattr(args, "unet_spatial_attention_heads", 4)
+        ),
+        "unet_spatial_attention_reduction": getattr(
+            args, "unet_spatial_attention_reduction", 4
+        ),
+        "unet_spatial_attention_window": list(
+            getattr(args, "unet_spatial_attention_window", (4, 8, 8))
+        ),
         "unet_blocks_per_stage": (
             list(b) if (b := getattr(args, "unet_blocks_per_stage", None)) else None
         ),

@@ -20,12 +20,4 @@ cd src
 # torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" main_contrastive.py --backbone vit_small_patch16_dinov3.lvd1689m
 
 
-torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" inference_contrastive.py --exp_folder ../logs/contrastive/2026-09-07/3/ --coords_log_folder ../logs/2026-09-07/4/preds_r6_0.50/
-
-torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" inference_contrastive.py --exp_folder ../logs/contrastive/2026-09-08/1/ --coords_log_folder ../logs/2026-09-07/4/preds_r6_0.50/
-
-torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" inference_contrastive.py --exp_folder ../logs/contrastive/2026-09-08/2/ --coords_log_folder ../logs/2026-09-07/4/preds_r6_0.50/
-
-torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" inference_contrastive.py --exp_folder ../logs/contrastive/2026-09-08/3/ --coords_log_folder ../logs/2026-09-07/4/preds_r6_0.50/
-
-torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" inference_contrastive.py --exp_folder ../logs/contrastive/2026-09-08/0/ --coords_log_folder ../logs/2026-09-07/4/preds_r6_0.50/
+torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" inference_contrastive.py --exp_folder ../logs/contrastive/2026-09-08/0/ --coords_log_folder ../logs/2026-09-08/3/preds_r6_0.50/

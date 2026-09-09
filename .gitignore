@@ -16,5 +16,6 @@ output/
 logs/
 weights/
 dataset/
+dataset_2/
 clean-approach-lightweight-local-cv-no-hack/
 hoct/

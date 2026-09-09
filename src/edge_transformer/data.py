@@ -52,6 +52,8 @@ class VideoData:
     links: dict[int, np.ndarray]                # t -> (K, 3) [src_row, tgt_row, _]
     frames: np.ndarray
     n_gt_added: int = 0                         # unmatched GT nodes appended
+    pl_links: dict[int, np.ndarray] | None = None   # t -> (K, 2), pseudo-labels
+    n_pl_dropped: int = 0                       # pseudo-labels the GT contradicted
 
     @property
     def embed_dim(self) -> int:
@@ -120,6 +122,77 @@ def unmatched_gt_rows(
     return np.concatenate(out) if out else np.zeros(0, int)
 
 
+def pseudo_links(
+    pl_path: Path,
+    coords: np.ndarray,
+    rows_by_frame: dict[int, np.ndarray],
+    links: dict[int, np.ndarray],
+) -> tuple[dict[int, np.ndarray], int]:
+    """A prediction folder's committed edges as per-frame pseudo-labels.
+
+    Returns ``({t: (K, 2) [src_row, tgt_row]}, n_dropped)`` in the same
+    within-frame row indexing ``detection_links`` uses, so the two can be read
+    by the same code.
+
+    **The ground truth vetoes.** Where the annotation names a cell's successor,
+    that cell has no other successor -- and where it names a predecessor, that
+    cell has no other predecessor. Any pseudo-label touching such an endpoint is
+    therefore either wrong or redundant, and both are worth dropping: wrong ones
+    would train the model against the only labels known to be true, and
+    redundant ones would restate a ground-truth link at the pseudo-label's
+    reduced weight. This is the one place a pseudo-label can be checked rather
+    than trusted, which is why it is done here and not left to the loss.
+
+    The rows are the prediction npz's own, which index the *same* node array the
+    nodes folder holds -- ``main_edge_predict`` writes ``video.coords`` back
+    unchanged -- so the alignment is checked rather than assumed.
+    """
+    with np.load(pl_path) as d:
+        pl_coords = np.asarray(d["coords"])
+        edges = np.asarray(d["edges"]).reshape(-1, 4)
+
+    if len(pl_coords) != len(coords) or not np.array_equal(
+        pl_coords.astype(np.int64), np.round(coords).astype(np.int64)
+    ):
+        raise ValueError(
+            f"{pl_path} holds {len(pl_coords)} nodes that do not match the "
+            f"{len(coords)} in the nodes folder. Its edges index rows of its own "
+            "coords, so they mean nothing against a different node set -- "
+            "predict the pseudo-labels from the same nodes_folder this run "
+            "trains on, and without --gt, which appends nodes."
+        )
+    if not len(edges):
+        return {}, 0
+
+    frame_of = coords[:, 0].astype(int)
+    src = edges[:, 0].astype(int)
+    tgt = edges[:, 1].astype(int)
+
+    out: dict[int, np.ndarray] = {}
+    n_dropped = 0
+    for t in np.unique(frame_of[src]):
+        t = int(t)
+        rt, rn = rows_by_frame.get(t), rows_by_frame.get(t + 1)
+        if rt is None or rn is None:
+            continue
+        sel = (frame_of[src] == t) & (frame_of[tgt] == t + 1)
+        if not sel.any():
+            continue
+        # Global row -> the row's position within its frame. rows_by_frame is
+        # ascending, so searchsorted is the inverse of the indexing above.
+        u = np.searchsorted(rt, src[sel])
+        v = np.searchsorted(rn, tgt[sel])
+
+        gt = links.get(t)
+        if gt is not None and len(gt):
+            keep = ~np.isin(u, gt[:, 0]) & ~np.isin(v, gt[:, 1])
+            n_dropped += int((~keep).sum())
+            u, v = u[keep], v[keep]
+        if len(u):
+            out[t] = np.stack([u, v], axis=1).astype(int)
+    return out, n_dropped
+
+
 def load_video(
     name: str,
     node_path: Path,
@@ -128,6 +201,7 @@ def load_video(
     match_um: float = MATCH_UM,
     embeddings_key: str = "embeddings",
     with_gt: bool = False,
+    pl_path: Path | None = None,
 ) -> VideoData:
     """Read one video's nodes, features and GT links.
 
@@ -220,10 +294,15 @@ def load_video(
         detection_links(ds_path, coords, match_um)
         if ds_path.with_suffix(".geff").exists() else {}
     )
+    pl_links, n_pl_dropped = (
+        pseudo_links(pl_path, coords, rows_by_frame, links)
+        if pl_path is not None else (None, 0)
+    )
+
     return VideoData(
         name=name, path=ds_path, coords=coords, emb=emb, conf=conf,
         rows_by_frame=rows_by_frame, links=links, frames=frames,
-        n_gt_added=n_gt_added,
+        n_gt_added=n_gt_added, pl_links=pl_links, n_pl_dropped=n_pl_dropped,
     )
 
 
@@ -238,12 +317,19 @@ def load_videos(
     verbose: bool = False,
     embeddings_key: str = "embeddings",
     with_gt: bool = False,
+    pl_folder: str | Path | None = None,
 ) -> list[VideoData]:
     """Every video of ``embryos`` that has both nodes and a ground-truth graph.
 
     ``with_gt`` is the diagnostic node set -- see :func:`load_video`.
+
+    ``pl_folder`` is a prediction folder (``main_edge_predict.py --pl``) whose
+    committed edges are read as pseudo-labels, vetoed against the annotation --
+    see :func:`pseudo_links`. A video with no file there simply has none, since
+    a partly-predicted folder is a normal state to train from.
     """
     node_files = find_node_files(nodes_folder)
+    pl_files = find_node_files(pl_folder) if pl_folder else {}
     paths = [p for p in list_datasets(Path(data_dir), require_geff=True)
              if embryos is None or any(p.name.startswith(e) for e in embryos)]
 
@@ -255,6 +341,7 @@ def load_videos(
             path.name, node_files[path.name], path,
             use_embeddings=use_embeddings, match_um=match_um,
             embeddings_key=embeddings_key, with_gt=with_gt,
+            pl_path=pl_files.get(path.name),
         )
         if require_links and not video.links:
             continue
@@ -277,6 +364,13 @@ def load_videos(
                     "(node recall is 1 by construction)")
         print(f"- Loaded {len(videos)} videos: {n_nodes} nodes, "
               f"{n_links} ground-truth links attached to them{note}")
+        if pl_folder:
+            n_pl = sum(sum(len(r) for r in (v.pl_links or {}).values()) for v in videos)
+            n_drop = sum(v.n_pl_dropped for v in videos)
+            have = sum(1 for v in videos if v.pl_links)
+            print(f"- Pseudo-labels from {pl_folder}: {n_pl} links over {have} "
+                  f"videos ({n_pl / max(n_links, 1):.0f}x the annotation), "
+                  f"{n_drop} dropped as contradicting or duplicating the GT")
     return videos
 
 
@@ -287,25 +381,32 @@ def build_windows(
 ) -> list[tuple[int, int]]:
     """``(video index, t_start)`` for every trainable window.
 
-    A window with no usable ground-truth link inside it is dropped when
-    ``require_links``: with per-edge supervision it would contribute an exactly
-    zero loss, so it is pure cost. Prediction keeps them -- there the point is
-    to score every frame pair of the video.
+    A window with no usable link inside it is dropped when ``require_links``:
+    with per-edge supervision it would contribute an exactly zero loss, so it is
+    pure cost. Prediction keeps them -- there the point is to score every frame
+    pair of the video.
+
+    A *pseudo*-label counts as a link for that test, and has to: the annotation
+    reaches around one cell a frame, so requiring a ground-truth link is what
+    confines training to the sliver of windows it touches. Admitting the
+    pseudo-labelled ones is most of what training on them buys.
     """
     out: list[tuple[int, int]] = []
     for vi, video in enumerate(videos):
         t_max = int(video.frames.max())
+        pl = video.pl_links or {}
         for t in video.frames.astype(int):
             span = [t + k for k in range(window_size)]
             if span[-1] > t_max or any(s not in video.rows_by_frame for s in span):
                 continue
             if require_links and not any(
-                len(video.links.get(s, ())) for s in span[:-1]
+                len(video.links.get(s, ())) or len(pl.get(s, ()))
+                for s in span[:-1]
             ):
                 continue
             out.append((vi, int(t)))
     if not out:
-        raise ValueError("no window held a ground-truth link")
+        raise ValueError("no window held a ground-truth or pseudo-label link")
     return out
 
 

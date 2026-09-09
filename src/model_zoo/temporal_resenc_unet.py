@@ -29,7 +29,7 @@ from model_zoo.resenc_unet import (
     init_last_norm_before_add_to_zero,
     init_weights_he,
 )
-from model_zoo.temporal_unet import _TemporalAttention
+from model_zoo.temporal_unet import _TemporalAttention, spatial_attention_block
 
 
 class TemporalResEncUNet3D(nn.Module):
@@ -60,6 +60,18 @@ class TemporalResEncUNet3D(nn.Module):
     temporal_attention : bool
         If False, drop the temporal attention blocks entirely and treat the
         window as a batch of independent frames.
+    spatial_attention : {"none", "pooled", "window", "cbam"}
+        A convolutional attention block on the spatial axes after each stage,
+        as in ``TemporalUNet3D``; see ``temporal_unet.spatial_attention_block``.
+    spatial_attention_stages : int
+        How many of the deepest encoder stages carry one. 1 is the bottleneck
+        alone, 0 is off.
+    spatial_attention_heads : int
+        Attention heads, reduced to a divisor of the stage width.
+    spatial_attention_reduction : int or (int, int, int)
+        ``"pooled"`` only: the stride of the K/V convolution.
+    spatial_attention_window : (int, int, int)
+        ``"window"`` only: the window each voxel attends inside.
     pool_stride : int or (int, int, int)
         The anisotropic downsampling stride, applied to the first
         ``n_anisotropic`` steps.  ``(1, 2, 2)`` pools Y/X only, keeping Z at
@@ -92,6 +104,11 @@ class TemporalResEncUNet3D(nn.Module):
         gradient_checkpointing: bool = False,
         skip_fullres_temporal: bool = True,
         temporal_attention: bool = True,
+        spatial_attention: str = "none",
+        spatial_attention_stages: int = 1,
+        spatial_attention_heads: int = 4,
+        spatial_attention_reduction: int | tuple[int, int, int] = 4,
+        spatial_attention_window: tuple[int, int, int] = (4, 8, 8),
         pool_stride: int | tuple[int, int, int] = 2,
         n_anisotropic: int = 2,
         stem_strides: bool = True,
@@ -173,6 +190,23 @@ class TemporalResEncUNet3D(nn.Module):
         self.apply(init_weights_he)
         self.apply(init_last_norm_before_add_to_zero)
 
+        # After the He init, not before: it walks every Conv3d in the module and
+        # would overwrite the zero-initialised output projection each attention
+        # block relies on to start out as the identity.
+        first_spatial = n_stages - max(0, int(spatial_attention_stages))
+        self.spatial_blocks = nn.ModuleList(
+            [
+                spatial_attention_block(
+                    spatial_attention if i >= first_spatial else "none",
+                    ch,
+                    n_heads=spatial_attention_heads,
+                    reduction=spatial_attention_reduction,
+                    window=spatial_attention_window,
+                )
+                for i, ch in enumerate(layers)
+            ]
+        )
+
     def _run(self, block: nn.Module, x: torch.Tensor) -> torch.Tensor:
         if self.gradient_checkpointing and self.training:
             return _grad_ckpt(block, x, use_reentrant=False)
@@ -189,11 +223,16 @@ class TemporalResEncUNet3D(nn.Module):
         x = self._run(self.encoder.stem, x)
 
         skips: list[torch.Tensor] = []
-        for i, (stage, temporal) in enumerate(zip(self.encoder.stages, self.temporal_blocks)):
+        for i, (stage, temporal, spatial) in enumerate(
+            zip(self.encoder.stages, self.temporal_blocks, self.spatial_blocks)
+        ):
             x = self._run(stage, x)
             # Attention mixes the frames of one window, so it needs the time axis back.
             if not isinstance(temporal, nn.Identity):
                 x = temporal(x.reshape(B, T, *x.shape[1:])).reshape(B * T, *x.shape[1:])
+            # The spatial block works one frame at a time, so it stays folded.
+            if not isinstance(spatial, nn.Identity):
+                x = self._run(spatial, x)
             skips.append(x)
 
             if self.verbose >= 1:

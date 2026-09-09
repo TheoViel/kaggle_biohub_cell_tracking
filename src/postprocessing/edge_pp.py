@@ -134,7 +134,7 @@ def assign(coords, cand, threshold=0.4, flow_weight=0.0, flow_k=30,
            flow_passes=2, max_residual=np.inf, emb=None, emb_weight=0.0,
            emb_momentum=0.0, vel_weight=0.0, vel_momentum=0.5,
            vel_max_residual=np.inf, vel_seed_drift=True,
-           cost='logprob', match='hungarian'):
+           cost='logprob', match='hungarian', fork_threshold=None):
     """One-to-one links per consecutive frame pair, over the scored candidates.
 
     Parameters
@@ -188,6 +188,16 @@ def assign(coords, cand, threshold=0.4, flow_weight=0.0, flow_k=30,
     vel_seed_drift : bool
         Give a track with no history yet the field's own drift rather than zero
         -- the embryo slides bodily, so zero is a wrong guess, not a neutral one.
+    fork_threshold : float or None
+        The probability a *second* child must beat for a matched parent to
+        fork. `None` keeps the pure one-to-one assignment, which cannot express
+        a division at all and scores a flat zero on the metric's division term.
+        Set it *below* `threshold`, not above: the true second daughter runs a
+        median 0.368 where the assignment commits at 0.4, which is exactly why
+        it is dropped. The child must be one the Hungarian left unclaimed and a
+        parent may fork once, so nothing is stolen. Distinct from `match="child"`, which removes the constraint
+        instead of pricing it -- measured at 17 division false positives for 0
+        true ones.
     """
     cand = np.asarray(cand, dtype=float).reshape(-1, 5)
     coords = np.asarray(coords)
@@ -281,6 +291,40 @@ def assign(coords, cand, threshold=0.4, flow_weight=0.0, flow_k=30,
 
         keep = _commit(base + penalty, a_rows, b_rows, pi, ci, len(parents),
                        len(children), forbid, match)
+
+        # A second child for a parent the assignment already matched, when the
+        # model scores it above `fork_threshold`.
+        #
+        # This is *not* `match="child"`, which drops the one-to-one constraint
+        # outright and was measured at 17 division false positives for 0 true
+        # ones. The constraint is kept and a fork is priced: the extra link must
+        # still have negative cost after the penalty, the child must be one the
+        # Hungarian left free, and a parent may fork once. The metric pays 0.1 x
+        # division Jaccard and charges a wrong link as one edge false positive
+        # among ~19 000, so the penalty is what sets that exchange rate.
+        if fork_threshold is not None:
+            taken_child = np.zeros(len(coords), bool)
+            taken_child[b_rows[keep]] = True
+            matched_parent = np.zeros(len(coords), bool)
+            matched_parent[a_rows[keep]] = True
+            forked = np.zeros(len(coords), bool)
+            # Highest probability first, and a plain threshold rather than a
+            # penalty added to the log-odds. A penalty can only make a fork
+            # *rarer* than an ordinary link, and the difficulty is the opposite:
+            # the true second daughter runs a median 0.368 where the assignment
+            # commits at 0.4. A penalty of even 0.5 log-odds would demand
+            # p > 0.66 and fire never -- measured, it committed nothing.
+            for i in np.argsort(-p):
+                if p[i] <= fork_threshold:
+                    break
+                a, b = a_rows[i], b_rows[i]
+                if forbid[i] or keep[i] or taken_child[b] or not matched_parent[a] \
+                        or forked[a]:
+                    continue
+                keep[i] = True
+                taken_child[b] = True
+                forked[a] = True
+
         for i in np.flatnonzero(keep):
             out.append((a_rows[i], b_rows[i], p[i], d[i]))
 
@@ -413,6 +457,502 @@ def prune_short(coords, edges, min_track=3, keep_index=False):
     kept[:, 1] = index[kept[:, 1].astype(int)]
     out = (coords[keep], kept)
     return (*out, np.flatnonzero(keep)) if keep_index else out
+
+
+def propose_divisions(
+    coords,
+    edges,
+    cand,
+    min_prob=0.2,
+    max_parent_um=9.0,
+    max_existing_child_um=10.0,
+    max_sister_um=14.0,
+    symmetry_tau=0.6,
+    diverge_um=2.25,
+    require_divergence=True,
+    require_mutual_nn=True,
+    frame_frac_cap=0.0076,
+    global_frac_cap=0.00375,
+    return_stats=False,
+):
+    """Give a parent a second child where the geometry says a cell divided.
+
+    The assignment is a one-to-one matching, so it cannot express a division at
+    all: the score is ``adj_edge_jaccard + 0.1 * division_jaccard`` and this
+    pipeline was scoring a flat 0 on the second term, with `division_fp` at 0 --
+    not wrong divisions, *no* divisions. This is the stage that proposes them.
+
+    The gate stack is the public "safe division" repair (see PublicChanges.md,
+    the 946 Harmonic Fusion notebook), which reached the strongest public score
+    of the family. A parent already holding exactly one committed child may take
+    a second one when every one of these holds:
+
+    * the second child is **free** -- nothing has claimed it as a child. This is
+      not a tunable: a node with two parents is an invalid lineage, and it is
+      also what keeps the stage from stealing a link the assignment made.
+    * ``min_prob`` -- the model's own probability for the parent/second-child
+      pair. **This gate is ours, not the notebook's**: 946 proposes on geometry
+      alone (it has no scored candidate graph), while here every pair carries a
+      probability, and on the true second daughters it runs a median 0.368
+      against a threshold the assignment set at 0.45. That is exactly why they
+      were dropped, and it is the sharpest signal available here.
+    * ``max_parent_um`` / ``max_existing_child_um`` / ``max_sister_um`` --
+      parent-to-candidate, parent-to-first-child and sister-to-sister distances.
+    * ``require_mutual_nn`` -- the candidate must be the free node *nearest the
+      first child*, which is what makes a pair of sisters rather than a cell
+      and an unrelated neighbour.
+    * ``require_divergence`` -- both sisters must themselves have a child at
+      ``t + 2``, and those grandchildren must be at least ``diverge_um`` further
+      apart than the sisters are. A real division separates; two detections of
+      one cell do not.
+    * ``symmetry_tau`` -- the parent must sit between its daughters, not beside
+      one of them: ``|d1 - d2| / mean(d1, d2) <= tau``.
+
+    Then the caps: ``frame_frac_cap`` of the eligible parents in a frame and
+    ``global_frac_cap`` of all nodes, proposals taken in order of
+    ``parent_dist + 0.15 * sister_dist``. Divisions are rare -- 26 in 71 stacks
+    for 44b6, 125 in 128 for 6bba -- so an uncapped stage that fires on 1% of
+    parents is wrong whatever its gates say.
+
+    Runs *before* ``prune_short``: attaching a free detection to a parent puts
+    it in that parent's component, so a second daughter that would have been
+    pruned as a fragment survives on the strength of the link.
+    """
+    coords = np.asarray(coords)
+    edges = np.asarray(edges, float).reshape(-1, 4)
+    stats = {k: 0 for k in (
+        "eligible_parents", "free_children", "prob_rejected", "distance_rejected",
+        "mutual_nn_rejected", "divergence_rejected", "symmetry_rejected",
+        # divergence splits two ways and they want different fixes: a pair whose
+        # sisters simply do not separate enough, and a pair where one sister has
+        # no committed child at t+2 to measure the separation with at all.
+        "divergence_no_grandchild", "divergence_too_close",
+        "proposals", "capped", "added",
+    )}
+    if len(edges) == 0 or len(coords) == 0:
+        return (edges, stats) if return_stats else edges
+
+    p_um = pos_um(coords)
+    frame_of = coords[:, 0].astype(int)
+    src = edges[:, 0].astype(int)
+    tgt = edges[:, 1].astype(int)
+
+    # One committed child per parent is what the Hungarian produces; a parent
+    # with none is a track end and has nothing to divide from.
+    n_children = np.bincount(src, minlength=len(coords))
+    only_child = np.full(len(coords), -1, np.int64)
+    only_child[src[n_children[src] == 1]] = tgt[n_children[src] == 1]
+    has_parent = np.zeros(len(coords), bool)
+    has_parent[tgt] = True
+
+    # The model's opinion on every pair it scored, for the min_prob gate.
+    cand = np.asarray(cand, float).reshape(-1, 5)
+    cand = cand[cand[:, 4] == 1] if len(cand) else cand
+    prob_of = {}
+    for s, t, pr in zip(cand[:, 0].astype(int), cand[:, 1].astype(int), cand[:, 2]):
+        prob_of[(s, t)] = pr
+
+    by_frame = rows_by_frame(coords)
+    committed = {(int(a), int(b)) for a, b in zip(src, tgt)}
+    global_cap = max(1, int(round(len(coords) * global_frac_cap)))
+
+    added = []
+    used_parents, used_children = set(), set()
+    for t in sorted(by_frame):
+        if len(added) >= global_cap:
+            break
+        rows_next = by_frame.get(t + 1)
+        if rows_next is None:
+            continue
+        parents = [int(r) for r in by_frame[t]
+                   if only_child[r] >= 0 and frame_of[only_child[r]] == t + 1]
+        free = [int(r) for r in rows_next if not has_parent[r]]
+        if not parents or not free:
+            continue
+        stats["eligible_parents"] += len(parents)
+        stats["free_children"] += len(free)
+
+        free_pos = p_um[free]
+        tree = cKDTree(free_pos)
+        frame_cap = max(1, int(round(len(parents) * frame_frac_cap)))
+
+        proposals = []
+        for parent in parents:
+            child = int(only_child[parent])
+            child_dist = float(np.linalg.norm(p_um[parent] - p_um[child]))
+            if child_dist > max_existing_child_um:
+                continue
+            # 946 queries with the *first child's* position, not the parent's:
+            # the second daughter is the free node nearest its sister.
+            if require_mutual_nn:
+                _, idx = tree.query(p_um[child])
+                queries = [free[int(idx)]]
+            else:
+                queries = [free[i] for i in tree.query_ball_point(p_um[parent], max_parent_um)]
+
+            for q in queries:
+                if q == child or (parent, q) in committed:
+                    continue
+                prob = prob_of.get((parent, q), 0.0)
+                if prob < min_prob:
+                    stats["prob_rejected"] += 1
+                    continue
+                parent_dist = float(np.linalg.norm(p_um[parent] - p_um[q]))
+                sister_dist = float(np.linalg.norm(p_um[child] - p_um[q]))
+                if parent_dist > max_parent_um or sister_dist > max_sister_um:
+                    stats["distance_rejected"] += 1
+                    continue
+                if require_divergence:
+                    g1, g2 = only_child[child], only_child[q]
+                    if g1 < 0 or g2 < 0 or frame_of[g1] != t + 2 or frame_of[g2] != t + 2:
+                        stats["divergence_rejected"] += 1
+                        stats["divergence_no_grandchild"] += 1
+                        continue
+                    if float(np.linalg.norm(p_um[g1] - p_um[g2])) - sister_dist < diverge_um:
+                        stats["divergence_rejected"] += 1
+                        stats["divergence_too_close"] += 1
+                        continue
+                if symmetry_tau > 0:
+                    denom = max((child_dist + parent_dist) / 2.0, 1e-6)
+                    if abs(child_dist - parent_dist) / denom > symmetry_tau:
+                        stats["symmetry_rejected"] += 1
+                        continue
+                proposals.append(
+                    (parent_dist + 0.15 * sister_dist, parent, q, prob, parent_dist)
+                )
+
+        stats["proposals"] += len(proposals)
+        proposals.sort(key=lambda item: item[0])
+        added_here = 0
+        for _, parent, q, prob, parent_dist in proposals:
+            if len(added) >= global_cap or added_here >= frame_cap:
+                stats["capped"] += 1
+                break
+            if q in used_children or has_parent[q] or parent in used_parents:
+                continue
+            added.append((parent, q, prob, parent_dist))
+            used_children.add(q)
+            used_parents.add(parent)
+            has_parent[q] = True
+            added_here += 1
+
+    stats["added"] = len(added)
+    if added:
+        edges = np.vstack([edges, np.asarray(added, float)])
+    return (edges, stats) if return_stats else edges
+
+
+def merge_shadow_forks(
+    coords,
+    edges,
+    radius=7.0,
+    min_shadow=3,
+    shadow_frac=0.6,
+    max_sister_um=14.0,
+    global_frac_cap=0.00375,
+    return_stats=False,
+):
+    """Rejoin a division that the detector split into two parallel tracks.
+
+    `merge_duplicate_parents` had the right diagnosis and the wrong instrument.
+    In 34 of the 151 annotated divisions the second daughter is already claimed
+    by a *duplicate detection of the same parent cell*, so the fork exists in
+    the graph but no node carries it -- and a one-frame distance test cannot
+    tell that duplicate from an ordinary neighbour, because both sit at 6-11 um.
+    Merging on distance alone fired 10 508 times for 34 opportunities.
+
+    Time tells them apart. A cell found twice produces two tracks that **shadow
+    each other** -- within a cell's width, frame after frame, for as long as both
+    detections survive. That is `dedup.suppress_parallel`'s signature, and it is
+    the one this uses.
+
+    What makes it a *division* rather than a plain duplicate is how the
+    shadowing **ends**. When the cell divides, one copy follows one daughter and
+    the other copy follows the other, and the two tracks separate for good. So:
+
+        ...a-a-a-a-a          two tracks within `radius` for >= min_shadow
+        ...b-b-b-b-b          consecutive frames, then at t+1
+                   \\
+                    a'         they part, and a' and b' are within
+                    b'         max_sister_um of each other
+
+    `shadow_frac` is what keeps that from firing on any two neighbours that
+    happen to drift together: the run has to be most of the shorter track's
+    life, not merely `min_shadow` frames of it.
+
+    The last shadowed frame is the division. The loser's child link is re-pointed
+    onto the winner, which then forks; the loser's own history is left dangling
+    and `prune_short` collects it, which also removes the duplicate detections
+    from the node count.
+
+    Nothing is invented: both edges keep the probability the model gave them.
+    """
+    coords = np.asarray(coords)
+    edges = np.asarray(edges, float).reshape(-1, 4)
+    stats = {k: 0 for k in ("shadow_pairs", "too_short", "no_split",
+                            "sister_rejected", "merged")}
+    if len(edges) == 0 or len(coords) == 0:
+        return (edges, stats) if return_stats else edges
+
+    p_um = pos_um(coords)
+    frame_of = coords[:, 0].astype(int)
+    src, tgt = edges[:, 0].astype(int), edges[:, 1].astype(int)
+    label = _components(len(coords), edges)
+    track_len = np.bincount(label, minlength=len(coords))[label]
+
+    n_children = np.bincount(src, minlength=len(coords))
+    only_child = np.full(len(coords), -1, np.int64)
+    single = n_children[src] == 1
+    only_child[src[single]] = tgt[single]
+    edge_of_parent = np.full(len(coords), -1, np.int64)
+    edge_of_parent[src[single]] = np.flatnonzero(single)
+
+    by_frame = rows_by_frame(coords)
+    # Which frames each pair of tracks shadows in, and which nodes carried it.
+    shadow: dict[tuple[int, int], dict[int, tuple[int, int]]] = {}
+    for t, rows in by_frame.items():
+        if len(rows) < 2:
+            continue
+        pairs = cKDTree(p_um[rows]).query_pairs(radius, output_type="ndarray")
+        for i, j in pairs:
+            u, v = int(rows[i]), int(rows[j])
+            lu, lv = int(label[u]), int(label[v])
+            if lu == lv:
+                continue
+            key = (lu, lv) if lu < lv else (lv, lu)
+            shadow.setdefault(key, {})[t] = (u, v) if lu < lv else (v, u)
+
+    global_cap = max(1, int(round(len(coords) * global_frac_cap)))
+    moved: dict[int, int] = {}
+    spent: set[int] = set()
+
+    for (la, lb), frames in sorted(shadow.items(), key=lambda kv: -len(kv[1])):
+        if len(moved) >= global_cap:
+            break
+        stats["shadow_pairs"] += 1
+        ts = sorted(frames)
+        # the run of consecutive shadowed frames that ends the shadowing
+        run_end = ts[-1]
+        run = 1
+        while run < len(ts) and ts[-1 - run] == run_end - run:
+            run += 1
+        # The run must also be most of the pair's shared life. Two unrelated
+        # neighbours drift within `radius` for a few frames all the time; a
+        # duplicate shadows its original for essentially the whole overlap.
+        span_a = int(track_len[frames[ts[0]][0]])
+        span_b = int(track_len[frames[ts[0]][1]])
+        if run < min_shadow or run < shadow_frac * min(span_a, span_b):
+            stats["too_short"] += 1
+            continue
+        t = run_end
+        a_t, b_t = frames[t]
+        if la in spent or lb in spent:
+            continue
+        ca, cb = int(only_child[a_t]), int(only_child[b_t])
+        # Both copies must carry the parent forward, into different nodes, and
+        # those must be the frame after -- that pair is the division.
+        if ca < 0 or cb < 0 or ca == cb:
+            stats["no_split"] += 1
+            continue
+        if frame_of[ca] != t + 1 or frame_of[cb] != t + 1:
+            stats["no_split"] += 1
+            continue
+        sister = float(np.linalg.norm(p_um[ca] - p_um[cb]))
+        if sister > max_sister_um or sister <= radius:
+            # <= radius means they never actually parted: a plain duplicate,
+            # not a division, and dropping one is `prune_short`'s business.
+            stats["sister_rejected"] += 1
+            continue
+        keep_node, drop_node = (a_t, b_t)
+        if track_len[b_t] > track_len[a_t]:
+            keep_node, drop_node = b_t, a_t
+        row = int(edge_of_parent[drop_node])
+        if row < 0:
+            continue
+        moved[row] = keep_node
+        spent.update((la, lb))
+        stats["merged"] += 1
+
+    if moved:
+        edges = edges.copy()
+        for row, keep in moved.items():
+            edges[row, 0] = keep
+            edges[row, 3] = float(np.linalg.norm(
+                p_um[keep] - p_um[int(edges[row, 1])]))
+    return (edges, stats) if return_stats else edges
+
+
+def merge_duplicate_parents(
+    coords,
+    edges,
+    max_dup_um=7.0,
+    max_parent_um=9.0,
+    max_sister_um=14.0,
+    symmetry_tau=0.6,
+    diverge_um=3.0,
+    require_divergence=True,
+    require_mutual=True,
+    global_frac_cap=0.00375,
+    return_stats=False,
+):
+    """Pull a division that got split across two duplicate detections onto one node.
+
+    `propose_divisions` can only use a second daughter nothing has claimed, and
+    `diag_divisions.py` says that is where most of the recall goes: of 151
+    annotated divisions, 59 fail because the second daughter already has a
+    parent. Those are not assignment mistakes -- the model gives the rival a
+    median probability of 0.719 for her against our parent's 0.016 -- and in
+    **34 of the 59 the rival is itself a detection of the same annotated parent
+    cell**. The graph is over-detected, the dividing cell was found twice, and
+    the two copies took one daughter each. The fork is already there; it is just
+    spread over two nodes, and the metric wants one node of out-degree 2.
+
+    So this moves the second copy's child onto the first copy rather than
+    inventing a link. Both parents keep the probability the model gave their own
+    child, which is the point: no link here is a guess.
+
+    **Measured, and it does not work -- off by default.** The premise is sound
+    and the execution is not: "the same cell, found twice" is not recoverable
+    from geometry at these radii. The rival pairs sit at p25 6.3 um and median
+    8.1, and so do thousands of genuinely distinct neighbours, so a 7 um merge
+    fires 10 508 times across 199 stacks for 34 reachable divisions. Requiring
+    both parents *and* both daughters to be mutual nearest neighbours cuts that
+    to 6 324 and division false positives from 114 to 85, still 200x too loose.
+    On the fold: the stage alone is -0.0001, and in front of `propose_divisions`
+    it takes +0.0114 down to +0.0077. Kept because the diagnosis behind it is
+    solid and a real duplicate test -- `dedup.suppress_parallel`'s shadow-track
+    signature, which watches a pair over its whole life rather than one frame --
+    could still make it pay. Do not switch it on without one.
+
+    ``max_dup_um`` is what makes a pair of parents "the same cell". It should sit
+    near the detector's NMS radius -- two peaks it left standing are, by
+    construction, at least that far apart -- and the measured separation of these
+    rival pairs is p25 6.3 um, median 8.1.
+
+    The loser keeps its own history and simply ends there; `prune_short` removes
+    it if what is left is a fragment, which also takes a duplicate detection out
+    of the node count.
+
+    Returns the edges with those child links re-pointed. Runs before
+    `propose_divisions`, which then works on what is genuinely unclaimed.
+    """
+    coords = np.asarray(coords)
+    edges = np.asarray(edges, float).reshape(-1, 4)
+    stats = {k: 0 for k in (
+        "pairs_considered", "not_mutual", "sister_rejected", "parent_rejected",
+        "divergence_rejected", "symmetry_rejected", "merged",
+    )}
+    if len(edges) == 0 or len(coords) == 0:
+        return (edges, stats) if return_stats else edges
+
+    p_um = pos_um(coords)
+    frame_of = coords[:, 0].astype(int)
+    src = edges[:, 0].astype(int)
+    tgt = edges[:, 1].astype(int)
+
+    n_children = np.bincount(src, minlength=len(coords))
+    only_child = np.full(len(coords), -1, np.int64)
+    single = n_children[src] == 1
+    only_child[src[single]] = tgt[single]
+    # Which edge row carries each parent's single child, so it can be re-pointed.
+    edge_of_parent = np.full(len(coords), -1, np.int64)
+    edge_of_parent[src[single]] = np.flatnonzero(single)
+
+    by_frame = rows_by_frame(coords)
+    global_cap = max(1, int(round(len(coords) * global_frac_cap)))
+    moved, spent = {}, set()
+
+    for t in sorted(by_frame):
+        if len(moved) >= global_cap:
+            break
+        parents = [int(r) for r in by_frame[t]
+                   if only_child[r] >= 0 and frame_of[only_child[r]] == t + 1]
+        if len(parents) < 2:
+            continue
+        pairs = cKDTree(p_um[parents]).query_pairs(max_dup_um, output_type="ndarray")
+        # "Same cell, found twice" is not a distance -- at these radii thousands
+        # of genuinely distinct cells qualify, and merging on distance alone
+        # costs 114 division false positives for 7 true ones (README_edge.md).
+        # Both copies must be each other's nearest neighbour among *all* nodes of
+        # the frame, and so must the two daughters, which is what a duplicated
+        # detection and its sister pair look like and a crowded neighbourhood
+        # does not.
+        nn_at = {}
+        if require_mutual and pairs.size:
+            for tt in (t, t + 1):
+                rows_tt = by_frame.get(tt)
+                if rows_tt is None or len(rows_tt) < 2:
+                    nn_at[tt] = {}
+                    continue
+                dists, near = cKDTree(p_um[rows_tt]).query(p_um[rows_tt], k=2)
+                nn_at[tt] = {int(rows_tt[i]): int(rows_tt[near[i, 1]])
+                             for i in range(len(rows_tt))}
+
+        cand_pairs = []
+        for i, j in pairs:
+            a, b = parents[i], parents[j]
+            ca, cb = int(only_child[a]), int(only_child[b])
+            if ca == cb:
+                continue
+            if require_mutual:
+                if nn_at.get(t, {}).get(a) != b or nn_at.get(t, {}).get(b) != a:
+                    stats["not_mutual"] += 1
+                    continue
+                if nn_at.get(t + 1, {}).get(ca) != cb or nn_at.get(t + 1, {}).get(cb) != ca:
+                    stats["not_mutual"] += 1
+                    continue
+            cand_pairs.append((float(np.linalg.norm(p_um[a] - p_um[b])), a, b, ca, cb))
+        cand_pairs.sort()
+        stats["pairs_considered"] += len(cand_pairs)
+
+        for _, a, b, ca, cb in cand_pairs:
+            if len(moved) >= global_cap:
+                break
+            if a in spent or b in spent or ca in spent or cb in spent:
+                continue
+            sister_dist = float(np.linalg.norm(p_um[ca] - p_um[cb]))
+            if sister_dist > max_sister_um:
+                stats["sister_rejected"] += 1
+                continue
+            if require_divergence:
+                g1, g2 = only_child[ca], only_child[cb]
+                if g1 < 0 or g2 < 0 or frame_of[g1] != t + 2 or frame_of[g2] != t + 2:
+                    stats["divergence_rejected"] += 1
+                    continue
+                if float(np.linalg.norm(p_um[g1] - p_um[g2])) - sister_dist < diverge_um:
+                    stats["divergence_rejected"] += 1
+                    continue
+            # Whichever copy sits between the two daughters becomes the fork;
+            # the other is the duplicate that gives its child up.
+            keep, drop = (a, b)
+            da = max(np.linalg.norm(p_um[a] - p_um[ca]), np.linalg.norm(p_um[a] - p_um[cb]))
+            db = max(np.linalg.norm(p_um[b] - p_um[ca]), np.linalg.norm(p_um[b] - p_um[cb]))
+            if db < da:
+                keep, drop = b, a
+            d1 = float(np.linalg.norm(p_um[keep] - p_um[ca]))
+            d2 = float(np.linalg.norm(p_um[keep] - p_um[cb]))
+            if max(d1, d2) > max_parent_um:
+                stats["parent_rejected"] += 1
+                continue
+            if symmetry_tau > 0:
+                denom = max((d1 + d2) / 2.0, 1e-6)
+                if abs(d1 - d2) / denom > symmetry_tau:
+                    stats["symmetry_rejected"] += 1
+                    continue
+            row = int(edge_of_parent[drop])
+            if row < 0:
+                continue
+            moved[row] = keep
+            spent.update((a, b, ca, cb))
+            stats["merged"] += 1
+
+    if moved:
+        edges = edges.copy()
+        for row, keep in moved.items():
+            edges[row, 0] = keep
+            edges[row, 3] = float(np.linalg.norm(
+                p_um[keep] - p_um[int(edges[row, 1])]))
+    return (edges, stats) if return_stats else edges
 
 
 def bridge_tracks(coords, edges, max_um=6.0, drift=None, min_len=2):

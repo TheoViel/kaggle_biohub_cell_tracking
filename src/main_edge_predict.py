@@ -24,6 +24,25 @@ detector's misses taken out of it. The scores are an upper bound on a node set
 no submission can have, so they go to ``preds_gt_<threshold>/`` and carry a
 ``gt_augmented`` flag -- they never overwrite or stand in for the real ones.
 
+``--pl`` predicts the fold's **training** embryos instead of its held-out one,
+which is the graph a pseudo-labelling round consumes: the annotation reaches
+~1 cell a frame against ~260 detections, so the overwhelming majority of the
+candidate graph never enters the loss, and this is what fills it in. Written to
+``preds_pl_<threshold>/`` beside the honest predictions.
+
+Those predictions are **in-sample** -- the model trained on these stacks -- so
+the scores printed for them are leaky and are labelled as such. That is a
+property of the labels too, not just of the report: a model recalls its own
+training data better than it generalises, so pseudo-labels taken this way are
+optimistic and will look more confident than they deserve. When every fold has
+been trained, the plain out-of-fold run (no ``--pl``) already covers every stack
+with a model that held it out, and those are the better labels; ``--pl`` is for
+when only one fold exists, or when the leak is an accepted cost.
+
+``--post_process`` chains ``main_edge_postprocess.py`` onto the threshold the
+sweep ranked best, so the number that matters -- post-processing is worth more
+here than any model change -- comes out of the same command.
+
 Mirrors ``main_predict.py``: every fold in the run's ``selected_folds`` is
 predicted in turn, each against its own held-out embryo, using the fold's
 ``fold_<n>/ckpt_final.pt``. Since the folds' val embryos are disjoint, one pass
@@ -50,6 +69,8 @@ which re-decides every link from flow-corrected geometry alone (its
 import argparse
 import json
 import os
+import subprocess
+import sys
 import warnings
 from pathlib import Path
 
@@ -120,6 +141,34 @@ def parse_args():
                         "scores are an upper bound, and they are written to "
                         "preds_gt_<threshold>/ so they cannot be mistaken for, "
                         "or overwrite, the honest ones")
+    p.add_argument("--pl", action="store_true",
+                   help="predict the fold's TRAINING embryos instead of its "
+                        "held-out one, to harvest pseudo-labels for the ~99%% of "
+                        "the candidate graph the sparse annotation never "
+                        "reaches. Writes preds_pl_<threshold>/. The model "
+                        "trained on these stacks, so both the labels and the "
+                        "scores printed for them are optimistic -- when every "
+                        "fold is trained, the plain out-of-fold run already "
+                        "covers every stack without the leak")
+    p.add_argument("--tta", action="store_true",
+                   help="score every window a second time with time reversed "
+                        "and fuse the two, mapping the reversed edges back "
+                        "to real time first. One extra forward per window; "
+                        "worth most on a model trained with time_flip_p > 0")
+    p.add_argument("--tta_fusion", choices=("harmonic", "mean"), default="harmonic",
+                   help="how --tta combines the two directions. 'harmonic' is "
+                        "dominated by whichever direction is less convinced, so "
+                        "it demands mutual support; 'mean' averages them, which "
+                        "barely moves a pair the two agree on")
+    p.add_argument("--tta_weight", type=float, default=0.5,
+                   help="weight on the reversed direction, in (0, 1). 0.5 is "
+                        "the symmetric mean; lower trusts the forward pass "
+                        "more, which is the safer setting for a model trained "
+                        "without time_flip_p")
+    p.add_argument("--post_process", "--post-process", action="store_true",
+                   dest="post_process",
+                   help="run main_edge_postprocess.py on the threshold the "
+                        "sweep ranked best, once it is known")
     p.add_argument("--limit", type=int, default=None, help="first N videos only")
     p.add_argument("--no_fp16", action="store_true")
     p.add_argument("--no_score", action="store_true",
@@ -135,8 +184,8 @@ def _latest_run(base_dir: Path) -> Path:
     return candidates[-1].parent
 
 
-def _print_sweep(summaries: dict) -> None:
-    """Rank the swept thresholds, best first, so the choice is one glance.
+def _ranked_by(summary: dict) -> tuple[str | None, float]:
+    """``(metric name, value)`` a threshold is judged on.
 
     On ``score``, the competition metric, and not on ``edge_jaccard``: the
     latter ignores both the node-count adjustment and the division term, and
@@ -147,23 +196,32 @@ def _print_sweep(summaries: dict) -> None:
     where ``score`` could not be formed, which is what ``_folder_score`` in
     main_edge_postprocess.py does with the same numbers.
     """
-    columns = ("edge_jaccard", "adj_edge_jaccard", "node_recall", "score")
-
-    def ranked_by(th):
-        """``(metric name, value)`` this threshold is judged on."""
+    for key in ("score", "edge_jaccard"):
+        value = summary.get(key, float("nan"))
         # NaN compares False against everything, so a failed threshold would
         # otherwise win by being first. Sink it instead.
-        for key in ("score", "edge_jaccard"):
-            value = summaries[th].get(key, float("nan"))
-            if value == value:
-                return key, float(value)
-        return None, float("-inf")
+        if value == value:
+            return key, float(value)
+    return None, float("-inf")
 
-    def rank(th):
-        return ranked_by(th)[1]
 
-    best = max(summaries, key=rank)
-    metric, best_value = ranked_by(best)
+def _best_threshold(summaries: dict):
+    """The swept threshold that ranks best, as ``(threshold, metric, value)``.
+
+    Shared with ``--post_process`` so the folder it chains onto is the one the
+    table below prints as best, rather than a second opinion that could differ.
+    """
+    if not summaries:
+        return None, None, float("-inf")
+    best = max(summaries, key=lambda th: _ranked_by(summaries[th])[1])
+    metric, value = _ranked_by(summaries[best])
+    return (best, metric, value) if metric else (None, None, float("-inf"))
+
+
+def _print_sweep(summaries: dict) -> None:
+    """Rank the swept thresholds, best first, so the choice is one glance."""
+    columns = ("edge_jaccard", "adj_edge_jaccard", "node_recall", "score")
+    best, metric, best_value = _best_threshold(summaries)
     ranked = metric is not None
 
     print(f"\n{'=' * 78}")
@@ -214,21 +272,27 @@ def main():
     # upper bound taken on a node set no submission can have, and the whole
     # point of running it is to compare against the honest numbers, so
     # overwriting them with it would destroy the comparison it exists to make.
-    stem = "preds_gt" if args.gt else "preds"
+    #
+    # --pl is kept apart for the same reason and one more: its predictions cover
+    # a different set of stacks, so sharing a folder would leave it holding a
+    # mixture of in-sample and out-of-fold graphs with nothing to tell them
+    # apart.
+    stem = "_".join(["preds"] + ["gt"] * bool(args.gt) + ["pl"] * bool(args.pl))
     out_dirs = {
         th: Path(args.out_dir or f"{log_folder}{stem}_{th:.2f}") for th in thresholds
     }
     # An explicit --out_dir escapes the naming above, so check it cannot land on
     # a folder of honest predictions. Refusing a non-empty one is blunt but it
     # is the only rule that does not depend on how the folder was named.
-    if args.gt and args.out_dir:
+    if (args.gt or args.pl) and args.out_dir:
         clashes = [d for d in out_dirs.values() if any(d.glob("*.npz"))]
         if clashes:
+            flag = "--gt" if args.gt else "--pl"
             raise ValueError(
-                f"--gt would write into {clashes[0]}, which already holds "
-                "predictions. Its scores are an upper bound and must not "
-                "replace a real run's; drop --out_dir to use the "
-                "preds_gt_<threshold>/ folders, or name an empty one."
+                f"{flag} would write into {clashes[0]}, which already holds "
+                "predictions. Its scores are not a clean out-of-fold number and "
+                "must not replace one; drop --out_dir to use the "
+                f"{stem}_<threshold>/ folders, or name an empty one."
             )
 
     if ctx.is_main:
@@ -273,6 +337,24 @@ def main():
                 f"--ckpt is one checkpoint, but folds {folds} are selected; "
                 "pass --fold to pick one"
             )
+        # Val splits are disjoint by construction, but *train* splits are not:
+        # with three or more embryos two folds share most of theirs, and each
+        # would overwrite the other's npz with a different model's predictions.
+        # (With two embryos they happen to be disjoint, so this stays quiet.)
+        if args.pl:
+            seen: dict[str, list[int]] = {}
+            for f in folds:
+                for e in EMBRYOS:
+                    if e != EMBRYOS[f]:
+                        seen.setdefault(e, []).append(f)
+            shared = {e: fs for e, fs in seen.items() if len(fs) > 1}
+            if shared:
+                raise ValueError(
+                    "--pl predicts each fold's training embryos, and folds "
+                    f"{folds} share {sorted(shared)} -- the later fold would "
+                    "overwrite the earlier one's npz with a different model's "
+                    "predictions. Pass --fold to run one."
+                )
 
     # Check every fold's checkpoint before running any of them, so a fold whose
     # training never happened is caught before another fold's npz files land.
@@ -302,20 +384,29 @@ def main():
                   "!! Node recall is 1 by construction and every score below is "
                   "an upper bound\n"
                   "!! on a node set no submission can have. Diagnostic only.")
+        if args.pl:
+            print("\n!! --pl: predicting each fold's TRAINING embryos, for "
+                  "pseudo-labels.\n"
+                  "!! The model saw these stacks, so the scores below are "
+                  "in-sample and the\n"
+                  "!! labels are optimistic. Not comparable with an "
+                  "out-of-fold run.")
 
     rows = {th: [] for th in thresholds}
     n_gt_added = 0
     n_videos = 0
     max_nodes_per_frame = None
     for fold in folds:
-        embryos = (
-            [e.strip() for e in args.embryos.split(",") if e.strip()]
-            if args.embryos else [EMBRYOS[fold]]
-        )
+        if args.embryos:
+            embryos = [e.strip() for e in args.embryos.split(",") if e.strip()]
+        elif args.pl:
+            embryos = [e for e in EMBRYOS if e != EMBRYOS[fold]]
+        else:
+            embryos = [EMBRYOS[fold]]
         ckpt_path = args.ckpt or os.path.join(log_folder, f"fold_{fold}", "ckpt_final.pt")
         if ctx.is_main:
             print(f"\n-> fold {fold}: {ckpt_path}")
-            print(f"   val embryos : {embryos}")
+            print(f"   {'train' if args.pl else 'val'} embryos : {embryos}")
 
         model, cfg = load_hoct(ckpt_path, device=device, verbose=ctx.is_main)
         videos = load_videos(
@@ -336,7 +427,9 @@ def main():
             cap = f"{max_nodes_per_frame}/frame" if max_nodes_per_frame else "none"
             print(f"- Nodes {nodes_folder}  cap {cap}, "
                   f"window {dataset.window_size}, threshold(s) "
-                  f"{', '.join(f'{t:g}' for t in thresholds)}\n")
+                  f"{', '.join(f'{t:g}' for t in thresholds)}"
+                  + (f"  [time-flip TTA: {args.tta_fusion} w={args.tta_weight:g}]"
+                     if args.tta else "") + "\n")
 
         # Shard videos across ranks; each writes its own npz files.
         mine = list(range(len(videos)))[ctx.rank :: ctx.world_size]
@@ -345,7 +438,10 @@ def main():
             # One pass over the video answers every threshold: the model scores
             # the candidates, and only the linking below reads the cutoff. The
             # candidate array is likewise threshold-free, so it is built once.
-            scored = score_video(model, dataset, vi, device, fp16=not args.no_fp16)
+            scored = score_video(model, dataset, vi, device,
+                                 fp16=not args.no_fp16, tta=args.tta,
+                                 tta_fusion=args.tta_fusion,
+                                 tta_weight=args.tta_weight)
             candidates = _candidate_array(video, scored)
 
             reported = []
@@ -400,6 +496,13 @@ def main():
                        # still says these are an upper bound.
                        "gt_augmented": bool(args.gt),
                        "n_gt_nodes_appended": int(n_gt_added) if args.gt else 0,
+                       # Likewise: "train" means the model saw these stacks, so
+                       # the numbers beside it are in-sample.
+                       "split": "train" if args.pl else "val",
+                       "pseudo_labels": bool(args.pl),
+                       "tta": bool(args.tta),
+                       "tta_fusion": args.tta_fusion if args.tta else None,
+                       "tta_weight": args.tta_weight if args.tta else None,
                        "overall": summary,
                        "per_sample": {r["sample_name"]: {
                            k: v for k, v in r.items() if k != "sample_name"
@@ -410,6 +513,8 @@ def main():
         print(f"threshold {th:g}  -  {len(th_rows)} stacks  ->  {out_dir}")
         if args.gt:
             print(f"UPPER BOUND: {n_gt_added} unmatched GT nodes appended")
+        if args.pl:
+            print("IN-SAMPLE: the model trained on these stacks")
         print(f"{'=' * 60}")
         for k in ("edge_tp", "edge_fp", "edge_fn"):
             print(f"- {k}: {summary[k]:.0f}")
@@ -419,6 +524,43 @@ def main():
 
     if sweeping and summaries:
         _print_sweep(summaries)
+
+    if args.post_process:
+        _post_process(out_dirs, summaries, thresholds)
+
+
+def _post_process(out_dirs: dict, summaries: dict, thresholds: list[float]) -> None:
+    """Chain ``main_edge_postprocess.py`` onto the best threshold's folder.
+
+    A subprocess rather than an import: that script inserts its own path,
+    parses its own arguments and fans out over a multiprocessing Pool, so
+    calling it the way a person would is both simpler and the thing that stays
+    working when it changes.
+    """
+    best, metric, value = _best_threshold(summaries)
+    if best is None:
+        if len(thresholds) == 1:
+            # Nothing was scored -- --no_score, or no ground truth -- but with a
+            # single threshold there is no choice to make, so honour the flag.
+            best = thresholds[0]
+        else:
+            print("\n-> --post_process: no threshold could be ranked "
+                  "(no scores), so there is no best folder to post-process. "
+                  "Re-run with a single --threshold to name one outright.")
+            return
+    else:
+        print(f"\n-> --post_process: best {metric} {value:.4f} at "
+              f"threshold {best:g}")
+
+    cmd = [sys.executable, str(Path(__file__).with_name("main_edge_postprocess.py")),
+           "--preds_dir", str(out_dirs[best])]
+    print("-> " + " ".join(cmd) + "\n", flush=True)
+    result = subprocess.run(cmd, cwd=str(Path(__file__).resolve().parent))
+    if result.returncode != 0:
+        # Loud, but not fatal: the predictions are already written and scored,
+        # and re-running post-processing alone is cheap.
+        print(f"\n!! post-processing exited {result.returncode}; the "
+              f"predictions in {out_dirs[best]} are unaffected.")
 
 
 def _candidate_array(video, scored):

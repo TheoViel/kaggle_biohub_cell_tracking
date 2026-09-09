@@ -106,7 +106,7 @@ DEFAULTS = {
     "data_dir": TRAIN_DIR,
     "window_size": 2,
     "crop_size": None,  # (16, 64, 64),  # None,  # (16, 64, 64),     # Crop
-    "selected_folds": [1],
+    "selected_folds": [],
     "fullfit": True,
     "fullfit_n_val_videos": 1,     # leaky either way, so keep the eval cheap
 
@@ -118,6 +118,17 @@ DEFAULTS = {
     "unet_n_anisotropic": 2,          # downsampling steps using unet_pool_stride
     "unet_n_decode_steps": 1,         # 1 decoder stage → output at 1/4 Y/X, full-scale Z
     "unet_temporal_attention": True,  # False = encode each frame independently
+    # Convolutional attention on the spatial axes, inside the backbone. The
+    # temporal blocks only mix a voxel with itself across the window's frames,
+    # so without this nothing in the encoder lets two places interact past the
+    # convolution stack's own receptive field. "pooled" attends globally over
+    # convolutionally reduced keys, "window" locally inside fixed windows,
+    # "cbam" only re-weights; "none" is the pre-upgrade architecture.
+    "unet_spatial_attention": "none",   # "none" / "pooled" / "window" / "cbam"
+    "unet_spatial_attention_stages": 1,   # deepest N encoder stages, 0 = off
+    "unet_spatial_attention_heads": 4,
+    "unet_spatial_attention_reduction": 4,      # "pooled": K/V conv stride
+    "unet_spatial_attention_window": (4, 8, 8),  # "window": the attended window
     "unet_blocks_per_stage": (3, 3, 3),    # (1, 3, 4) residual depth per stage;  None = two-conv blocks
     "unet_stem": "unshuffle",         # "unshuffle" keeps every voxel, "stride" drops 3 in 4
     "unet_norm": "batch",             # "batch" / "instance" / "group"
@@ -157,7 +168,7 @@ DEFAULTS = {
 
     # Stage 1 - Synthetic data pretraining
     "synthetic_pretraining": {
-        "enabled": False,
+        "enabled": True,
         "synthetic_dir": "../input/synthetic/v4/",
         "synthetic_proportion": 1,
         "weights": None,
@@ -213,7 +224,7 @@ DEFAULTS = {
     # Stage 1.5 - Pretraining
     "pretraining": {
         "enabled": True,
-        "weights": "../logs/2026-09-01/9/fold_0/ckpt_synthetic.pt",
+        "weights": None,  # "../logs/2026-09-01/9/fold_0/ckpt_synthetic.pt",
         # Data
         "crop_size": (32, 128, 128),
         "aug_strength": 3,

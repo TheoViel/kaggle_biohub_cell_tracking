@@ -47,15 +47,20 @@ from utils.logger import create_logger, prepare_log_folder
 
 DEFAULTS = {
     # Global
-    # "nodes_folder": "../logs/2026-09-02/9/preds_pp/",
-    # "nodes_folder": "../logs/2026-09-07/4/preds_r7_0.50/",
-    "nodes_folder": "../logs/2026-09-07/4/preds_r6_0.50/",
+    "nodes_folder": "../logs/2026-09-07/4/preds_r6_0.50/",  # best
+    # "nodes_folder": "../logs/2026-09-08/0/preds_r6_0.50/",  # + attentio
+    # "nodes_folder": "../logs/2026-09-08/3/preds_r6_0.50/",  # + windowed attention
     # "nodes_folder": "../logs/2026-09-07/4/preds_r6_0.40/",
-    # "embeddings_key": "embeddings_contrastive_2026-09-03_13",
-    "embeddings_key": "embeddings_contrastive_2026-09-07_2",
+    # "embeddings_key": "embeddings_contrastive_2026-09-03_13", # 0.861 (?)
+    # "embeddings_key": "embeddings_contrastive_2026-09-07_2",  # 0.861/2
+    # "embeddings_key": "embeddings_contrastive_2026-09-07_3",  # 0.8623 - vit_base_patch16_224
+    "embeddings_key": "embeddings_contrastive_2026-09-08_0",  # 0.8623 - vit_small_patch8_224
+    # "embeddings_key": "embeddings_contrastive_2026-09-08_1",  # 0.8609 - xcit_tiny_12_p8_224
+    # "embeddings_key": "embeddings_contrastive_2026-09-08_2", # 0.8613 - vit_small_patch14_dinov2
+    # "embeddings_key": "embeddings_contrastive_2026-09-08_3", # 0.8612 - vit_small_patch16_dinov3.lvd1689m
     "data_dir": TRAIN_DIR,
-    "selected_folds": [0] , # [0, 1],
-    "fullfit": False,
+    "selected_folds": [0, 1] , # [0, 1],
+    "fullfit": True,
 
     # Data
     "window_size": 2,               # frames per sample; 2 = one scored frame pair
@@ -64,11 +69,24 @@ DEFAULTS = {
     "n_val_videos": 10,             # also how many videos the full metric scores
     "use_embeddings": True,         # False = geometry alone, as an ablation
 
+    # Divisions are 0.13% of the annotated links (151 across both embryos), so
+    # at their natural frequency the model does not learn them: the true second
+    # child of a division scores a median 0.368 against an ordinary link's 0.45,
+    # the assignment drops it, and the division term of the score -- a full 0.1
+    # of it -- comes back only through post-processing repair. This prices both
+    # links of a dividing parent up in the loss.
+    "division_weight": 10.0,
+
+    # Pseudo-labels
+    "pl_folder": None,  # "../logs/edge_run/2026-09-07/4/preds_pl_0.45/",
+    "pl_weight": 0.,  # Weight in the loss
+
     # Augmentations
     "augment": True,
     "flip_p": 0.5,
     "rot_p": 0.5,
     "jitter_um": 0.3,
+    "time_flip_p": 0.5,  # Run the window backwards
 
     # Candidate graph
     "n_neighbors": 5,               # per node, per frame pair, both directions
@@ -106,15 +124,9 @@ DEFAULTS = {
     "fp16": True,
     "focal_gamma": 2.0,
     "pos_weight": 1.0,
-    "rank_weight": 0.0,  # Weight on the competitor-ranking term in `losses.competitor_rank_loss`.
-    # Weight on the structural term in `losses.degree_loss`: a squared hinge on
-    # every node's expected in-degree (<= 1 parent) and out-degree (<= 2
-    # children), both verified exact on this ground truth. Unlike every other
-    # term it needs no annotation, so it reaches the ~99% of the candidate graph
-    # the sparse labels never touch. Its scale is far above the focal term's --
-    # the log prints it separately as `deg=` -- so start around 0.01.
-    "degree_weight": 0.0,
-    "link_threshold": 0.4,          # for the reported precision/recall and linking
+    "rank_weight": 0.,  # 0.25   # Weight on the competitor-ranking term in `losses.competitor_rank_loss`.
+    "degree_weight": 0.0,   # Weight on the structural term in `losses.degree_loss`
+    "link_threshold": 0.4,  # for the reported precision/recall and linking
     "optimizer_config": {
         "name": "AdamW",
         "lr": 3e-4,

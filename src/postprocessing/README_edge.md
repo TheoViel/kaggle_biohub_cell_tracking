@@ -427,8 +427,12 @@ sparse enough — 5 per node — that the sign decides nearly every pair and the
 magnitude almost never does. `"logprob"` stays the default so `assign` keeps
 reproducing `link_video` exactly.
 
-**One-to-one costs true links, and is still right.** The ground truth has no
-divisions, but the *predictions* are over-detected, so two detections of one
+**One-to-one costs true links, and is still right — for the edge term only.**
+The ground truth *does* have divisions (26 in 44b6, 125 in 6bba); the sentence
+that stood here said it had none, and that error is what left the score's
+division term at zero for this whole chain. See "Divisions" at the end of this
+file. They are 0.13% of the links, so the argument below survives for the edge
+term unchanged. The *predictions* are over-detected, so two detections of one
 cell both legitimately want the same parent and exclusivity forces one to steal
 or go unlinked. Dropping the constraint on the parent side (`match="child"`:
 every child takes its best parent, a parent may keep several children) does
@@ -519,3 +523,274 @@ top of 470 stolen and 336 declined. Two things follow:
   localisation on the annotated cells alone is worth 0.2–0.3 on the hard
   stacks. The centroid-vote head (`--offset_head`) is the real version of this
   and is still unscored.
+
+## Divisions — the term this chain was scoring zero on
+
+The fold score is `adj_edge_jaccard + 0.1 * division_jaccard`, and every number
+above is the first term alone. The second was **0.0**, with `division_fp` also
+**0** — the chain was not proposing divisions and getting them wrong, it was not
+proposing them at all. `assign` solves a one-to-one matching per frame pair, so
+a fork is not something it can express.
+
+The claim in "One-to-one costs true links, and is still right" above, that *the
+ground truth has no divisions*, is **wrong**. It is nearly harmless for the edge
+term — 26 links in 19 826 is 0.13% — and it is what kept anyone from looking at
+the other 10% of the score. The annotation holds:
+
+| embryo | divisions | stacks with ≥1 |
+|---|---|---|
+| 44b6 | 26 | 21 / 71 |
+| 6bba | 125 | 66 / 128 |
+
+`propose_divisions` gives a parent a second child. The gate stack is the public
+"safe division" repair — see `PublicChanges.md`, the 946 Harmonic Fusion
+notebook, the strongest of that family — with one gate that notebook cannot
+have: **the model's own probability for the pair**. 946 works from geometry
+alone because it has no scored candidate graph; here every pair carries a
+probability, and on the true second daughters it runs a median 0.368 against an
+assignment threshold of 0.45. That is precisely why they were being dropped, and
+it is the sharpest single signal in the stage.
+
+All 199 out-of-fold stacks of `logs/edge_run/2026-09-08/13/preds_0.50`, scored
+with the real metric (`exp_divisions.py`, not `fast_score` — see below):
+
+| chain | cv | Δ | 44b6 | 6bba | div tp/fp/fn |
+|---|---|---|---|---|---|
+| no divisions | 0.8323 | — | 0.8624 | 0.8021 | 0/0/151 |
+| `min_prob=0.50` | 0.8378 | +0.0056 | 0.8657 | 0.8099 | 12/19/139 |
+| `min_prob=0.45` | 0.8409 | +0.0086 | 0.8706 | 0.8112 | 18/47/133 |
+| `min_prob=0.40` | 0.8432 | +0.0109 | 0.8745 | 0.8118 | 23/69/128 |
+| **`min_prob=0.40, diverge=3.0`** | **0.8437** | **+0.0114** | 0.8748 | 0.8126 | 21/41/130 |
+| `min_prob=0.35, diverge=3.0` | 0.8440 | +0.0117 | 0.8747 | 0.8133 | 23/47/128 |
+
+**It gains on both embryos**, +0.0123 and +0.0105, which no other stage in this
+file can say — and it costs 0.0004 of adjusted edge Jaccard, because ~2 000
+added edges against 200 000 committed ones is nothing.
+
+**What was tuned, and how flat it is.** `diverge_um` 3.0 over 946's 2.25 is the
+only knob whose gain held its sign on both embryos at both thresholds
+(+0.0007…+0.0009); 4.0 gives it all back. `min_prob` 0.35 and 0.40 are within
+0.0003 and identical on 44b6 — the choice inside that tie is arbitrary and 0.40
+was taken as the conservative end. Read the whole 0.35–0.40 × 2.25–3.0 block as
+one plateau at ≈ +0.011.
+
+**Dropping `require_divergence` is a trap.** It raises true positives from 2 to
+3 on a 12-stack probe and false positives from 6 to 60, for −0.0026. The gate
+that asks the two grandchildren to have separated by `t+2` is what separates a
+division from two detections of one cell.
+
+**The ceiling is not this stage, and part of it is the detector.** Sisters at
+the division frame sit at median 8.98 µm (44b6) and 11.47 µm (6bba), but 22 of
+the 151 pairs are closer than the detector's 7 µm NMS radius. Matching each GT
+daughter to a *distinct* detection:
+
+| | both daughters have their own node | collapsed to one by NMS |
+|---|---|---|
+| 44b6 | 22 / 26 (85%) | 4 (15%) |
+| 6bba | 115 / 125 (92%) | 10 (8%) |
+
+That is 9% of pairs losing a daughter — but it is measured on the *raw* node
+set, and `propose_divisions` runs after `recover`, which interpolates nodes into
+gaps and puts some of them back. On the chain's own output the per-cell picture
+is milder, against the same one-to-one matcher `node_recall` uses:
+
+| role | 44b6 | 6bba |
+|---|---|---|
+| ordinary cells | 0.983 | 0.943 |
+| dividing parents | 1.000 | 0.976 |
+| **daughters, division frame** | **0.942** | **0.932** |
+
+A daughter is 4.1 points below an ordinary cell on 44b6 and 1.1 on 6bba — 3 of
+52 and 17 of 250 cells. The dividing parent itself is detected essentially
+perfectly, which is what one would expect: the crowding exists only after the
+split. So detection is **not** the constraint. Both endpoints are available for
+the large majority of divisions and the stage still converts 15% of them; the
+loss is the gates and the linking, and a division-aware NMS exemption would be
+chasing ~20 cells across 199 stacks. Worth knowing too that the pairs NMS does
+collapse are the closest ones, which the divergence gate would reject anyway —
+the two losses overlap rather than add.
+
+**`fast_score` cannot see any of this.** It computes the edge Jaccard and
+nothing else, so it is blind to the entire division term and reports 0.0000 for
+every row of the table above. Every chain in this file was ranked with it, which
+was safe only because nothing in those chains moved divisions. `exp_divisions.py`
+scores with `tracking_cellmot.metrics.evaluate` instead — the same scorer
+`main_edge_postprocess.py` reports — and caches the base chain per stack so a
+sweep still costs ~35 s over all 199 stacks. **Use it, not `exp_edge_pp.py`, for
+anything that touches divisions.**
+
+### Where the division recall actually goes
+
+`diag_divisions.py` takes every annotated division, locates the predicted parent
+and both daughters, and walks `propose_divisions`' gates in their real order
+against the pair that ought to have been proposed, attributing each division to
+the *first* gate that rejects it. At the shipped settings, over all 151:
+
+| first gate that rejects it | 44b6 | 6bba | all |
+|---|---|---|---|
+| second daughter already has a parent | 11 | 48 | **59** |
+| prob < `min_prob` | 4 | 25 | 29 |
+| divergence (missing grandchild / too close) | 2 | 12 | 14 |
+| symmetry | 1 | 9 | 10 |
+| a daughter not detected | 2 | 8 | 10 |
+| not the mutual nearest neighbour | 2 | 4 | 6 |
+| committed child is neither daughter | 0 | 4 | 4 |
+| parent not detected / no single child / distance | 1 | 5 | 6 |
+| passes every gate | 3 | 10 | 13 |
+
+**The gates are not the constraint and neither is the detector.** Divergence
+rejects 14 and symmetry 10; tightening or reshaping either is worth a handful of
+events. The single largest bucket is that the second daughter is **already
+somebody else's child** — 39% of all divisions — so the stage never sees a free
+node to attach.
+
+Those are not assignment mistakes. On those 59, the model gives the rival parent
+a median probability of **0.719** for the daughter against this parent's
+**0.016**, and in only 11 of 59 does our parent even outscore the rival. The
+assignment is not close to wrong; it is confident.
+
+**What is actually happening: the fork is split across a duplicate.** In **34 of
+the 59** the rival parent is itself a detection matched to the *same annotated
+parent cell*. The graph over-detects, the dividing cell is found twice, and the
+two copies take one daughter each — so the division is already in the graph and
+no node forks. That is 23% of all divisions, the largest recoverable bucket
+here, and `merge_duplicate_parents` is the attempt at it. It does not work; see
+its docstring for the numbers and for the one idea that might.
+
+So the ranked list of what is left, by size: duplicate-split forks (34),
+`min_prob` (29, and lowering it costs more in false positives than it returns —
+0.35 and 0.40 are a plateau), divergence and symmetry (24 between them), missing
+detections (10). Only the first is worth real effort, and it needs a duplicate
+test that geometry at one frame cannot give.
+
+### A classifier over the candidates, instead of the gates
+
+The gates are a conjunction of thresholds — one *point* in precision/recall —
+and the diagnostic above says no single one of them is doing the work. The
+natural answer is to score the candidates and rank them, so
+`div_dataset.py` writes every pair the loose proposer would consider, with
+everything the gates test recorded as a *feature* rather than applied as a
+filter, and `div_classifier.py` fits a shallow gradient boosting over it.
+
+Two numbers frame what is possible before any model is fitted:
+
+- **The candidate set tops out at 48% recall** (73 of 151). A candidate needs a
+  *free* second daughter, and 59 divisions fail exactly that — the
+  duplicate-split problem again. No ranker reaches them.
+- **73 positives, two embryos.** The only honest split is leave-one-embryo-out,
+  which means fitting on 61 and testing on 12, or fitting on 12 and testing on
+  61.
+
+All 199 stacks, real metric, out-of-fold scores:
+
+| selection | cv | Δ | 44b6 | 6bba |
+|---|---|---|---|---|
+| **hand-set gates** | **0.8437** | **+0.0114** | +0.0123 (divJ 0.125, 4 tp / 6 fp) | +0.0105 (divJ 0.106, 17 tp / 35 fp) |
+| classifier, top 20 / stack | 0.8410 | +0.0087 | +0.0134 (divJ 0.135) | +0.0040 (divJ 0.054, 229 fp) |
+| classifier, top 50 / stack | 0.8398 | +0.0076 | **+0.0162** (divJ 0.167, 8 tp) | −0.0011 (divJ 0.039, 693 fp) |
+
+**The gates win, and the reason the classifier loses is the label count, not the
+idea.** The two folds are not comparable experiments. Held out on 44b6 the model
+had 6bba's 61 positives to learn from and it *beat* the gates — +0.0162 against
++0.0123, twice the true divisions. Held out on 6bba it had 44b6's 12 and emitted
+693 false positives. The pooled number is an average over one reasonable fit and
+one hopeless one.
+
+Worth keeping in view when this is next picked up: a model that shipped would
+train on all 73, which is more than the fold that already won had. That is not a
+measurement — with two embryos there is no third to check it on, and believing
+the fold that agrees with you is the error this file warns about elsewhere — but
+it does say where the effort goes. **More labelled divisions is the whole
+problem.** The cheaper half-measure is to let the gates choose the candidates and
+the classifier only rank *within* them, which caps what a bad model can cost at
+the frame/global caps instead of at 693 false positives.
+
+Not wired into `main_edge_postprocess.py`; `div_dataset.py`, `div_classifier.py`
+and `exp_divisions.py --clf_scores` are measurement scaffolding.
+
+**One harness bug worth not repeating.** The classifier path first read its
+scores through a module global set in `main()` and handed to a `Pool`
+initialiser. That works when this module is imported and silently loads nothing
+when it is run as `__main__` — which is the only way it is ever used. Every
+classifier config scored exactly +0.0000, which reads like a clean null result
+and was not one. The path now travels inside the config dict. Any stage here
+whose output is "it changed nothing" deserves one check that it ran at all.
+
+### Three attacks on the division term, and what they measured
+
+Written after the gate diagnostic above pointed at the assignment and the model
+rather than at the gates. All on the 199 out-of-fold stacks of
+`logs/edge_run/2026-09-08/13/preds_0.50`, real metric.
+
+| config | cv | Δ | div tp / fp |
+|---|---|---|---|
+| **gates only (shipped)** | **0.8437** | **+0.0114** | 21 / 41 |
+| + `merge_shadow_forks`, `shadow_frac=0.85` | 0.8437 | +0.0114 | 21 / 41 |
+| + `merge_shadow_forks`, `shadow_frac=0.6` | 0.8431 | +0.0108 | 21 / 61 |
+| `assign(fork_threshold=0.39)` | 0.8043 | −0.0280 | 73 / 3 477 |
+| `assign(fork_threshold=0.35)` | 0.7972 | −0.0351 | 78 / 4 369 |
+| `assign(fork_threshold=0.30)` | 0.7902 | −0.0421 | **85** / 5 289 |
+
+**The single most useful number here is 85.** Letting the assignment fork on
+probability alone recovers **85 of the 151** annotated divisions, four times what
+the tuned gates manage, and it is the worst-scoring row in the table. So the
+earlier reading of the gate diagnostic — that recall is the constraint — was
+wrong. The divisions are findable. `division_jaccard = tp/(tp+fp+fn)` charges
+every false one at full weight, and at 72 true positives the false ones would
+have to come in under ~570 against the 4 202 actually produced. **Precision is
+the whole problem, and it needs roughly a 7x improvement at fixed recall.**
+
+`fork_threshold` is monotone across every value tried, 0.20 through 0.39, always
+toward "do not fork" — there is no operating point, not a badly chosen one.
+
+`merge_shadow_forks` is the temporal duplicate test that `merge_duplicate_parents`
+lacked, and time is the better signal: the distance version cost −0.0037, this
+one −0.0006 at `shadow_frac=0.6` and exactly nothing at 0.85, where it fires 88
+times and changes no metric. Tight enough to be safe is tight enough to be a
+no-op. Both stay off by default.
+
+**Which leaves the model.** Nothing in post-processing can manufacture precision
+that the probabilities do not carry: the true second daughter scores a median
+0.368 and so do thousands of free neighbours. The one lever that attacks this at
+source is `division_weight` in `edge_transformer/targets.py` — divisions are
+0.13% of the annotation, and both links of a dividing parent are now priced up
+in the loss (10.0 in `main_edge.py`). That is implemented and **not yet
+trained**; it is the only untested item of the three, and the only one whose
+mechanism addresses what the table above says is wrong.
+
+### Do the contrastive embeddings know a dividing cell? No.
+
+Before building a division head on the detection UNet -- the natural next step,
+since every division attempt so far has re-arranged the same geometric and
+probability features and precision plateaued -- the cheap version of the
+question: is mitotic appearance decodable from the embeddings already on disk?
+
+126 279 annotated nodes, 148 of them dividing (1:853), leave-one-embryo-out
+logistic regression on the 256-d `embeddings_contrastive_2026-09-08_0`, with the
+detector's own `node_probs` as a control. Positives *and* negatives are both
+restricted to annotated nodes: an unannotated detection's division status is
+unknown, and scoring it as a negative would price a guess as a fact.
+
+| held out | features | AUC | AP vs chance | precision@k |
+|---|---|---|---|---|
+| 44b6 | embeddings | 0.558 | 1.3x | 0/25 |
+| 44b6 | `node_prob` (control) | 0.551 | 1.3x | 0/25 |
+| 6bba | embeddings | **0.435** | 0.9x | 0/123 |
+| 6bba | `node_prob` (control) | 0.582 | 1.2x | 0/123 |
+
+Three ways of saying the same thing: the AUC straddles chance and goes *below*
+it on the larger embryo, which is noise and not a weak effect; precision@k is
+zero on both folds, so not one dividing cell makes it into a budget the size of
+the positive class; and the embeddings do not beat the control, so what little
+they encode is "confidently detected", not mitosis.
+
+**What this does and does not rule out.** It tests these embeddings, not the
+images. The contrastive model is trained to recognise *the same cell across
+frames*, so its objective rewards invariance to temporal appearance change --
+which is exactly what mitotic rounding is. It may be discarding the signal by
+construction. The honest claim is that the cheap path is closed, not that the
+volumes lack the signal; testing that properly means the detection UNet's own
+feature maps at annotated nodes, which needs the images and a GPU.
+
+Probe: `scratchpad/div_embed_probe.py`. Seven embedding keys sit in those npz
+files and only the one the run used was tested.

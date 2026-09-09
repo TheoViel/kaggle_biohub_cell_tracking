@@ -34,11 +34,15 @@ def build_model(cfg: dict, device="cuda"):
     keys = (
         "unet_arch", "unet_out_channels", "unet_layers", "unet_pool_stride",
         "unet_n_anisotropic", "unet_n_decode_steps", "unet_temporal_attention",
+        "unet_spatial_attention", "unet_spatial_attention_stages",
+        "unet_spatial_attention_heads", "unet_spatial_attention_reduction",
+        "unet_spatial_attention_window",
         "unet_blocks_per_stage", "unet_stem", "unet_norm", "unet_hires_fusion",
         "in_channels",
     )
     kwargs = {k: cfg[k] for k in keys if k in cfg}
-    for k in ("unet_layers", "unet_pool_stride", "unet_blocks_per_stage"):
+    for k in ("unet_layers", "unet_pool_stride", "unet_blocks_per_stage",
+              "unet_spatial_attention_window"):
         if kwargs.get(k) is not None:
             kwargs[k] = tuple(kwargs[k])
     kwargs["dropout"] = cfg.get("head_dropout", 0.0)

@@ -111,6 +111,7 @@ def fit(
             edge_feats = batch["edge_feats"].to(device, non_blocking=True)
             target = batch["edge_target"].to(device, non_blocking=True)
             supervised = batch["edge_supervised"].to(device, non_blocking=True)
+            edge_weight = batch["edge_weight"].to(device, non_blocking=True)
 
             with torch.amp.autocast(
                 device_type=device.type, dtype=amp_dtype, enabled=use_amp
@@ -127,6 +128,7 @@ def fit(
                     degree_weight=float(getattr(args, "degree_weight", 0.0)),
                     edge_index=edge_index,
                     edge_mask=edge_mask,
+                    weight=edge_weight,
                     n_nodes=node_feats.shape[1],
                 )
                 loss = result.loss

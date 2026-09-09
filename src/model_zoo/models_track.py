@@ -280,6 +280,11 @@ def define_track_model(
     unet_n_anisotropic: int = 2,
     unet_blocks_per_stage: list[int] | None = None,
     unet_temporal_attention: bool = True,
+    unet_spatial_attention: str = "none",
+    unet_spatial_attention_stages: int = 1,
+    unet_spatial_attention_heads: int = 4,
+    unet_spatial_attention_reduction: int | tuple[int, int, int] = 4,
+    unet_spatial_attention_window: tuple[int, int, int] = (4, 8, 8),
     unet_stem: str = "stride",
     unet_norm: str = "batch",
     unet_hires_fusion: bool = False,
@@ -330,6 +335,25 @@ def define_track_model(
     unet_temporal_attention : bool
         If False, the backbone drops its temporal attention blocks and the
         frames of a window are encoded independently.
+    unet_spatial_attention : {"none", "pooled", "window", "cbam"}
+        Convolutional attention on the spatial axes, inside the backbone. The
+        temporal blocks only ever mix a voxel with itself across frames, so
+        without this nothing in the encoder lets two *places* interact beyond
+        the reach of the convolution stack. ``"pooled"`` attends globally over
+        convolutionally reduced keys, ``"window"`` locally inside fixed windows,
+        ``"cbam"`` re-weights without any pairwise interaction. See
+        ``temporal_unet.spatial_attention_block``.
+    unet_spatial_attention_stages : int
+        How many of the deepest encoder stages carry a block. 1 is the
+        bottleneck alone, 0 turns it off.
+    unet_spatial_attention_heads : int
+        Attention heads, reduced to a divisor of the stage width if it is not
+        one already.
+    unet_spatial_attention_reduction : int or (int, int, int)
+        ``"pooled"`` only: the stride of the convolution the keys and values
+        are read through.
+    unet_spatial_attention_window : (int, int, int)
+        ``"window"`` only: the window each voxel attends inside.
     unet_stem : str
         Temporal backbone only: ``"unshuffle"`` folds the stem's downsampling
         block into the channel axis so no Y/X detail is dropped before the
@@ -353,6 +377,13 @@ def define_track_model(
         if unet_arch == "resenc"
         else {"stem": unet_stem, "norm": unet_norm, "hires_skip_fusion": unet_hires_fusion}
     )
+    # Both backbones take these, so they go in the shared block rather than in
+    # `extra`; "none" leaves every stage an Identity and the model unchanged.
+    extra["spatial_attention"] = unet_spatial_attention
+    extra["spatial_attention_stages"] = unet_spatial_attention_stages
+    extra["spatial_attention_heads"] = unet_spatial_attention_heads
+    extra["spatial_attention_reduction"] = unet_spatial_attention_reduction
+    extra["spatial_attention_window"] = tuple(unet_spatial_attention_window)
 
     unet = backbone(
         in_channels=1,

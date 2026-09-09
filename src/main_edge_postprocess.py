@@ -43,6 +43,7 @@ from params import EMBRYOS, LOG_FOLDER, SCALE, TRAIN_DIR  # noqa: E402
 from tracking.post_process import build_graph  # noqa: E402
 from tracking_cellmot.io import save_graph  # noqa: E402
 from tracking_cellmot.metrics import (  # noqa: E402
+    MACRO_METRICS,
     evaluate,
     macro_summarise,
     node_recall,
@@ -87,6 +88,46 @@ DEFAULTS = dict(
     linefit_window=3,
     vel_weight=0.02,
     vel_momentum=0.7,
+    # The ILP node filter -- see `ilp_filter_nodes`. Off: one solve is ~9-16 s a
+    # stack against ~1 s for the rest of the chain, so it is a final-run switch
+    # rather than something to sweep behind.
+    ilp=0,
+    ilp_threshold=0.50,
+    ilp_edge_weight=-1.0,
+    ilp_appearance=0.0,
+    ilp_disappearance=1.5,
+    # Must sit below the probability of a second child or a fork can never pay
+    # for itself: with edge_weight -1 an extra edge is worth at most -1 against
+    # a cost of +ilp_division, so anything >= 1.0 provably never divides. It
+    # matters little here -- the ILP's edges are discarded and only its node set
+    # is kept -- but it still moves which nodes end up linked.
+    ilp_division=1.0,
+    # Divisions. The score is `adj_edge_jaccard + 0.1 * division_jaccard` and
+    # this chain scored a flat 0 on the second term -- `division_fp` was 0 too,
+    # so it was not proposing them and getting them wrong, it was not proposing
+    # them at all: the one-to-one assignment cannot express a fork. The gates
+    # are the public "safe division" repair (PublicChanges.md, 946 Harmonic
+    # Fusion) plus a `div_min_prob` gate that notebook has no way to apply,
+    # since it works from geometry with no scored candidate graph.
+    # See README_edge.md, "Divisions".
+    divisions=1,
+    # 0.40 and 0.35 are within 0.0003 of each other on the 199 out-of-fold
+    # stacks and identical on 44b6; 0.40 is the conservative end of that tie,
+    # adding fewer edges for the same score. 0.45 costs 0.0031 and 0.50 costs
+    # 0.0061 -- past the break-even the gate starts dropping true divisions.
+    div_min_prob=0.40,
+    div_max_parent_um=9.0,
+    div_max_existing_child_um=10.0,
+    div_max_sister_um=14.0,
+    div_symmetry_tau=0.6,
+    # 3.0, not 946's 2.25: worth +0.0007..+0.0009 over it at both min_prob 0.35
+    # and 0.40, on both embryos, which is the only knob here whose gain held
+    # its sign everywhere. 4.0 gives it all back and more (-0.005).
+    div_diverge_um=3.0,
+    div_require_divergence=1,
+    div_require_mutual_nn=1,
+    div_frame_frac_cap=0.0076,
+    div_global_frac_cap=0.00375,
 )
 
 # torch is only here for `recover`'s drift estimate, and its intra-op pool
@@ -140,6 +181,56 @@ def parse_args():
                         "it off (default %(default)s)")
     p.add_argument("--vel_momentum", type=float, default=DEFAULTS["vel_momentum"],
                    help="EMA on that velocity (default %(default)s)")
+    p.add_argument("--ilp", action="store_true",
+                   help="filter the nodes with a global ILP before linking: "
+                        "keep only the detections it places in a track, then "
+                        "run the usual chain over what is left. Worth +0.0087 "
+                        "(t=7.0, 149/199 stacks) but ~9-16 s a stack, so it is "
+                        "off by default -- turn it on for a final run")
+    p.add_argument("--ilp_threshold", type=float, default=DEFAULTS["ilp_threshold"],
+                   help="lowest candidate probability the ILP may use "
+                        "(default %(default)s)")
+    p.add_argument("--ilp_edge_weight", type=float, default=DEFAULTS["ilp_edge_weight"])
+    p.add_argument("--ilp_appearance", type=float, default=DEFAULTS["ilp_appearance"],
+                   help="ILP cost of a track starting (default %(default)s)")
+    p.add_argument("--ilp_disappearance", type=float,
+                   default=DEFAULTS["ilp_disappearance"],
+                   help="ILP cost of a track ending (default %(default)s)")
+    p.add_argument("--ilp_division", type=float, default=DEFAULTS["ilp_division"],
+                   help="ILP cost of a fork; must be below a second child's "
+                        "probability or none is ever taken (default %(default)s)")
+    p.add_argument("--no_assign", action="store_true",
+                   help="keep the committed edges already in the npz instead of "
+                        "re-solving each frame pair from the candidates. Use it "
+                        "to score a different matcher through the same "
+                        "downstream chain; the default replaces its links")
+    p.add_argument("--no_divisions", action="store_true",
+                   help="skip the division proposal stage; the chain then scores "
+                        "a flat 0 on the division term, which is 0.1 of the score")
+    p.add_argument("--div_min_prob", type=float, default=DEFAULTS["div_min_prob"],
+                   help="the model's probability a parent/second-child pair must "
+                        "reach before it can become a division (default %(default)s)")
+    p.add_argument("--div_max_parent_um", type=float,
+                   default=DEFAULTS["div_max_parent_um"])
+    p.add_argument("--div_max_existing_child_um", type=float,
+                   default=DEFAULTS["div_max_existing_child_um"])
+    p.add_argument("--div_max_sister_um", type=float,
+                   default=DEFAULTS["div_max_sister_um"])
+    p.add_argument("--div_symmetry_tau", type=float,
+                   default=DEFAULTS["div_symmetry_tau"],
+                   help="reject when the parent sits beside one daughter rather "
+                        "than between the two (default %(default)s)")
+    p.add_argument("--div_diverge_um", type=float, default=DEFAULTS["div_diverge_um"],
+                   help="um the grandchildren must have separated beyond the "
+                        "sisters by t+2 (default %(default)s)")
+    p.add_argument("--div_no_divergence", action="store_true",
+                   help="drop the divergence requirement (measured: 10x the "
+                        "false positives -- see README_edge.md)")
+    p.add_argument("--div_no_mutual_nn", action="store_true")
+    p.add_argument("--div_frame_frac_cap", type=float,
+                   default=DEFAULTS["div_frame_frac_cap"])
+    p.add_argument("--div_global_frac_cap", type=float,
+                   default=DEFAULTS["div_global_frac_cap"])
     p.add_argument("--jobs", type=int, default=16, help="worker processes")
     p.add_argument("--limit", type=int, default=None, help="cap the stacks (debugging)")
     p.add_argument("--no_score", action="store_true",
@@ -203,11 +294,105 @@ def _best_preds_dir(base_dir: Path) -> tuple[Path, str]:
     return max(candidates, key=lambda d: d.stat().st_mtime), "most recent (none scored)"
 
 
+def ilp_filter_nodes(coords, edges, cand, cfg):
+    """Keep only the detections a global ILP places in a track.
+
+    `tracksdata`'s ILPSolver over the whole candidate graph, subject to
+    in-degree <= 1 and out-degree <= 2 -- the matcher the public notebooks run
+    before their own repair chain. What is kept from it is deliberately *only
+    the node set*: measured over 199 out-of-fold stacks, keeping its edges as
+    well scored +0.0027 against the plain chain while keeping just its nodes
+    and letting `assign` re-link scored +0.0087 (t=7.0, better on 149 of 199).
+    Its edge Jaccard is in fact the worst of the four arms tried -- the ILP is
+    a better judge of which detections are real than of which links are.
+
+    That is also what the notebooks do, for all that they run the solver: their
+    `motion_relink` discards the ILP edge set and re-solves from geometry,
+    inheriting only `nodes_by_id`.
+
+    Returns `(coords, edges, cand)` renumbered onto the surviving nodes.
+    """
+    import contextlib
+    import io
+
+    import tracksdata as td
+
+    from tracking.post_process import build_graph
+
+    keep_prob = cand[:, 2] >= cfg["ilp_threshold"]
+    c = cand[(cand[:, 4] == 1) & keep_prob]
+    if not len(c):
+        return coords, edges, cand
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        graph = build_graph(
+            coords,
+            [(int(a), int(b), float(p), float(d)) for a, b, p, d, _ in c],
+        )
+    if graph.num_edges() == 0:
+        return coords, edges, cand
+
+    solver = td.solvers.ILPSolver(
+        edge_weight=cfg["ilp_edge_weight"] * td.EdgeAttr("edge_prob"),
+        appearance_weight=cfg["ilp_appearance"],
+        disappearance_weight=cfg["ilp_disappearance"],
+        division_weight=cfg["ilp_division"],
+    )
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        solved = solver.solve(graph)
+
+    ea = solved.edge_attrs()
+    if "solution" in ea.columns:
+        ea = ea.filter(ea["solution"])
+    if not len(ea):
+        return coords, edges, cand
+
+    # `build_graph` numbers nodes in coords order, so a solution node id is a
+    # coords row. A node the solver linked to nothing is one it judged not to
+    # belong to any track, which is exactly what this stage is here to drop.
+    n = len(coords)
+    deg = np.zeros(n, int)
+    np.add.at(deg, ea["source_id"].to_numpy().astype(int), 1)
+    np.add.at(deg, ea["target_id"].to_numpy().astype(int), 1)
+    keep = np.flatnonzero(deg > 0)
+    remap = -np.ones(n, int)
+    remap[keep] = np.arange(len(keep))
+
+    # Renumber the candidates with the coords, dropping any that touch a node
+    # the ILP declined -- those are the links it ruled out, and `assign` should
+    # not get to re-propose them.
+    cand = cand.reshape(-1, 5)
+    if len(cand):
+        ok = (remap[cand[:, 0].astype(int)] >= 0) & (remap[cand[:, 1].astype(int)] >= 0)
+        cand = cand[ok].copy()
+        cand[:, 0] = remap[cand[:, 0].astype(int)]
+        cand[:, 1] = remap[cand[:, 1].astype(int)]
+    edges = np.asarray(edges, float).reshape(-1, 4)
+    if len(edges):
+        ok = (remap[edges[:, 0].astype(int)] >= 0) & (remap[edges[:, 1].astype(int)] >= 0)
+        edges = edges[ok].copy()
+        edges[:, 0] = remap[edges[:, 0].astype(int)]
+        edges[:, 1] = remap[edges[:, 1].astype(int)]
+    return coords[keep], edges, cand
+
+
 def postprocess(coords, edges, cand, cfg):
     """The chain. `(coords, edges, candidates)` -> `(coords, edges)`."""
+    if cfg.get("ilp"):
+        # Before everything: it removes nodes, so every later stage should see
+        # the reduced graph rather than re-deriving it.
+        coords, edges, cand = ilp_filter_nodes(coords, edges, cand, cfg)
+
     assign_kw = dict(vel_weight=cfg["vel_weight"],
                      vel_momentum=cfg["vel_momentum"])
-    edges = edge_pp.assign(coords, cand, threshold=cfg["threshold"], **assign_kw)
+    if cfg.get("assign", 1):
+        edges = edge_pp.assign(coords, cand, threshold=cfg["threshold"], **assign_kw)
+    else:
+        # Keep whatever matcher wrote the file. `assign` re-solves the frame
+        # pairs from the candidate array and never reads the committed edges,
+        # so an alternative matcher upstream -- the ILP, say -- would otherwise
+        # be silently discarded here and the two inputs would score identically.
+        edges = np.asarray(edges, dtype=float).reshape(-1, 4)
     if cfg["recover"]:
         coords, edges = edge_pp.recover_nodes(
             coords, edges, cand,
@@ -222,6 +407,23 @@ def postprocess(coords, edges, cand, cfg):
         # one-node "tracks" pruning is about to delete.
         edges = edge_pp.link_through_isolated(
             coords, edges, max_gap=cfg["through_max_gap"], max_um=cfg["through"])
+    if cfg.get("divisions"):
+        # Before pruning: attaching a free detection to a parent puts it in that
+        # parent's component, so a second daughter that would have been pruned
+        # as a fragment survives on the strength of the link.
+        edges = edge_pp.propose_divisions(
+            coords, edges, cand,
+            min_prob=cfg["div_min_prob"],
+            max_parent_um=cfg["div_max_parent_um"],
+            max_existing_child_um=cfg["div_max_existing_child_um"],
+            max_sister_um=cfg["div_max_sister_um"],
+            symmetry_tau=cfg["div_symmetry_tau"],
+            diverge_um=cfg["div_diverge_um"],
+            require_divergence=bool(cfg["div_require_divergence"]),
+            require_mutual_nn=bool(cfg["div_require_mutual_nn"]),
+            frame_frac_cap=cfg["div_frame_frac_cap"],
+            global_frac_cap=cfg["div_global_frac_cap"],
+        )
     if cfg["min_track"]:
         coords, edges = edge_pp.prune_short(coords, edges, cfg["min_track"])
     if cfg["linefit"]:
@@ -323,14 +525,37 @@ def main():
         min_track=args.min_track,
         linefit=args.linefit, linefit_window=args.linefit_window,
         vel_weight=args.vel_weight, vel_momentum=args.vel_momentum,
+        ilp=1 if args.ilp else 0,
+        ilp_threshold=args.ilp_threshold,
+        ilp_edge_weight=args.ilp_edge_weight,
+        ilp_appearance=args.ilp_appearance,
+        ilp_disappearance=args.ilp_disappearance,
+        ilp_division=args.ilp_division,
+        assign=0 if args.no_assign else 1,
+        divisions=0 if args.no_divisions else 1,
+        div_min_prob=args.div_min_prob,
+        div_max_parent_um=args.div_max_parent_um,
+        div_max_existing_child_um=args.div_max_existing_child_um,
+        div_max_sister_um=args.div_max_sister_um,
+        div_symmetry_tau=args.div_symmetry_tau,
+        div_diverge_um=args.div_diverge_um,
+        div_require_divergence=0 if args.div_no_divergence else 1,
+        div_require_mutual_nn=0 if args.div_no_mutual_nn else 1,
+        div_frame_frac_cap=args.div_frame_frac_cap,
+        div_global_frac_cap=args.div_global_frac_cap,
     )
     stages = [name for name, on in (
+        (f"ilp-node-filter(p>={args.ilp_threshold:g}, dis={args.ilp_disappearance:g}, "
+         f"div={args.ilp_division:g})", args.ilp),
+        ("keep-input-edges(no assign)", args.no_assign),
         (f"assign(th={args.threshold:g}"
          + (f", momentum w={args.vel_weight:g} m={args.vel_momentum:g}"
-            if args.vel_weight else "") + ")", True),
+            if args.vel_weight else "") + ")", not args.no_assign),
         (f"recover(gap<={args.recover_max_gap}, r={args.recover_max_residual:g})",
          not args.no_recover),
         (f"through(gap<={args.through_max_gap}, {args.through:g} um)", args.through),
+        (f"divisions(p>={args.div_min_prob:g}, diverge={args.div_diverge_um:g}, "
+         f"cap={args.div_global_frac_cap:g})", not args.no_divisions),
         (f"prune(min_track={args.min_track})", args.min_track),
         (f"linefit(w={args.linefit:g}, +-{args.linefit_window})", args.linefit),
     ) if on]
@@ -367,8 +592,10 @@ def main():
     by_embryo = {}
     for row in rows:
         by_embryo.setdefault(row.get("embryo", "?"), []).append(row)
-    report_keys = ("score", "edge_jaccard", "adj_edge_jaccard", "node_recall",
-                   "edge_tp", "edge_fp", "edge_fn", "n_nodes_pred", "n_edges_pred")
+    report_keys = ("score", "edge_jaccard", "adj_edge_jaccard", "division_jaccard",
+                   "node_recall", "edge_tp", "edge_fp", "edge_fn",
+                   "division_tp", "division_fp", "division_fn",
+                   "n_nodes_pred", "n_edges_pred")
 
     scores = {
         "preds_dir": str(preds_dir),
@@ -380,7 +607,12 @@ def main():
         "macro": _jsonable(macro),
         "overall": _jsonable(summary),
         "per_embryo": {
-            emb: {"n_samples": len(by_embryo[emb]), **_jsonable(s)}
+            emb: {
+                "fold": sorted({r["fold"] for r in by_embryo[emb]
+                                if r.get("fold") is not None}),
+                "n_samples": len(by_embryo[emb]),
+                **_jsonable(s),
+            }
             for emb, s in group_summaries.items()
         },
         "per_sample": {
@@ -396,16 +628,46 @@ def main():
     with open(scores_file, "w") as f:
         json.dump(scores, f, indent=4)
 
-    print(f"\n{'=' * 60}")
+    print(f"\n{'=' * 78}")
     print(f"{len(rows)} stacks  ->  {out_dir}")
-    print(f"{'=' * 60}")
-    for k in ("edge_tp", "edge_fp", "edge_fn"):
-        print(f"- {k}: {summary[k]:.0f}")
-    for k in ("node_recall", "edge_jaccard", "adj_edge_jaccard", "score"):
-        print(f"- {k}: {summary[k]:.4f}")
+    print(f"{'=' * 78}")
+
+    # Pooled over every stack: counts, where summing is the meaningful thing.
+    for k in ("edge_tp", "edge_fp", "edge_fn",
+              "division_tp", "division_fp", "division_fn"):
+        if k in summary:
+            print(f"- {k}: {summary[k]:.0f}")
+    for k in ("node_recall", "edge_jaccard", "adj_edge_jaccard",
+              "division_jaccard", "score"):
+        if k in summary:
+            print(f"- {k}: {summary[k]:.4f}")
+
+    # The number a fold is judged on. Pooling weights an embryo by how many
+    # stacks it happens to contribute -- 128 of 6bba against 71 of 44b6 -- so
+    # the macro mean, one vote each, is the headline and `score` above is not.
     if macro["n_groups"] > 1:
-        print(f"- cv_score: {macro['score']:.4f}   (mean over "
-              f"{macro['n_groups']} embryos, not pooled)")
+        print(f"\nmacro  (mean over {macro['n_groups']} embryos, one vote each)")
+        for k in MACRO_METRICS:
+            if k in macro:
+                label = "cv_score" if k == "score" else k
+                print(f"- {label:<17s}: {macro[k]:.4f}")
+
+    per_embryo = scores["per_embryo"]
+    if len(per_embryo) > 1:
+        cols = ("node_recall", "edge_jaccard", "adj_edge_jaccard",
+                "division_jaccard", "score")
+        print(f"\nper embryo\n  {'embryo':<8}{'fold':<6}{'n':<6}"
+              + "".join(f"{c:>18s}" for c in cols)
+              + f"{'div tp/fp/fn':>16s}")
+        for emb, s in per_embryo.items():
+            folds = sorted({r["fold"] for r in by_embryo[emb]
+                            if r.get("fold") is not None})
+            cells = "".join(f"{s.get(c, float('nan')):>18.4f}" for c in cols)
+            div = (f"{int(s.get('division_tp', 0))}/{int(s.get('division_fp', 0))}"
+                   f"/{int(s.get('division_fn', 0))}")
+            print(f"  {emb:<8}{','.join(str(f) for f in folds) or '-':<6}"
+                  f"{s['n_samples']:<6}{cells}{div:>16s}")
+
     print(f"\n-> scores  : {scores_file}")
 
 

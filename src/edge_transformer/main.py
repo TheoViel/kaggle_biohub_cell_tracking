@@ -27,7 +27,8 @@ def _opt_int(value):
     return int(value)
 
 
-def build_dataset(args, embryos: list[str], train: bool, n_videos=None) -> EdgeDataset:
+def build_dataset(args, embryos: list[str], train: bool, n_videos=None,
+                  verbose: bool = False) -> EdgeDataset:
     videos = load_videos(
         args.nodes_folder,
         args.data_dir,
@@ -35,7 +36,11 @@ def build_dataset(args, embryos: list[str], train: bool, n_videos=None) -> EdgeD
         n_videos=_opt_int(n_videos),
         use_embeddings=bool(getattr(args, "use_embeddings", True)),
         embeddings_key=getattr(args, "embeddings_key", None) or "embeddings",
-        verbose=False,
+        # Training only. Validation must stay a clean read of the annotation --
+        # pseudo-labels are this model's own output, so scoring against them
+        # would measure agreement with a previous round, not with the truth.
+        pl_folder=getattr(args, "pl_folder", None) if train else None,
+        verbose=verbose,
     )
     return EdgeDataset(
         videos,
@@ -52,6 +57,11 @@ def build_dataset(args, embryos: list[str], train: bool, n_videos=None) -> EdgeD
         flip_p=float(getattr(args, "flip_p", 0.5)),
         rot_p=float(getattr(args, "rot_p", 0.5)),
         jitter_um=float(getattr(args, "jitter_um", 0.3)),
+        time_flip_p=float(getattr(args, "time_flip_p", 0.0)),
+        pl_weight=float(getattr(args, "pl_weight", 0.0)) if train else 0.0,
+        # Training only: validation must read the annotation as it is.
+        division_weight=(float(getattr(args, "division_weight", 1.0))
+                         if train else 1.0),
     )
 
 
@@ -146,7 +156,8 @@ def _train_one(args, ctx, run: dict, base_output_dir: str) -> None:
         print(f"{'=' * 60}\n")
 
     train_ds = build_dataset(args, run["train_embryos"], train=True,
-                             n_videos=getattr(args, "n_train_videos", None))
+                             n_videos=getattr(args, "n_train_videos", None),
+                             verbose=ctx.is_main and bool(getattr(args, "pl_folder", None)))
     val_ds = build_dataset(args, run["val_embryos"], train=False,
                            n_videos=getattr(args, "n_val_videos", None))
     train_loader, train_sampler = build_loader(

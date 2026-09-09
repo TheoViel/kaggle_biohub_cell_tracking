@@ -27,6 +27,9 @@ LOSS_KEYS = ("flow", "cellprob", "total")
 UNET_KEYS = (
     "unet_arch", "unet_out_channels", "unet_layers", "unet_pool_stride",
     "unet_n_anisotropic", "unet_n_decode_steps", "unet_temporal_attention",
+    "unet_spatial_attention", "unet_spatial_attention_stages",
+    "unet_spatial_attention_heads", "unet_spatial_attention_reduction",
+    "unet_spatial_attention_window",
     "unet_blocks_per_stage", "unet_stem", "unet_norm", "unet_hires_fusion",
 )
 
