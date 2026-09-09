@@ -237,6 +237,19 @@ def _reconcile_arch(cfg, state, verbose=False):
             print(f"-> offset_head={has_offset} (offset_head weights "
                   f"{'present' if has_offset else 'absent'})")
         cfg.offset_head = has_offset
+
+    # Likewise for the extra decoder branch feeding the fine detection head. The
+    # count is the number of blocks that were built, which the weights name
+    # directly (unet.fine_decoder_blocks.<i>...), so it is read rather than
+    # trusted from args.json.
+    n_extra = len({
+        k.split(".")[2] for k in state if k.startswith("unet.fine_decoder_blocks.")
+    })
+    if n_extra != int(getattr(cfg, "unet_n_extra_decode_steps", 0) or 0):
+        if verbose:
+            print(f"-> unet_n_extra_decode_steps={n_extra} (inferred from "
+                  f"unet.fine_decoder_blocks weights)")
+        cfg.unet_n_extra_decode_steps = n_extra
     return cfg
 
 

@@ -29,7 +29,7 @@ fi
 torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" main_predict.py \
     "${LOG_ARGS[@]}" \
     --det_threshold 0.4,0.5 \
-    --nms_radius_um 5,6,7 \
+    --nms_radius_um 6,7 \
     "$@"
 
 

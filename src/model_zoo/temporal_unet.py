@@ -462,6 +462,14 @@ class TemporalUNet3D(nn.Module):
         ``len(layers) - 1`` (fully symmetric U-Net).  Set to 0 to skip
         the decoder entirely — the head then operates on the bottleneck
         features, producing output at the encoder's lowest resolution.
+    n_extra_decode_steps : int
+        Decoder stages built *past* the head's grid, feeding a second and finer
+        output.  ``self.head`` does not move: it keeps producing the same map at
+        ``output_stride``, so node features and everything measured on that grid
+        are unchanged.  What this adds is a finer map at ``fine_output_stride``
+        for a head that wants the resolution, with the coarse one still
+        available to supervise.  ``forward`` then returns ``(coarse, fine)``
+        instead of a single tensor.
     hires_skip_fusion : bool
         When the decoder stops short of the input resolution, the finest
         encoder skips are computed and then thrown away. If True, max-pool
@@ -490,6 +498,7 @@ class TemporalUNet3D(nn.Module):
         stem: str = "stride",
         norm: str = "batch",
         n_decode_steps: int | None = None,
+        n_extra_decode_steps: int = 0,
         hires_skip_fusion: bool = False,
         verbose: int = 0,
     ) -> None:
@@ -598,6 +607,32 @@ class TemporalUNet3D(nn.Module):
         head_stage = n_full_decode - n_decode_steps
         head_in = layers[head_stage]
 
+        # Decoder stages past the head's grid, branching off the same features
+        # `self.head` reads. They are a second output, not a relocation of the
+        # first: `output_stride`, the node-feature map and every distance
+        # measured on that grid stay exactly where they were, and the coarse
+        # head remains available as deep supervision for the finer one.
+        n_extra_decode_steps = max(0, min(int(n_extra_decode_steps), head_stage))
+        self.fine_upsamples = nn.ModuleList()
+        self.fine_decoder_blocks = nn.ModuleList()
+        for i in range(head_stage, head_stage - n_extra_decode_steps, -1):
+            self.fine_upsamples.append(
+                nn.Upsample(
+                    scale_factor=tuple(float(s) for s in stage_strides[i]),
+                    mode="trilinear",
+                    align_corners=False,
+                )
+            )
+            self.fine_decoder_blocks.append(
+                build_stage(layers[i] + layers[i - 1], layers[i - 1], 1)
+            )
+        fine_stage = head_stage - n_extra_decode_steps
+        self.fine_head = (
+            nn.Conv3d(layers[fine_stage], out_channels, kernel_size=1)
+            if n_extra_decode_steps
+            else None
+        )
+
         # Skips finer than the head's grid are otherwise computed and dropped.
         self.hires_pools = nn.ModuleList()
         self.hires_projs = nn.ModuleList()
@@ -613,6 +648,8 @@ class TemporalUNet3D(nn.Module):
 
         self.out_channels = out_channels
         self.n_decode_steps = n_decode_steps
+        self.n_extra_decode_steps = n_extra_decode_steps
+        self.head_stage = head_stage
         # Spatial sizes must be divisible by this; the encoder runs every stage
         # regardless of how far back the decoder goes.
         self.divisible_by = cumulative_stride(stem_stride, list(stage_strides))
@@ -621,14 +658,20 @@ class TemporalUNet3D(nn.Module):
         self.output_stride = cumulative_stride(
             stem_stride, list(stage_strides[: head_stage + 1])
         )
+        # The same for the extra branch's output, equal to output_stride when
+        # there is no extra branch.
+        self.fine_output_stride = cumulative_stride(
+            stem_stride, list(stage_strides[: fine_stage + 1])
+        )
 
     def _run(self, block: nn.Module, x: torch.Tensor) -> torch.Tensor:
         if self.gradient_checkpointing and self.training:
             return _grad_ckpt(block, x, use_reentrant=False)
         return block(x)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, C_in, Z, Y, X) -> (B, T, C_out, Z', Y', X')
+    def forward(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # x: (B, T, C_in, Z, Y, X) -> (B, T, C_out, Z', Y', X'), plus a second
+        # and finer map of the same layout when n_extra_decode_steps > 0.
         B, T = x.shape[:2]
         x = x.reshape(B * T, *x.shape[2:])
         x = self.stem(x)
@@ -665,6 +708,28 @@ class TemporalUNet3D(nn.Module):
             x = torch.cat([x, skip], dim=1)
             x = self._run(block, x)
 
+        # Branch here, before the hires fusion concatenates onto x: the extra
+        # stages continue the decoder proper, and the fused detail is the coarse
+        # head's own input.
+        fine = None
+        if self.fine_head is not None:
+            fine = x
+            for j, (up, block) in enumerate(
+                zip(self.fine_upsamples, self.fine_decoder_blocks)
+            ):
+                skip = skips[self.head_stage - 1 - j]
+                fine = up(fine)
+
+                if self.verbose >= 1:
+                    print(f"TemporalUNet3D - Fine Decoder Block {j} upsampled shape: {fine.shape} - skip shape: {skip.shape}")
+
+                if fine.shape[2:] != skip.shape[2:]:
+                    fine = F.interpolate(
+                        fine, size=skip.shape[2:], mode="trilinear", align_corners=False
+                    )
+                fine = self._run(block, torch.cat([fine, skip], dim=1))
+            fine = self.fine_head(fine)
+
         if self.hires_projs:
             detail = []
             for proj, pool, skip in zip(self.hires_projs, self.hires_pools, skips):
@@ -675,7 +740,10 @@ class TemporalUNet3D(nn.Module):
             x = torch.cat([x, *detail], dim=1)
 
         x = self.head(x)
-        return x.reshape(B, T, *x.shape[1:])
+        x = x.reshape(B, T, *x.shape[1:])
+        if fine is None:
+            return x
+        return x, fine.reshape(B, T, *fine.shape[1:])
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)

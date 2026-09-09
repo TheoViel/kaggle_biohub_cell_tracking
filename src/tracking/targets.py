@@ -229,6 +229,7 @@ def detect_and_match(
     max_match_distance: float = 7.0,
     voxel_size: tuple | None = None,
     unet_scaling: tuple | None = None,
+    det_scaling: tuple | None = None,
     frame_index: int = 0,
     window_size: int | None = None,
     max_dets_per_sample: int | None = None,
@@ -260,9 +261,16 @@ def detect_and_match(
     (each trivially matched to itself), decoupling edge training from detector
     quality entirely. Intended for the start of training only.
 
+    ``det_scaling`` is how many voxels of ``det_probas``'s grid make up one node
+    -grid voxel — (1, 2, 2) when the model runs an extra decoder stage for the
+    heatmap alone. NMS then happens at the heatmap's own resolution, and the
+    peaks are divided back down, so a node lands on a half-voxel of the node
+    grid rather than being rounded onto it. Everything downstream keeps
+    measuring in node-grid units, which is the only space that is isotropic.
+
     Returns
     -------
-    coords  : (B, M, 3)              detected coords in downsampled space
+    coords  : (B, M, 3)              detected coords in node-grid space
     pos     : (B, M, 4*D)            sinusoidal positional embeddings
     det_mask: (B, M)  bool
     matches : list of B tensors each (n_det,) — GT index matched or -1
@@ -283,13 +291,23 @@ def detect_and_match(
         vs = torch.ones(3, dtype=torch.float32, device=device)
         unet_vs = vs
 
+    # The heatmap may sit on a finer grid than the nodes do; peak finding runs
+    # on the grid the heatmap is actually on.
+    det_scale_t = torch.tensor(
+        det_scaling if det_scaling is not None else (1, 1, 1),
+        dtype=torch.float32, device=device,
+    )
+    det_vs = unet_vs / det_scale_t
+
     # Shared with predict.py, so training and inference suppress over the same
     # physical distance.
-    pool_kernel = pool_kernel_from_um(pool_kernel_um, tuple(unet_vs.tolist()))
+    pool_kernel = pool_kernel_from_um(pool_kernel_um, tuple(det_vs.tolist()))
     # print(pool_kernel)
 
     pad = tuple(k // 2 for k in pool_kernel)
-    spatial = det_probas.shape[2:]
+    det_spatial = det_probas.shape[2:]
+    # The node grid, which is what the returned coordinates are expressed in.
+    spatial = tuple(int(s // d) for s, d in zip(det_spatial, det_scale_t.tolist()))
 
     use_greedy = nms == "greedy"
     if nms not in ("greedy", "maxpool"):
@@ -347,7 +365,7 @@ def detect_and_match(
             if det_b.shape[0] > max_nms_candidates:
                 top = scores_b.topk(max_nms_candidates).indices
                 det_b, scores_b = det_b[top], scores_b[top]
-            keep = greedy_nms(det_b, scores_b, unet_vs, nms_radius_um)
+            keep = greedy_nms(det_b, scores_b, det_vs, nms_radius_um)
             det_b, scores_b = det_b[keep], scores_b[keep]
 
         # Too few peaks cleared the threshold — fall back to the top-k local
@@ -359,6 +377,10 @@ def detect_and_match(
 
         if max_dets_per_sample is not None and det_b.shape[0] > max_dets_per_sample:
             det_b = det_b[scores_b.topk(max_dets_per_sample).indices]
+
+        # Out of the heatmap's grid and into the node grid. Exact: a fine index
+        # divided by an integer factor, so multiplying back recovers it.
+        det_b = det_b / det_scale_t
 
         n_det = det_b.shape[0]
         gt_b = gt_coords[b, :nt]

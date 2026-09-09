@@ -59,7 +59,7 @@ def detection_maps():
             imgs = torch.from_numpy(np.stack([arr[i] for i in idx]).astype(np.float32))
             imgs = ((imgs - q_low) / (q_high - q_low + 1e-6)).clamp(0.0, 4.0)
             imgs = imgs.unsqueeze(0).to(DEVICE)
-            _, det = model.encode(imgs)
+            _, det, _ = model.encode(imgs)
             for k, i in enumerate(idx):
                 if i == len(maps):
                     maps.append(det[k][0, 0].sigmoid().cpu().numpy().astype(np.float16))

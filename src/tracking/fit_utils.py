@@ -14,6 +14,7 @@ from tracking.targets import detect_and_match, nodes_from_precomputed
 _CACHE_SIGNATURE_KEYS = (
     "window_size",
     "downscale_factor",
+    "unet_n_extra_decode_steps",
     "detect_and_match_threshold",
     "max_dets_per_sample",
     "top_k_nodes",
@@ -77,7 +78,7 @@ def _cache_signature(args) -> dict:
         for k in ("weights", "embed_dim", "unet_out_channels")
     }
     signature["unet_features"] = list(getattr(args, "unet_features", []) or [])
-    signature["format"] = "v3-frozen-bn"
+    signature["format"] = "v4-fine-det"
     signature["pretraining_weights"] = (getattr(args, "pretraining", None) or {}).get("weights")
     return {k: str(v) for k, v in signature.items()}
 
@@ -229,16 +230,23 @@ def encode_nodes(
     nms: str = "maxpool",
     nms_radius_um: float = 7.0,
     node_features: bool = True,
-) -> tuple[list, list, tuple, list | None]:
+) -> tuple[list, list, tuple, list | None, list | None, tuple]:
     """UNet encode, then peak detection and GT matching on every frame.
 
-    Returns ``(frame_det, det_logits, unet_scaling, offset_maps)`` where
-    ``frame_det`` holds one ``(coords, pos_embed, mask, matches, unet_feat,
-    scores)`` tuple per frame, empty when ``detect`` is False (the
-    detection-only warmup never reads it). ``scores`` is each node's detection
-    probability, which lets a higher threshold be applied later by filtering
-    instead of re-detecting. ``offset_maps`` is the per-frame centroid vote, or
-    None on a model built without the head.
+    Returns ``(frame_det, det_logits, unet_scaling, offset_maps, det_logits_ds,
+    det_stride)`` where ``frame_det`` holds one ``(coords, pos_embed, mask,
+    matches, unet_feat, scores)`` tuple per frame, empty when ``detect`` is
+    False (the detection-only warmup never reads it). ``scores`` is each node's
+    detection probability, which lets a higher threshold be applied later by
+    filtering instead of re-detecting. ``offset_maps`` is the per-frame centroid
+    vote, or None on a model built without the head.
+
+    ``unet_scaling`` is the node grid — image voxels per node-grid unit — and is
+    what every coordinate coming out of here is expressed in. ``det_stride`` is
+    the same measure for the heatmap, which sits on a finer grid when the model
+    runs extra decoder stages; the two are equal otherwise. ``det_logits_ds`` is
+    the coarse head's heatmap in that case, on the node grid, and None when
+    there is no second head to supervise.
 
     Node coordinates stay on the integer grid even when the vote exists: it
     refines where a detection is *reported*, not which voxel the edge scorer
@@ -255,11 +263,17 @@ def encode_nodes(
     embeddings with gradient attached.
     """
     _, window_size, d, h, w = imgs.shape
-    unet_out, det_logits = core_model.encode(imgs)
+    unet_out, det_logits, det_logits_ds = core_model.encode(imgs)
     offset_maps = core_model.encode_offsets(unet_out)
 
     d_out, h_out, w_out = unet_out.shape[-3:]
     unet_scaling = (d // d_out, h // h_out, w // w_out)
+
+    # Voxels of the heatmap's grid per node-grid voxel: (1, 1, 1) unless the
+    # model decodes further for the detection head alone.
+    d_det, h_det, w_det = det_logits[0].shape[-3:] if det_logits else (d_out, h_out, w_out)
+    det_scaling = (d_det // d_out, h_det // h_out, w_det // w_out)
+    det_stride = tuple(u // s for u, s in zip(unet_scaling, det_scaling))
 
     # Which feature maps the nodes are read from, in the order the model's
     # unet_features lists them. Concatenation happens per node, not per voxel —
@@ -282,6 +296,7 @@ def encode_nodes(
             image_shape,
             voxel_size=voxel_size,
             unet_scaling=unet_scaling,
+            det_scaling=det_scaling,
             pool_kernel_um=args.pool_kernel_um,
             frame_index=i,
             window_size=window_size,
@@ -299,13 +314,18 @@ def encode_nodes(
             ],
             dim=-1,
         ) if source_maps else det_coords.new_zeros(det_coords.shape[:2] + (0,))
-        # The peak's own probability, read back off the same grid it came from.
-        det_scores = core_model._index_features(probas[i], det_coords, det_mask).squeeze(-1)
+        # The peak's own probability, read back off the same grid it came from —
+        # the heatmap's, so the node coordinates go back through det_scaling.
+        det_scores = core_model._index_features(
+            probas[i],
+            det_coords * torch.tensor(det_scaling, dtype=det_coords.dtype, device=det_coords.device),
+            det_mask,
+        ).squeeze(-1)
         frame_det.append(
             (det_coords, det_pos_embed, det_mask, matches, unet_feat, det_scores)
         )
 
-    return frame_det, det_logits, unet_scaling, offset_maps
+    return frame_det, det_logits, unet_scaling, offset_maps, det_logits_ds, det_stride
 
 
 def node_scaling_from_voxel(voxel_size) -> tuple[float, float, float]:
