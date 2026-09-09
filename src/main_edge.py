@@ -75,7 +75,7 @@ DEFAULTS = {
     # the assignment drops it, and the division term of the score -- a full 0.1
     # of it -- comes back only through post-processing repair. This prices both
     # links of a dividing parent up in the loss.
-    "division_weight": 10.0,
+    "division_weight": 1.0,
 
     # Pseudo-labels
     "pl_folder": None,  # "../logs/edge_run/2026-09-07/4/preds_pl_0.45/",

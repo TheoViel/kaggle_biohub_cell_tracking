@@ -47,7 +47,30 @@ from data_gen.render import gen_volume_native
 # Measured on the real lineages; see the module docstring.
 STEP_MED_UM = 1.86
 PERSISTENCE = 0.30
-SISTER_UM = 7.24
+# Sister separation one frame after the division, measured on the annotation:
+# 151 real divisions give a median of 10.57 um, p10 6.36 and p90 14.36. The
+# value here was 7.24 and produced a median of 6.82, with 54% of pairs closer
+# than the detector's 7 um NMS radius against 15% in the real data -- so over
+# half of the generated divisions were teaching a configuration that cannot
+# survive its own detector. See the "Divisions" section of
+# notebooks/SyntheticData.ipynb.
+# 12.4, not the 10.57 measured: the collision check rejects the widest draws
+# (a daughter placed further out is likelier to overlap a neighbour), so the
+# realised median comes out ~15% below the drawn one. At 10.6 the generated
+# median was 8.95; this pre-compensates for that bias rather than leaving the
+# fit check to quietly shift the distribution.
+SISTER_UM = 12.4
+SISTER_SD = 3.1
+SISTER_MIN_UM = 4.0
+
+# A dividing cell does not go from one sphere to two in a single step: at the
+# frame the annotation calls the division, the nucleus has already resolved
+# into two kernels inside one envelope. Rendering it as an ordinary sphere left
+# the labelled frame with no visible cue at all, so the classifier's only
+# evidence was the frame after. The two lobes are drawn at this fraction of the
+# separation the daughters will take, along the same axis.
+MITOTIC_FRAC = 0.5
+MITOTIC_LOBE_SCALE = 0.78
 # Median length of a 3D isotropic gaussian step, in units of its per-axis
 # sigma (the chi distribution with three degrees of freedom). Dividing the
 # measured 1.86 um step by it gives the per-axis sigma to draw.
@@ -185,6 +208,97 @@ def _resolve_moves(pos, shift, offset, radii, csf, rng):
     return out
 
 
+def _lobe(app):
+    """One kernel of a dividing nucleus: the cell's own appearance, shrunk.
+
+    Not `Palette.divide`, which draws two *daughters* with fresh texture and
+    independent brightness. These are the two halves of a nucleus that has not
+    finished separating, so they keep the parent's appearance and only lose
+    size -- what distinguishes the mitotic frame from the frame after it is
+    that the lobes still belong to one cell.
+    """
+    out = app.take([0])
+    out.radius_um[:] = out.radius_um * MITOTIC_LOBE_SCALE
+    return out
+
+
+def _plan_transition(tracks, cens, rng, regime, flow, division_rate):
+    """Move every cell, then decide which divide. Returns `(nxt, mitotic)`.
+
+    Separated from the render loop so the frame can be drawn knowing which of
+    its cells are mid-division; `mitotic` maps a slot to the lobe offset (in
+    voxels) and the parent radius, and is empty when nothing divides.
+    """
+    # Slow appearance change: bleaching, growth, a little rotation.
+    apps = [tr["app"].drift(rng, regime) for tr in tracks]
+    radii = np.array([tr["r"] for tr in tracks], np.float32)
+    shift = _global_shift(flow)
+    offsets = np.stack([_cell_movement(tr, rng) for tr in tracks])
+    moved = _resolve_moves(cens, shift, offsets, radii, regime.collision_factor, rng)
+
+    # Divisions are tested against the *settled* frame: positions are final
+    # before any daughter is placed, so a division is checked against where the
+    # neighbours actually ended up. `occupied` then tracks the frame as it is
+    # built -- a dividing cell is replaced by its first daughter and the second
+    # is appended -- so two neighbours dividing at once still cannot be placed
+    # on top of each other.
+    occupied, occ_r = list(moved), list(radii)
+    nxt, mitotic = [], {}
+    for k, tr in enumerate(tracks):
+        # The jitter the guardrail allowed. Feeding back what was taken -- not
+        # what was drawn -- keeps a blocked cell from building up a velocity it
+        # was never able to use.
+        v = moved[k] - (cens[k] + shift)
+        app, daughters = apps[k], None
+        if rng.random() < division_rate:
+            d = rng.normal(0, 1, 3)
+            d /= np.linalg.norm(d) + 1e-9
+            sep = max(SISTER_MIN_UM, rng.normal(SISTER_UM, SISTER_SD))
+            half = 0.5 * sep * d / VOXEL_NATIVE
+            pair = app.divide(0, rng, regime)
+            spots = np.stack([moved[k] + half, moved[k] - half])
+            r_pair = np.array([float(reserved_um(q.radius_um[0], q.aniso[0]))
+                               for q in pair], np.float32)
+            # Everything except the cell being replaced. The two sisters are not
+            # checked against each other: SISTER_UM is measured on the real
+            # lineages and is the one separation not up for negotiation.
+            rest = [i for i in range(len(occupied)) if i != k]
+            obs_p = [occupied[i] for i in rest]
+            obs_r = [occ_r[i] for i in rest]
+            fits = (
+                (spots >= _LO).all() and (spots <= _HI).all()
+                and all(_clears(s, r, obs_p, obs_r, regime.collision_factor)
+                        for s, r in zip(spots, r_pair))
+            )
+            # A cell with no room to divide simply does not divide this frame.
+            # Forcing it would put two labels inside one nucleus, which is the
+            # failure this whole guardrail is here to avoid.
+            if fits:
+                daughters = (pair, spots, r_pair)
+                # What this cell shows *now*: two kernels, half a separation
+                # apart on the axis the daughters will take.
+                mitotic[k] = (d * (MITOTIC_FRAC * sep) / VOXEL_NATIVE,
+                              float(app.radius_um[0]))
+
+        if daughters is None:
+            nxt.append(dict(
+                pos=moved[k], vel=v, sc=tr["sc"], tid=tr["tid"], r=tr["r"],
+                parent_slot=k, is_div=False, app=app,
+            ))
+            continue
+
+        pair, spots, r_pair = daughters
+        occupied[k], occ_r[k] = spots[0], r_pair[0]
+        occupied.append(spots[1])
+        occ_r.append(r_pair[1])
+        for spot, daughter, r_d in zip(spots, pair, r_pair):
+            nxt.append(dict(
+                pos=spot, vel=v * 0.5, sc=tr["sc"], tid=tr["tid"],
+                r=float(r_d), parent_slot=k, is_div=True, app=daughter,
+            ))
+    return nxt, mitotic
+
+
 def generate_sequence(index, counts, shell, out_dir, n_frames=6,
                       division_rate=0.05, seed_base=500_000):
     """One time sequence with a lineage: volumes, nodes, edges and divisions.
@@ -235,9 +349,37 @@ def generate_sequence(index, counts, shell, out_dir, n_frames=6,
 
     for t in range(n_frames):
         cens = np.array([tr["pos"] for tr in tracks], np.float32)
-        frame_palette = concat([tr["app"] for tr in tracks])
+
+        # The transition out of this frame is planned *before* the frame is
+        # rendered, because a cell that is about to divide has to be drawn
+        # differently in it: at the frame the annotation calls the division the
+        # nucleus has already split into two kernels. Planning first is the only
+        # way the label and the picture can agree -- otherwise the labelled
+        # frame shows an ordinary sphere and the evidence exists only afterwards.
+        nxt, mitotic = (None, {}) if t == n_frames - 1 else _plan_transition(
+            tracks, cens, rng, regime, flow, division_rate
+        )
+
+        # A dividing cell renders as two lobes on the axis its daughters will
+        # take. They are extra *render* entries only: the cell keeps one node,
+        # at the centroid, which is the midpoint of the two lobes.
+        # `.copy()` matters: writing the first lobe back into a view of `cens`
+        # would move the centre the second lobe is then measured from, and the
+        # pair would come out as {centre, centre + offset/2} rather than
+        # straddling it.
+        lobe_cens = cens.copy()
+        render_cens = [lobe_cens]
+        render_apps = [tr["app"] for tr in tracks]
+        for k, (offset, r_um) in mitotic.items():
+            render_apps[k] = _lobe(render_apps[k])
+            lobe_cens[k] = cens[k] + offset / 2.0
+            render_cens.append((cens[k] - offset / 2.0)[None])
+            render_apps.append(_lobe(tracks[k]["app"]))
+
+        frame_palette = concat(render_apps)
         vol, _, _, _, _ = gen_volume_native(
-            zshape=SHAPE[0], xyshape=SHAPE[1], cens_native=cens,
+            zshape=SHAPE[0], xyshape=SHAPE[1],
+            cens_native=np.concatenate(render_cens).astype(np.float32),
             # A fresh rng per frame, for the shot noise and the medium: those
             # are genuinely independent between exposures. Everything that is
             # not -- optics, lighting, cell appearance -- comes in through
@@ -261,70 +403,6 @@ def generate_sequence(index, counts, shell, out_dir, n_frames=6,
         prev_ids = cur_ids
         if t == n_frames - 1:
             break
-
-        # --- move every cell: GLOBAL_IMAGE_SHIFT, then the guarded jitter ---
-        # Slow appearance change: bleaching, growth, a little rotation.
-        apps = [tr["app"].drift(rng, regime) for tr in tracks]
-        radii = np.array([tr["r"] for tr in tracks], np.float32)
-        shift = _global_shift(flow)
-        offsets = np.stack([_cell_movement(tr, rng) for tr in tracks])
-        moved = _resolve_moves(cens, shift, offsets, radii, regime.collision_factor, rng)
-
-        # --- divide, against the settled frame ---
-        # Positions are final before any daughter is placed, so a division is
-        # tested against where the neighbours actually ended up. ``occupied``
-        # then tracks the frame as it is built: a cell that divides is replaced
-        # by its first daughter and the second is appended, so two neighbours
-        # dividing at once still cannot be placed on top of each other.
-        occupied, occ_r = list(moved), list(radii)
-        nxt = []
-        for k, tr in enumerate(tracks):
-            # The jitter the guardrail allowed. Feeding back what was taken --
-            # not what was drawn -- keeps a blocked cell from building up a
-            # velocity it was never able to use.
-            v = moved[k] - (cens[k] + shift)
-            app, daughters = apps[k], None
-            if rng.random() < division_rate:
-                d = rng.normal(0, 1, 3)
-                d /= np.linalg.norm(d) + 1e-9
-                half = 0.5 * max(2.0, rng.normal(SISTER_UM, 1.6)) * d / VOXEL_NATIVE
-                pair = app.divide(0, rng, regime)
-                spots = np.stack([moved[k] + half, moved[k] - half])
-                r_pair = np.array([float(reserved_um(p.radius_um[0], p.aniso[0]))
-                                   for p in pair], np.float32)
-                # Everything except the cell being replaced. The two sisters are
-                # not checked against each other: SISTER_UM is measured on the
-                # real lineages and is the one separation not up for negotiation.
-                rest = [i for i in range(len(occupied)) if i != k]
-                obs_p = [occupied[i] for i in rest]
-                obs_r = [occ_r[i] for i in rest]
-                fits = (
-                    (spots >= _LO).all() and (spots <= _HI).all()
-                    and all(_clears(s, r, obs_p, obs_r, regime.collision_factor)
-                            for s, r in zip(spots, r_pair))
-                )
-                # A cell with no room to divide simply does not divide this
-                # frame. Forcing it would put two labels inside one nucleus,
-                # which is the failure this whole guardrail is here to avoid.
-                if fits:
-                    daughters = (pair, spots, r_pair)
-
-            if daughters is None:
-                nxt.append(dict(
-                    pos=moved[k], vel=v, sc=tr["sc"], tid=tr["tid"], r=tr["r"],
-                    parent_slot=k, is_div=False, app=app,
-                ))
-                continue
-
-            pair, spots, r_pair = daughters
-            occupied[k], occ_r[k] = spots[0], r_pair[0]
-            occupied.append(spots[1])
-            occ_r.append(r_pair[1])
-            for spot, daughter, r_d in zip(spots, pair, r_pair):
-                nxt.append(dict(
-                    pos=spot, vel=v * 0.5, sc=tr["sc"], tid=tr["tid"],
-                    r=float(r_d), parent_slot=k, is_div=True, app=daughter,
-                ))
         tracks = nxt
 
     rel = f"sequences/seq_{index:04d}.npz"

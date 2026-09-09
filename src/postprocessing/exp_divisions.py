@@ -141,6 +141,10 @@ DIV_DEFAULTS = dict(
     merge_dup_um=0.0, merge_require_mutual=1,
     # classifier selection instead of the gates
     clf=0, clf_top_k=0, clf_min_score=0.0, clf_path=None,
+    # The division classifier's per-node probability, from
+    # main_division_predict.py. `div_prob_dir` is injected by main(), not typed
+    # into a chain spec.
+    div_prob_min=0.0, div_prob_rank=1, div_prob_dir=None,
     # merge_shadow_forks: the temporal duplicate test. 0 turns it off.
     shadow_radius=0.0, shadow_min=3, shadow_frac=0.6,
     # assign(fork_penalty=...): a priced fork in the assignment itself. It
@@ -172,7 +176,7 @@ def parse_config(spec):
             continue
         key, _, value = part.partition("=")
         key = key.strip()
-        if key not in DIV_DEFAULTS or key == "clf_path":
+        if key not in DIV_DEFAULTS or key in ("clf_path", "div_prob_dir"):
             raise SystemExit(f"unknown division setting {key!r}; "
                              f"known: {', '.join(sorted(DIV_DEFAULTS))}")
         cfg[key] = _literal(value.strip())
@@ -274,8 +278,17 @@ def run_stack(job):
     if cfg is not None:
         kw = dict(cfg)
         # Selection-rule keys; `propose_divisions` does not take them.
-        for k in ("clf", "clf_top_k", "clf_min_score", "clf_path"):
+        for k in ("clf", "clf_top_k", "clf_min_score", "clf_path", "div_prob_dir"):
             kw.pop(k, None)
+        kw["div_prob_rank"] = bool(kw.get("div_prob_rank", 1))
+        # One array per stack, aligned to its nodes. Absent -> None, and
+        # `propose_divisions` falls back to pure geometry.
+        dp_dir = cfg.get("div_prob_dir")
+        if dp_dir:
+            f = Path(dp_dir) / f"{stem}.npz"
+            if f.exists():
+                with np.load(f) as d:
+                    kw["div_prob"] = d["div_prob"]
         kw["require_divergence"] = bool(kw["require_divergence"])
         kw["require_mutual_nn"] = bool(kw["require_mutual_nn"])
         shadow_r = float(kw.pop("shadow_radius", 0.0))
@@ -358,6 +371,7 @@ def report(res, base=None):
               f" mutualNN={st.get('mutual_nn_rejected', 0)}"
               f" diverge={st.get('divergence_rejected', 0)}"
               f" sym={st.get('symmetry_rejected', 0)}"
+              f" cls={st.get('prob_cls_rejected', 0)}"
               f" [noGC={st.get('divergence_no_grandchild', 0)}"
               f" tooClose={st.get('divergence_too_close', 0)}]")
         if st.get("shadow_merged"):
@@ -386,6 +400,8 @@ def main():
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--jobs", type=int, default=16)
     p.add_argument("--out", default=None, help="write results json here")
+    p.add_argument("--div_prob_dir", default=None,
+                   help="main_division_predict.py's <preds>_divprob folder")
     p.add_argument("--clf_scores", default=None,
                    help="div_classifier.py's out-of-fold scores npz")
     args = p.parse_args()
@@ -422,6 +438,7 @@ def main():
         cfg = parse_config(spec)
         if cfg is not None:
             cfg["clf_path"] = CLF_PATH
+            cfg["div_prob_dir"] = args.div_prob_dir
         res = evaluate_config(cache_paths, cfg, baseline_rows, args.jobs, spec)
         report(res, baseline)
         results.append(res)

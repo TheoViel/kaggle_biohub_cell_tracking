@@ -66,12 +66,28 @@ BRIGHT_SPAN = (0.34, 1.0)
 # chromatin is textured, and that texture is what puts spurious local maxima
 # inside a cell. Rendering perfectly smooth blobs means local-max suppression
 # never has to cope with them.
-TEXTURE_AMP = (0.04, 0.32)
+# Upper bound was 0.32. Mottling multiplies the profile, so it inflates a
+# cell's *peak* as well as roughening its interior -- at 0.32 a 2-sigma draw
+# lifts the peak by ~1.6x on its own. The point of the texture is competing
+# local maxima inside one cell, which 0.22 still provides; see the peak clip in
+# render._sphere_native, lowered with it.
+TEXTURE_AMP = (0.04, 0.22)
 TEXTURE_UM = (1.2, 3.0)
 
 # A share of cells is dimmed by a log-normal factor, to reproduce the faint
 # population the real data has: a quarter of annotated real cells rise less
 # than 100% above their local background.
+# How far the brightest cell in a frame may rise above the frame's median
+# cell, measured as a *rendered peak* over 132 annotated real cells: their p99
+# is 1.51x and the single brightest reaches 1.57x. Nothing real goes past that.
+#
+# The unbounded normal draw in `Palette.sample` did: 6.7% of generated cells
+# landed above 2x and the worst reached 5.9x, which is what read as "some cells
+# are pure white" -- against any display scaled to the typical cell, a 3-6x cell
+# is a flat blown-out disc. This caps the *upper* tail only; the faint
+# population below is deliberate and separately calibrated.
+BRIGHT_MAX_RATIO = 1.55
+
 FAINT_FRAC = (0.18, 0.45)
 FAINT_MEDIAN = 0.45
 FAINT_MIN = 0.15
@@ -140,7 +156,13 @@ ATTEN_FRAC = (0.10, 0.55)
 # cells themselves -- at a contrast of 8 the detected-cell peak fell to 0.42
 # against a real 0.90 and the blob count halved. So the lighting stays modest
 # and the haze gamma, which darkens the void, carries the rest.
-ILLUM_CONTRAST = (3.2, 0.45, 1.6, 12.0)
+# The upper clip was 12.0. A smooth gradient spanning a factor C puts the
+# brightest cell at about sqrt(C) of the frame's median, so the 3.2 median
+# gives 1.79 -- which matches the real data's 1.77 measured over 2002 detected
+# cells, and is why the median stays. The tail did not: at C = 12 the brightest
+# cell reaches 3.5x the median and reads as a blown-out white disc, where
+# nothing real exceeds 1.77x.
+ILLUM_CONTRAST = (3.2, 0.45, 1.6, 5.5)
 
 # Photo-electrons at full scale, which sets shot noise (log-uniform). The old
 # fixed 300 gave 0.010 of high-frequency noise in dark regions against a real

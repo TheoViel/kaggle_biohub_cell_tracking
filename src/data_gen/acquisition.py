@@ -34,7 +34,8 @@ from dataclasses import dataclass, field, replace
 import numpy as np
 
 from data_gen.constants import (
-    ATTEN_FRAC, BRIGHT_SPAN, CELL_RADIUS_UM, COLLISION_FACTOR, DEBRIS_PER_VOLUME,
+    ATTEN_FRAC, BRIGHT_MAX_RATIO, BRIGHT_SPAN, CELL_RADIUS_UM, COLLISION_FACTOR,
+    DEBRIS_PER_VOLUME,
     DEFOCUS_UM, DENSITY_FACTOR, ELLIPTICAL_P, FAINT_FRAC, FAINT_MEDIAN, FAINT_MIN,
     HALO_AMP, HAZE_GAMMA, HAZE_UM, HAZE_Z_RATIO, ILLUM_CONTRAST, MEDIUM_LEVEL,
     PEDESTAL,
@@ -241,11 +242,22 @@ class Palette:
             regime.bright_lo,
             regime.bright_hi,
         )
+        # Cap the upper tail against the frame's own median. Real cells sit in
+        # a narrow band -- the brightest of 132 annotated ones reaches 1.57x
+        # the frame median -- while the draw above is unbounded on the high
+        # side and produced cells at 5.9x, rendering as flat white discs. The
+        # clip to `bright_hi` does not prevent this: `bright_hi` is a per-regime
+        # ceiling, and what matters visually is a cell's brightness *relative to
+        # its neighbours in the same frame*.
+        if n:
+            bright = np.minimum(bright, BRIGHT_MAX_RATIO * float(np.median(bright)))
+
         # The faint population. The real data holds cells that rise only ~44%
         # above their local background where a typical one rises ~220%, and
         # those are precisely the ones a detector misses. A symmetric spread
         # around a bright mean never produces them; a log-normal knock-down on
-        # a share of cells does.
+        # a share of cells does. Applied after the cap, since it only ever
+        # reduces and the cap is about the bright end.
         faint = rng.random(n) < regime.faint_frac
         bright[faint] *= np.clip(
             rng.lognormal(np.log(FAINT_MEDIAN), 0.45, int(faint.sum())),

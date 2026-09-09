@@ -81,7 +81,11 @@ def _sphere_native(r_um, rng, sharp=7, aniso=None, theta=None, frac=None,
     noise = trng.normal(0, 1, prof.shape).astype(np.float32)
     noise = gaussian_filter(noise, tuple(texture_um / VOXEL_NATIVE))
     noise /= noise.std() + 1e-9
-    return prof * np.clip(1.0 + texture_amp * noise, 0.25, 1.75), core
+    # The upper bound was 1.75, which let mottling alone put a cell 75% above
+    # where its own brightness placed it. Real detected cells span 1.77x from
+    # the frame median *in total*, across lighting, depth and brightness
+    # together, so no single term may spend that much of the budget.
+    return prof * np.clip(1.0 + texture_amp * noise, 0.25, 1.45), core
 
 
 def _scattered_light(emis, n_cells, regime: Regime):

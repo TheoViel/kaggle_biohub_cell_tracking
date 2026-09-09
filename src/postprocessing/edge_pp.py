@@ -473,6 +473,9 @@ def propose_divisions(
     require_mutual_nn=True,
     frame_frac_cap=0.0076,
     global_frac_cap=0.00375,
+    div_prob=None,
+    div_prob_min=0.0,
+    div_prob_rank=True,
     return_stats=False,
 ):
     """Give a parent a second child where the geometry says a cell divided.
@@ -508,6 +511,27 @@ def propose_divisions(
     * ``symmetry_tau`` -- the parent must sit between its daughters, not beside
       one of them: ``|d1 - d2| / mean(d1, d2) <= tau``.
 
+    ``div_prob`` is the division classifier's opinion of the *parent*, one entry
+    per node from `main_division_predict.py` (`nan` where unscored). It enters
+    twice and both matter:
+
+    * as a gate, ``div_prob_min`` -- and this is the only signal here that is
+      not geometry or the edge model's link probability, which is why it is
+      worth the extra pass. `README_edge.md` establishes that precision is the
+      binding constraint and that no rearrangement of the existing features
+      supplies it; the classifier reads the image, where the mitotic figure
+      actually is.
+    * as the ranking, ``div_prob_rank`` -- the caps below admit only a handful
+      of proposals per frame, so *which* ones they admit is most of the
+      decision. Ordering by ``parent_dist + 0.15 * sister_dist`` prefers the
+      tightest pair; ordering by the classifier prefers the one that looks like
+      a division.
+
+    A parent with no score (`nan`) is treated as unscored rather than as zero:
+    it falls back to the geometric ordering and is only gated if
+    ``div_prob_min`` is set, so a partially-scored folder degrades to the old
+    behaviour instead of silently dropping every division.
+
     Then the caps: ``frame_frac_cap`` of the eligible parents in a frame and
     ``global_frac_cap`` of all nodes, proposals taken in order of
     ``parent_dist + 0.15 * sister_dist``. Divisions are rare -- 26 in 71 stacks
@@ -527,8 +551,14 @@ def propose_divisions(
         # sisters simply do not separate enough, and a pair where one sister has
         # no committed child at t+2 to measure the separation with at all.
         "divergence_no_grandchild", "divergence_too_close",
-        "proposals", "capped", "added",
+        "prob_cls_rejected", "proposals", "capped", "added",
     )}
+    cls = None if div_prob is None else np.asarray(div_prob, float).ravel()
+    if cls is not None and len(cls) != len(coords):
+        raise ValueError(
+            f"div_prob covers {len(cls)} of {len(coords)} nodes; it must be the "
+            "array main_division_predict.py wrote for *this* prediction npz"
+        )
     if len(edges) == 0 or len(coords) == 0:
         return (edges, stats) if return_stats else edges
 
@@ -597,6 +627,13 @@ def propose_divisions(
                 if prob < min_prob:
                     stats["prob_rejected"] += 1
                     continue
+                # The classifier's view of the parent. `nan` means unscored --
+                # not "not dividing" -- so it passes the gate and falls back to
+                # the geometric ranking below.
+                p_cls = float(cls[parent]) if cls is not None else float("nan")
+                if div_prob_min > 0 and p_cls == p_cls and p_cls < div_prob_min:
+                    stats["prob_cls_rejected"] += 1
+                    continue
                 parent_dist = float(np.linalg.norm(p_um[parent] - p_um[q]))
                 sister_dist = float(np.linalg.norm(p_um[child] - p_um[q]))
                 if parent_dist > max_parent_um or sister_dist > max_sister_um:
@@ -617,9 +654,12 @@ def propose_divisions(
                     if abs(child_dist - parent_dist) / denom > symmetry_tau:
                         stats["symmetry_rejected"] += 1
                         continue
-                proposals.append(
-                    (parent_dist + 0.15 * sister_dist, parent, q, prob, parent_dist)
-                )
+                # Lower sorts first. Geometry gives `parent_dist + 0.15 *
+                # sister_dist`; the classifier gives `-p_cls`, so a confident
+                # division outranks a merely tight pair.
+                order_key = (-p_cls if (div_prob_rank and p_cls == p_cls)
+                             else parent_dist + 0.15 * sister_dist)
+                proposals.append((order_key, parent, q, prob, parent_dist))
 
         stats["proposals"] += len(proposals)
         proposals.sort(key=lambda item: item[0])
