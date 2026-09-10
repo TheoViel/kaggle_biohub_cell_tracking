@@ -36,7 +36,8 @@ import torch
 import zarr
 from torch.utils.data import Dataset
 
-from embeddings.augment import apply_photometric, resolve_aug_cfg, sample_geometry
+from embeddings.augment import apply_photometric, sample_geometry
+from division_cls.augment import apply_clip_aug, resolve_div_aug, sample_clip_aug
 from embeddings.patches import extract_patches
 from params import SCALE
 from tracking_cellmot.io import list_datasets
@@ -138,7 +139,7 @@ class DivisionDataset(Dataset):
         self.patch_z = int(patch_z)
         self.n_frames = int(n_frames)
         self.augment = bool(augment)
-        self.aug_cfg = resolve_aug_cfg(aug_cfg)
+        self.aug_cfg, self.div_aug = resolve_div_aug(aug_cfg)
         self.seed = int(seed)
         self._vol = {}
 
@@ -238,6 +239,7 @@ class DivisionDataset(Dataset):
         geom = {"angle": 0.0, "scale": 1.0, "elastic": None,
                 "photo": {"brightness": 0.0, "contrast": 1.0, "gamma": 1.0, "noise": 0.0}}
         cy, cx = float(y), float(x)
+        zc, draw = float(z), None
         if self.augment:
             # One draw for the whole clip, not one per frame: the frames are the
             # same scene a moment apart, and re-rolling per frame would destroy
@@ -248,6 +250,11 @@ class DivisionDataset(Dataset):
             if jit:
                 cy += float(rng.normal(0, jit / SCALE[1]))
                 cx += float(rng.normal(0, jit / SCALE[2]))
+            # The clip-level draw: what has to be decided before the pixels are
+            # read (which z, which per-frame offset) and what is applied to the
+            # assembled clip afterwards.
+            draw = sample_clip_aug(self.div_aug, rng, self.n_frames, SCALE[1:])
+            zc += draw["z"]
 
         half = self.n_frames // 2
         clip = np.zeros((self.n_frames, self.patch_z, self.patch_yx, self.patch_yx),
@@ -256,15 +263,19 @@ class DivisionDataset(Dataset):
             tt = t + dt
             if tt < 0 or tt >= n_t:
                 continue            # off the ends of the video: genuinely nothing
-            slab = self._slab(vol, tt, z)
+            slab = self._slab(vol, tt, zc)
             # Percentiles over the slab, following the paper's per-frame rule;
             # a per-crop range would erase how bright this cell is next to its
             # neighbours, which is part of what marks a mitotic one.
             lo, hi = np.percentile(slab, [1.0, 99.99])
             slab = np.clip((slab - lo) / (hi - lo + 1e-6), 0.0, 1.0)
 
+            # The per-frame residual shift is registration error, so it moves
+            # the crop centre rather than the image: same thing, one fewer
+            # resampling pass.
+            dy, dx = (draw["shift"][k] if draw is not None else (0.0, 0.0))
             patch = extract_patches(
-                slab, np.array([[self.patch_z // 2, cy, cx]], np.float32),
+                slab, np.array([[self.patch_z // 2, cy + dy, cx + dx]], np.float32),
                 patch_zyx=(self.patch_z, self.patch_yx, self.patch_yx),
                 angle_deg=geom["angle"], scale=geom["scale"],
                 elastic=geom["elastic"], n_frames=1,
@@ -272,6 +283,10 @@ class DivisionDataset(Dataset):
             if self.augment:
                 patch = apply_photometric(patch, geom["photo"], rng)
             clip[k] = patch
+
+        label = float(label)
+        if draw is not None:
+            clip, label = apply_clip_aug(clip, draw, self.div_aug, rng, label)
 
         return {
             "clip": torch.from_numpy(clip),                       # (T, pz, H, W)
