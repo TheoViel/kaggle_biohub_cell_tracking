@@ -1,0 +1,71 @@
+seed0	--seed 0
+seed1	--seed 1
+seed2	--seed 2
+seed3	--seed 3
+aug_none	--augmentations '{"flip_p": 0, "rot90_p": 0, "z_jitter": 0, "frame_shift_um": 0, "frame_brightness": 0, "frame_contrast": 0, "shot_noise": 0, "blur_p": 0, "cutout_p": 0}'
+no_flip_p	--augmentations '{"flip_p": 0}'
+no_rot90_p	--augmentations '{"rot90_p": 0}'
+no_z_jitter	--augmentations '{"z_jitter": 0}'
+no_frame_shift_um	--augmentations '{"frame_shift_um": 0}'
+no_frame_brightness	--augmentations '{"frame_brightness": 0}'
+no_frame_contrast	--augmentations '{"frame_contrast": 0}'
+no_shot_noise	--augmentations '{"shot_noise": 0}'
+no_blur_p	--augmentations '{"blur_p": 0}'
+no_cutout_p	--augmentations '{"cutout_p": 0}'
+aug_light	--augmentations '{"rot_p": 0.5, "elastic_p": 0.3, "scale_p": 0.3, "brightness": 0.12, "contrast": 0.12, "gamma": 0.12, "shot_noise": 0.02, "blur_p": 0.1, "cutout_p": 0.1, "frame_shift_um": 0.2}'
+aug_strong	--augmentations '{"elastic_p": 0.8, "elastic_um": 2.0, "scale_p": 0.8, "scale_range": [0.8, 1.25], "brightness": 0.35, "contrast": 0.35, "gamma": 0.35, "shot_noise": 0.07, "blur_p": 0.4, "blur_sigma": [0.4, 1.6], "cutout_p": 0.4, "cutout_frac": [0.1, 0.4], "frame_shift_um": 0.6, "frame_brightness": 0.1, "frame_contrast": 0.1, "z_jitter": 1}'
+aug_extreme	--augmentations '{"elastic_p": 0.9, "elastic_um": 2.6, "scale_p": 0.9, "scale_range": [0.75, 1.35], "brightness": 0.45, "contrast": 0.45, "gamma": 0.45, "shot_noise": 0.1, "blur_p": 0.5, "blur_sigma": [0.5, 2.0], "cutout_p": 0.5, "cutout_frac": [0.15, 0.45], "frame_shift_um": 0.8, "frame_brightness": 0.15, "frame_contrast": 0.15, "z_jitter": 2}'
+reverse0.15	--augmentations '{"time_reverse_p": 0.15}'
+reverse0.3	--augmentations '{"time_reverse_p": 0.3}'
+reverse0.5	--augmentations '{"time_reverse_p": 0.5}'
+drop_ctx0.3	--augmentations '{"drop_context_p": 0.3}'
+reverse0.3_strong	--augmentations '{"time_reverse_p": 0.3, "elastic_p": 0.8, "scale_p": 0.8, "cutout_p": 0.4, "shot_noise": 0.07}'
+mult2	--positive_multiplier 2
+mult12	--positive_multiplier 12
+mult24	--positive_multiplier 24
+mult32	--positive_multiplier 32
+mult24_strong	--positive_multiplier 24 --augmentations '{"elastic_p": 0.8, "scale_p": 0.8, "cutout_p": 0.4, "shot_noise": 0.07, "brightness": 0.35, "contrast": 0.35}'
+mult4_light	--positive_multiplier 4 --augmentations '{"rot_p": 0.5, "elastic_p": 0.3, "scale_p": 0.3, "cutout_p": 0.1, "blur_p": 0.1}'
+bb_convnext_atto	--backbone convnext_atto
+bb_convnext_femto	--backbone convnext_femto
+bb_convnext_pico	--backbone convnext_pico
+bb_convnext_nano	--backbone convnext_nano
+bb_convnext_small	--backbone convnext_small
+bb_convnextv2_nano	--backbone convnextv2_nano
+bb_convnextv2_tiny	--backbone convnextv2_tiny
+bb_resnet18	--backbone resnet18
+bb_resnet34	--backbone resnet34
+bb_efficientnet_b0	--backbone efficientnet_b0
+bb_maxvit_nano_rw_256	--backbone maxvit_nano_rw_256
+bb_regnety_016	--backbone regnety_016
+bb_seresnext26d_32x4d	--backbone seresnext26d_32x4d
+bb_repvgg_a2	--backbone repvgg_a2
+bb_densenet121	--backbone densenet121
+bb_scratch	--no-pretrained
+d128	--d_model 128 --dim_feedforward 256
+d384	--d_model 384 --dim_feedforward 768
+d512	--d_model 512 --dim_feedforward 1024
+layers2	--n_layers 2
+layers6	--n_layers 6
+layers8	--n_layers 8
+heads2	--n_heads 2
+heads8	--n_heads 8
+drop0.0	--dropout 0.0
+drop0.2	--dropout 0.2
+drop0.35	--dropout 0.35
+tokens2	--min_tokens 2
+tokens8	--min_tokens 8
+neg6	--neg_per_pos 6
+neg24	--neg_per_pos 24
+neg48	--neg_per_pos 48
+neg_stack	--negatives stack --neg_per_pos 24
+exclude0	--exclude_window 0
+exclude2	--exclude_window 2
+lr0.0001	--optimizer_config '{"lr": 0.0001}'
+lr0.0006	--optimizer_config '{"lr": 0.0006}'
+enc_lr1e-4	--optimizer_config '{"lr_encoder": 0.0001}'
+wd0.05	--optimizer_config '{"weight_decay": 0.05}'
+bs16	--batch_size 16
+bs64	--batch_size 64
+iter4000	--iterations 4000
+iter4000_strong	--iterations 4000 --augmentations '{"elastic_p": 0.8, "scale_p": 0.8, "cutout_p": 0.4, "shot_noise": 0.07}'
