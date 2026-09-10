@@ -106,7 +106,7 @@ DEFAULTS = {
     "data_dir": TRAIN_DIR,
     "window_size": 2,
     "crop_size": None,  # (16, 64, 64),  # None,  # (16, 64, 64),     # Crop
-    "selected_folds": [1],
+    "selected_folds": [0, 1],
     "fullfit": True,
     "fullfit_n_val_videos": 1,     # leaky either way, so keep the eval cheap
 
@@ -165,8 +165,8 @@ DEFAULTS = {
 
     # Stage 1 - Synthetic data pretraining
     "synthetic_pretraining": {
-        "enabled": False,
-        "synthetic_dir": "../input/synthetic/v4/",
+        "enabled": True,
+        "synthetic_dir": "../input/synthetic/v5/",
         "synthetic_proportion": 1,
         "weights": None,
         # Data
@@ -213,7 +213,8 @@ DEFAULTS = {
         "focus_3d_max_ratio": 1.75,    # drop a stack predicting far too many cells
         # Weak positives from pl_folder
         # "pl_folder": "../logs/2026-08-31/33/preds_pl_0.50/",  # 1st round PL
-        "pl_folder": "../logs/2026-09-01/9/preds_pl_pp/",  # 2nd round PL + PP
+        # "pl_folder": "../logs/2026-09-01/9/preds_pl_pp/",  # 2nd round PL + PP
+        "pl_folder": "../logs/2026-09-09/4/preds_pl_pp/",  # Extra head 3rd round PL + PP
         "pl_ignore_folder": None,  # Expects lower threshold coords
         "ignore_min_dist_um": 7.0,  # the pl_ignore_folder path only
     },
@@ -346,6 +347,7 @@ def parse_args():
                 f"--{name}", action=argparse.BooleanOptionalAction, default=value
             )
         elif isinstance(value, dict):
+            # e.g. --mixup {"p": 0., "alpha": 4.0}
             parser.add_argument(f"--{name}", type=parse_config(value), default=dict(value))
         elif isinstance(value, (tuple, list)) and any(isinstance(v, str) for v in value):
             # e.g. --unet_features '["detection", "contrastive"]'. type=list would

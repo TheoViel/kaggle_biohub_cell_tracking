@@ -47,17 +47,17 @@ from utils.logger import create_logger, prepare_log_folder
 
 DEFAULTS = {
     # Global
-    "nodes_folder": "../logs/2026-09-07/4/preds_r6_0.50/",  # best
-    # "nodes_folder": "../logs/2026-09-08/0/preds_r6_0.50/",  # + attentio
-    # "nodes_folder": "../logs/2026-09-08/3/preds_r6_0.50/",  # + windowed attention
+    # "nodes_folder": "../logs/2026-09-07/4/preds_r6_0.50/",  # best
     # "nodes_folder": "../logs/2026-09-07/4/preds_r6_0.40/",
-    # "embeddings_key": "embeddings_contrastive_2026-09-03_13", # 0.861 (?)
-    # "embeddings_key": "embeddings_contrastive_2026-09-07_2",  # 0.861/2
+    # "nodes_folder": "../logs/2026-09-09/4/preds_r6_0.40/",
+    # "nodes_folder": "../logs/2026-09-09/4/preds_r6_0.50/",
+    # "nodes_folder": "../logs/2026-09-10/0/preds_r6_0.40/",
+    "nodes_folder": "../logs/2026-09-10/0/preds_r6_0.50/",
+
     # "embeddings_key": "embeddings_contrastive_2026-09-07_3",  # 0.8623 - vit_base_patch16_224
-    "embeddings_key": "embeddings_contrastive_2026-09-08_0",  # 0.8623 - vit_small_patch8_224
-    # "embeddings_key": "embeddings_contrastive_2026-09-08_1",  # 0.8609 - xcit_tiny_12_p8_224
-    # "embeddings_key": "embeddings_contrastive_2026-09-08_2", # 0.8613 - vit_small_patch14_dinov2
-    # "embeddings_key": "embeddings_contrastive_2026-09-08_3", # 0.8612 - vit_small_patch16_dinov3.lvd1689m
+    # "embeddings_key": "embeddings_contrastive_2026-09-08_0",  # 0.8623 - vit_small_patch8_224
+    "embeddings_key": "embeddings_contrastive_2026-09-09_1",
+    
     "data_dir": TRAIN_DIR,
     "selected_folds": [0, 1] , # [0, 1],
     "fullfit": True,

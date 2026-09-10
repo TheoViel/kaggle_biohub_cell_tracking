@@ -494,6 +494,30 @@ def macro_summarise(
     return per_group, macro
 
 
+def pooled_counts(rows: list[dict]) -> dict:
+    """The count columns summed over every row, and nothing else.
+
+    :func:`summarise` also returns pooled *rates* -- ``score``,
+    ``adj_edge_jaccard``, ``division_jaccard``, ``node_recall`` -- and those are
+    the biased ones: pooling weights an embryo by however many stacks it happens
+    to contribute, so with 128 of ``6bba`` against 71 of ``44b6`` a pooled score
+    sits close to ``6bba``'s alone. The two embryos are also annotated at
+    different densities, and edge FP is only counted against annotated nodes, so
+    the pooled figure is not even an average of comparable quantities. Nothing
+    should be judged on it, and the reports no longer emit it -- see
+    :func:`macro_summarise`, which gives each embryo one vote.
+
+    Counts are the exception: summing them *is* the meaningful operation, and
+    "how many divisions did this chain get right in total" is a fair question
+    with a pooled answer. So they survive, on their own, under a name that says
+    what they are.
+    """
+    valid = [r for r in rows if r.get("edge_tp") == r.get("edge_tp")]
+    counts = {c: sum(r[c] for r in valid if c in r) for c in COUNT_COLUMNS}
+    counts["n"] = len(valid)
+    return counts
+
+
 def nan_metrics_row() -> dict:
     """Return a dict with every :data:`METRIC_COLUMNS` key set to NaN."""
     return {col: float("nan") for col in METRIC_COLUMNS}

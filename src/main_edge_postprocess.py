@@ -46,6 +46,7 @@ from tracking_cellmot.metrics import (  # noqa: E402
     MACRO_METRICS,
     evaluate,
     macro_summarise,
+    pooled_counts,
     node_recall,
     per_sample_metrics,
     summarise,
@@ -62,28 +63,38 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # checkpoint (node ratio 1.157 raw against the 1.081 the block above was tuned
 # on) -- see README_edge.md's "Retuned again for preds_0.45". min_track went
 # 2 -> 5 and recover_min_dup 4.0 -> 3.0; everything else held.
+#
+# Retuned once more on the 199 out-of-fold stacks of
+# `logs/edge_run/2026-09-09/0/preds_0.45`, the first checkpoint with the fine
+# detection head. The whole `recover` block tightened and `min_track` rose:
+# together +0.0131 (0.8374 -> 0.8506 without the ILP), gaining on both embryos
+# (+0.0111 on 44b6, +0.0152 on 6bba). Every one of the four was positive on both
+# embryos on its own as well, which is the bar README_edge.md sets. The four sit
+# on a plateau -- gap 2 scores 0.8507 to gap 3's 0.8506, min_track 6/7/8 span
+# 0.0011 -- so read the values as "somewhere in here", not as a peak.
 DEFAULTS = dict(
     threshold=0.4,
     recover=1,
-    recover_max_gap=5,
-    recover_max_residual=5.0,
-    # 3.0, not the 4.0 this was tuned to. On a more over-detected graph the
-    # nodes recover would skip as "too close to an existing one" are more
-    # often real duplicates than genuine misses, so letting it insert a little
-    # closer and leaving `min_track` to clean up the result pays again -- the
-    # opposite direction from "Retuned for preds_pp input" below, on a graph
-    # that has moved further along the same axis.
-    recover_min_dup=3.0,
+    # 3, down from 5. The finer detection head leaves less to recover, so the
+    # long gaps that used to pay now mostly interpolate nodes into holes that
+    # are real. 5 -> 3 is worth +0.0080 on its own; 7 costs -0.0085, 4 recovers
+    # only +0.0039, and 1-2 are level with 3. Turning recover off entirely still
+    # beats gap 5 (+0.0037) but loses on 44b6 (-0.0051), so the stage earns its
+    # place -- at a shorter reach.
+    recover_max_gap=3,
+    recover_max_residual=4.0,
+    # Back to 4.0, undoing the preds_0.45 retune below. Same reasoning read the
+    # other way: this checkpoint over-detects less, so a node recover would skip
+    # as "too close to an existing one" is once again more often a real
+    # duplicate than a genuine miss. +0.0037 on its own, both embryos.
+    recover_min_dup=4.0,
     through=0.0,          # measured, finds nothing -- see the README
     through_max_gap=2,
-    # 5, not the 2 this was tuned to on preds_pp input. That retune reasoned
-    # from "little left to recover, so pruning deletes real short tracks" --
-    # true there, false here: preds_0.45 over-detects hard enough (ratio 1.157
-    # raw, 1.196 through the old min_track=2 chain) that pruning at 2 is again
-    # cheap unwanted fragments, not real tracks. Worth +0.0031 over min_track=2 on the full
-    # 71, positive on both halves of the fold and on 57 of 71 stacks
-    # individually -- see README_edge.md.
-    min_track=5,
+    # 7, up from 5, and the direction is the same as every retune before it:
+    # whatever the chain leaves as short fragments, pruning them pays. +0.0027
+    # on its own; 6 and 8 are within 0.0011 of 7 once the recover block is
+    # tightened, and 9 gives a third of it back.
+    min_track=7,
     linefit=0.6,
     linefit_window=3,
     vel_weight=0.02,
@@ -91,6 +102,25 @@ DEFAULTS = dict(
     # The ILP node filter -- see `ilp_filter_nodes`. Off: one solve is ~9-16 s a
     # stack against ~1 s for the rest of the chain, so it is a final-run switch
     # rather than something to sweep behind.
+    #
+    # As of the 2026-09-09/0 retune it is not worth turning on. That has to be
+    # measured with the divisions refitted *to the ILP graph*, because the
+    # filter removes nodes and so changes what there is to fork from -- refit
+    # both sides or the comparison is rigged:
+    #
+    #   base chain   ILP   divisions tuned for   cv
+    #   old          off   off graph             0.8375
+    #   old          on    on  graph             0.8466   <- ILP worth +0.0091
+    #   new          off   off graph             0.8506
+    #   new          on    on  graph             0.8508   <- ILP worth +0.0002
+    #
+    # So the filter was doing real work, and the tightened `recover` block and
+    # `min_track=7` now do the same work for ~1 s a stack instead of 9-16. The
+    # two were always substitutes; the retune made the cheap one sufficient.
+    # Consistently, the ILP buys macro adj_edge_jaccard (0.8391 against 0.8370)
+    # and sells division_jaccard (0.114 against 0.136): it drops spurious
+    # detections and dividing nodes alike. Re-measure -- both sides -- before
+    # trusting this on a checkpoint that over-detects again.
     ilp=0,
     ilp_threshold=0.50,
     ilp_edge_weight=-1.0,
@@ -111,19 +141,32 @@ DEFAULTS = dict(
     # since it works from geometry with no scored candidate graph.
     # See README_edge.md, "Divisions".
     divisions=1,
-    # 0.40 and 0.35 are within 0.0003 of each other on the 199 out-of-fold
-    # stacks and identical on 44b6; 0.40 is the conservative end of that tie,
-    # adding fewer edges for the same score. 0.45 costs 0.0031 and 0.50 costs
-    # 0.0061 -- past the break-even the gate starts dropping true divisions.
+    # 0.40 and 0.35 are within 0.0001 of each other on the 199 out-of-fold
+    # stacks of 2026-09-09/0 (0.8374 against 0.8375) and both gain on both
+    # embryos; 0.40 is the conservative end of that tie, proposing 6/50 false
+    # divisions against 0.35's 10/73 for the same score. 0.45 costs 0.0014.
     div_min_prob=0.40,
     div_max_parent_um=9.0,
     div_max_existing_child_um=10.0,
     div_max_sister_um=14.0,
-    div_symmetry_tau=0.6,
-    # 3.0, not 946's 2.25: worth +0.0007..+0.0009 over it at both min_prob 0.35
-    # and 0.40, on both embryos, which is the only knob here whose gain held
-    # its sign everywhere. 4.0 gives it all back and more (-0.005).
-    div_diverge_um=3.0,
+    # 0 -- off -- retuned on the 199 out-of-fold stacks of
+    # `logs/edge_run/2026-09-09/0/preds_0.45`. Worth +0.0018 over 0.6 at
+    # diverge 3.0 and +0.0025 at 3.5, gaining on *both* embryos. The gate is
+    # effectively binary rather than a knob: 1.5 scores identically to 0 (the
+    # ratio is bounded by 2, so it almost never trips) and the whole cost sits
+    # in the 0.3-0.6 middle, where 0.3 is -0.0060. It asks the parent to sit
+    # between its daughters, and on this data it often does not.
+    #
+    # The same retune on the tracking chain, where there is no `min_prob` to do
+    # the rejecting, moved it much further -- see DIVISIONS_TUNED in
+    # main_postprocess.py.
+    div_symmetry_tau=0.0,
+    # 3.5 with the symmetry gate off, where the old 3.0 was tuned with it on.
+    # Read 3.0-4.5 as one plateau at ~0.8365 +- 0.001: the curve is not monotone
+    # inside it (3.5 and 4.5 both 0.8374, 3.75 0.8361), so that spread is noise
+    # on 151 divisions and only the ends mean anything -- 2.25 is -0.0048 and
+    # 5.0 is -0.0031.
+    div_diverge_um=3.5,
     div_require_divergence=1,
     div_require_mutual_nn=1,
     div_frame_frac_cap=0.0076,
@@ -249,17 +292,29 @@ def _latest_run(base_dir: Path) -> Path:
 def _folder_score(preds_dir: Path) -> float | None:
     """A preds folder's headline score, from the json main_edge_predict wrote.
 
-    ``score`` is the competition number; ``edge_jaccard`` stands in for a split
-    where it could not be formed (no divisions present, say). A NaN is treated
-    as no score at all rather than compared, since NaN loses every comparison
-    and would quietly rank last -- or first, depending which way it is written.
+    ``cv_score`` is the competition number, one vote per embryo; macro
+    ``edge_jaccard`` stands in for a split where it could not be formed (no
+    divisions present, say). A NaN is treated as no score at all rather than
+    compared, since NaN loses every comparison and would quietly rank last --
+    or first, depending which way it is written.
+
+    Files written before the pooled ``overall`` block was dropped are still read
+    from it, last, so an old run remains rankable. That is a fallback and not a
+    preference: on two embryos of very different sample counts the two numbers
+    disagree, and mixing them across a sweep would rank the folders by which
+    format they happen to be in.
     """
     path = preds_dir.parent / f"scores_{preds_dir.name}.json"
     if not path.exists():
         return None
-    overall = (json.load(open(path)).get("overall") or {})
+    blob = json.load(open(path))
+    macro = blob.get("macro") or {}
+    for value in (blob.get("cv_score"), macro.get("score"), macro.get("edge_jaccard")):
+        if value is not None and value == value:
+            return float(value)
+    legacy = blob.get("overall") or {}
     for key in ("score", "edge_jaccard"):
-        value = overall.get(key)
+        value = legacy.get(key)
         if value is not None and value == value:
             return float(value)
     return None
@@ -587,7 +642,7 @@ def main():
         print(f"\n-> wrote {len(paths)} stacks to {out_dir} and {geff_dir} (not scored)")
         return
 
-    summary = summarise(rows)
+    counts = pooled_counts(rows)
     group_summaries, macro = macro_summarise(rows)
     by_embryo = {}
     for row in rows:
@@ -603,9 +658,11 @@ def main():
         "settings": {k: v for k, v in cfg.items()
                      if k not in ("out_dir", "geff_dir", "no_score")},
         "n_samples": len(rows),
+        # The only score. `overall` -- the sample-count-weighted pooling -- used
+        # to sit here beside it and is gone: see metrics.pooled_counts.
         "cv_score": _jsonable(macro["score"]),
         "macro": _jsonable(macro),
-        "overall": _jsonable(summary),
+        "counts": _jsonable(counts),
         "per_embryo": {
             emb: {
                 "fold": sorted({r["fold"] for r in by_embryo[emb]
@@ -632,25 +689,21 @@ def main():
     print(f"{len(rows)} stacks  ->  {out_dir}")
     print(f"{'=' * 78}")
 
-    # Pooled over every stack: counts, where summing is the meaningful thing.
+    # Pooled over every stack: counts only, where summing is the meaningful
+    # thing. The pooled *rates* are not reported at all -- see
+    # metrics.pooled_counts for why.
     for k in ("edge_tp", "edge_fp", "edge_fn",
               "division_tp", "division_fp", "division_fn"):
-        if k in summary:
-            print(f"- {k}: {summary[k]:.0f}")
-    for k in ("node_recall", "edge_jaccard", "adj_edge_jaccard",
-              "division_jaccard", "score"):
-        if k in summary:
-            print(f"- {k}: {summary[k]:.4f}")
+        if k in counts:
+            print(f"- {k}: {counts[k]:.0f}")
 
-    # The number a fold is judged on. Pooling weights an embryo by how many
-    # stacks it happens to contribute -- 128 of 6bba against 71 of 44b6 -- so
-    # the macro mean, one vote each, is the headline and `score` above is not.
-    if macro["n_groups"] > 1:
-        print(f"\nmacro  (mean over {macro['n_groups']} embryos, one vote each)")
-        for k in MACRO_METRICS:
-            if k in macro:
-                label = "cv_score" if k == "score" else k
-                print(f"- {label:<17s}: {macro[k]:.4f}")
+    # The number a fold is judged on: one vote per embryo.
+    print(f"\nmacro  (mean over {macro['n_groups']} "
+          f"embryo{'s' if macro['n_groups'] != 1 else ''}, one vote each)")
+    for k in MACRO_METRICS:
+        if k in macro:
+            label = "cv_score" if k == "score" else k
+            print(f"- {label:<17s}: {macro[k]:.4f}")
 
     per_embryo = scores["per_embryo"]
     if len(per_embryo) > 1:

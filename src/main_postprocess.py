@@ -4,7 +4,7 @@ Post-process every stack of a prediction run, and score the result.
 Reads  <log_folder>/preds/*.npz     — the tracker's own output
 Writes <log_folder>/preds_pp/*.npz  — the same format, post-processed
        <log_folder>/geff_pp/*.geff  — the same graphs, for the viewer
-       <log_folder>/preds_pp/metrics.csv, summary.json
+       <log_folder>/preds_pp/metrics.csv, scores_pp.json
 
     python main_postprocess.py --log_folder ../logs/2026-08-20/20/
 
@@ -101,10 +101,12 @@ from tracking.post_process import build_graph  # noqa: E402
 from tracking_cellmot.io import save_graph  # noqa: E402
 from utils.logger import get_last_log_folder  # noqa: E402
 from tracking_cellmot.metrics import (  # noqa: E402
+    MACRO_METRICS,
     evaluate,
     macro_summarise,
     node_recall,
     per_sample_metrics,
+    pooled_counts,
     summarise,
 )
 
@@ -294,14 +296,16 @@ def _best_threshold_preds_dir(log_folder, pl=False, th=None):
                 f"No {stem}<_th>.json under {log_folder}; "
                 "pass --th or --preds_dir explicitly"
             )
-        # cv_score when the run scored more than one embryo -- the pooled
-        # score would pick whichever threshold suits the embryo contributing
-        # the most stacks. Older score files predate the field, so fall back.
+        # cv_score, one vote per embryo. The pooled score this used to fall
+        # back on would pick whichever threshold suits the embryo contributing
+        # the most stacks; it is no longer written, and the fallback stays only
+        # so files from before that change remain rankable.
         best_file, best_score, best, best_key = None, float("-inf"), None, "score"
         for f in score_files:
             scores = json.loads(f.read_text())
             key = "cv_score" if scores.get("cv_score") is not None else "score"
-            score = scores[key] if key == "cv_score" else scores["overall"]["score"]
+            score = (scores[key] if key == "cv_score"
+                     else (scores.get("overall") or {}).get("score"))
             if score is not None and score == score and score > best_score:
                 best_file, best_score, best, best_key = f, score, scores, key
         if best is None:
@@ -547,12 +551,9 @@ def main():
         return
 
     metrics_file = out_dir.parent / "metrics.csv" if not args.pl else out_dir.parent / "metrics_pl.csv"
-    summary_file = out_dir.parent / "summary.json" if not args.pl else out_dir.parent / "summary_pl.json"
     df = pd.DataFrame(rows).sort_values("sample_name")
     df.to_csv(metrics_file, index=False)
-    summary = summarise(rows)
-    with open(summary_file, "w") as f:
-        json.dump(_jsonable(summary), f, indent=4, default=str)
+    counts = pooled_counts(rows)
 
     # One summary per embryo, i.e. per fold. Kept separate rather than pooled:
     # the embryos are annotated at very different densities and edge FP is only
@@ -585,11 +586,11 @@ def main():
         "split": "train" if args.pl else "val",
         "stages": stages,
         "n_samples": len(rows),
-        # The headline number: the pooled "overall" score weights each embryo
-        # by its sample count, so it is close to the larger embryo's alone.
+        # The only score: one vote per embryo. The pooled `overall` block that
+        # used to sit here is gone -- see metrics.pooled_counts.
         "cv_score": _jsonable(macro["score"]),
         "macro": _jsonable(macro),
-        "overall": _jsonable(summary),
+        "counts": _jsonable(counts),
         "per_embryo": per_embryo,
         "per_sample": {
             r["sample_name"]: _jsonable({k: r[k] for k in report_keys if k in r})
@@ -608,16 +609,16 @@ def main():
     print(f"\n{'=' * 60}")
     print(f"{len(rows)} stacks  ->  {out_dir}")
     print(f"{'=' * 60}")
+    # Counts pool; rates do not -- see metrics.pooled_counts.
     for k in ("edge_tp", "edge_fp", "edge_fn"):
-        if k in summary:
-            print(f"- {k}: {summary[k]:.0f}")
-    for k in ("node_recall", "edge_jaccard", "adj_edge_jaccard",
-              "division_jaccard", "score"):
-        if k in summary:
-            print(f"- {k}: {summary[k]:.4f}")
-    if macro["n_groups"] > 1:
-        print(f"- cv_score: {macro['score']:.4f}   (mean over "
-              f"{macro['n_groups']} embryos, not pooled)")
+        if k in counts:
+            print(f"- {k}: {counts[k]:.0f}")
+    print(f"\nmacro  (mean over {macro['n_groups']} "
+          f"embryo{'s' if macro['n_groups'] != 1 else ''}, one vote each)")
+    for k in MACRO_METRICS:
+        if k in macro:
+            label = "cv_score" if k == "score" else k
+            print(f"- {label:<17s}: {macro[k]:.4f}")
 
     # Only when there is more than one, otherwise it repeats the block above.
     if len(per_embryo) > 1:
@@ -631,7 +632,6 @@ def main():
             print(f"  {emb:<10}{fold_str:<6}{s['n_samples']:<5}{cells}")
 
     print(f"\n-> metrics : {metrics_file}")
-    print(f"-> summary : {summary_file}")
     print(f"-> scores  : {scores_file}")
 
 

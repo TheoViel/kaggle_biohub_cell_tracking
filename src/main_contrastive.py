@@ -51,8 +51,8 @@ from utils.logger import create_logger, prepare_log_folder
 
 DEFAULTS = {
     # Global
-    "coords_log_folder": "../logs/2026-09-07/4/preds_r6_0.50/",
-    # "coords_log_folder": "../logs/2026-09-02/9/preds_0.50/",
+    # "coords_log_folder": "../logs/2026-09-07/4/preds_r6_0.50/",
+    "coords_log_folder": "../logs/2026-09-09/4/preds_r6_0.40/",
     "data_dir": TRAIN_DIR,
     "selected_folds": [0, 1],
     "fullfit": True,
@@ -84,8 +84,8 @@ DEFAULTS = {
     },
 
     # Model
-    "backbone": "vit_small_patch16_224.dino",
-    # "backbone": "vit_small_patch8_224.dino",
+    # "backbone": "vit_small_patch16_224.dino",
+    "backbone": "vit_small_patch8_224.dino",
     # "backbone": "xcit_tiny_12_p8_224.fb_dist_in1k",
     "pretrained": True,
     "frame_aggregation": "mean",   # "mean" (paper default) | "bigru"

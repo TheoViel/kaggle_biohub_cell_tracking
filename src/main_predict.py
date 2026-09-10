@@ -6,7 +6,7 @@ section: predict_video -> build_graph -> evaluate, per sample.
 
 Predictions land in <log_folder>/preds/<sample>.npz (coords + edges), with
 per-sample metrics in <log_folder>/preds/metrics.csv and a run-level summary
-in summary.json.
+in scores_<th>.json.
 
 Several detection thresholds and greedy-NMS radii can be swept in one pass, as
 their full cross product. The UNet forward is what this costs and it depends on
@@ -56,6 +56,7 @@ from tracking_cellmot.metrics import (
     node_recall,
     macro_summarise,
     per_sample_metrics,
+    pooled_counts,
     summarise,
 )
 from training.distributed import cleanup_distributed, init_distributed
@@ -278,11 +279,11 @@ def _print_sweep(summaries: dict, per_embryo: dict | None = None):
             ((r,) if sweep_r else ()) + ((th,) if sweep_th else ())
         )
 
-    def _table(title, table: dict, rank_key="score"):
-        # cv_score only exists on the pooled table; a per-embryo one would
-        # print a column of NaN.
-        has_cv = any("cv_score" in row for row in table.values())
-        columns = (("score", "cv_score") if has_cv else ("score",)) + base_columns[1:]
+    def _table(title, table: dict, rank_key="score", score_label="score"):
+        # The all-embryo table holds macro metrics, so its `score` column *is*
+        # cv_score and is labelled as such; a per-embryo table has one embryo,
+        # where the distinction does not arise.
+        columns = base_columns
 
         def rank(key):
             # NaN compares False against everything, so a failed grid point
@@ -296,15 +297,16 @@ def _print_sweep(summaries: dict, per_embryo: dict | None = None):
         print(f"\n{'=' * 78}")
         print(title)
         print(f"{'=' * 78}")
+        headers = [score_label if c == "score" else c for c in columns]
         print("".join(f"{lbl:>7s}" for lbl in labels) + "  "
-              + "".join(f"{c:>18s}" for c in columns))
+              + "".join(f"{c:>18s}" for c in headers))
         for key in sorted(table):
             cells = "".join(f"{table[key].get(c, float('nan')):>18.4f}" for c in columns)
             print(f"{_label(key)}  {cells}"
                   f"{'   <- best' if ranked and key == best else ''}")
 
         if ranked:
-            label = "cv_score" if rank_key == "cv_score" else "score"
+            label = score_label
             r, th = best
             at = f"threshold {th:g}" + (f", nms_radius_um {r:g}" if sweep_r else "")
             print(f"\n-> best {label} {rank(best):.4f} at {at}")
@@ -315,13 +317,11 @@ def _print_sweep(summaries: dict, per_embryo: dict | None = None):
         "NMS RADIUS SWEEP" if sweep_r else "THRESHOLD SWEEP"
     )
     embryos = sorted({e for pe in (per_embryo or {}).values() for e in pe})
-    # Rank by cv_score once there is more than one embryo: the pooled score
-    # would pick whichever grid point suits the embryo with more stacks.
     multi = len(embryos) > 1
     _table(
         title + ("  (all embryos)" if multi else ""),
         summaries,
-        rank_key="cv_score" if multi else "score",
+        score_label="cv_score" if multi else "score",
     )
 
     if len(embryos) > 1:
@@ -601,10 +601,7 @@ def main():
 
         df = pd.DataFrame(th_rows).sort_values("sample_name")
         df.to_csv(out_dir / "metrics.csv", index=False)
-        summary = summarise(th_rows)
-        summaries[key] = summary
-        with open(out_dir / "summary.json", "w") as f:
-            json.dump(summary, f, indent=4, default=str)
+        counts = pooled_counts(th_rows)
 
         # One summary per embryo. Folds hold out different embryos, so this is
         # also the per-fold breakdown. Worth keeping separate: the embryos are
@@ -626,12 +623,12 @@ def main():
             for emb, summary_emb in group_summaries.items()
         }
         per_embryo_all[key] = per_embryo
-        summaries[key]["cv_score"] = macro["score"]
+        # One vote per embryo. The pooled roll-up that used to sit here weighted
+        # each embryo by its sample count -- 128 stacks of 6bba against 71 of
+        # 44b6 -- so it sat close to 6bba's score alone; see
+        # metrics.pooled_counts.
+        summaries[key] = dict(macro)
 
-        # Per-sample scores alongside the run-level roll-up.
-        # The headline number. The pooled "overall" score weights each embryo
-        # by its sample count -- 128 stacks of 6bba against 71 of 44b6 -- so it
-        # is close to 6bba's score alone. cv_score gives each embryo one vote.
         worst = sorted(
             (r for r in th_rows if r.get("score") == r.get("score")),
             key=lambda r: r["score"],
@@ -644,7 +641,7 @@ def main():
             "n_samples": len(th_rows),
             "cv_score": _jsonable(macro["score"]),
             "macro": _jsonable(macro),
-            "overall": _jsonable(summary),
+            "counts": _jsonable(counts),
             "per_embryo": per_embryo,
             "threshold": th,
             "nms_radius_um": radius,
@@ -681,13 +678,16 @@ def main():
         print(f"{head}  -  {len(th_rows)} stacks  ->  {out_dir}")
         print(f"-> scores: {scores_path}")
         print(f"{'=' * 60}")
+        # Counts pool; rates do not -- see metrics.pooled_counts.
         for k in ("edge_tp", "edge_fp", "edge_fn"):
-            if k in summary:
-                print(f"- {k}: {summary[k]:.0f}")
-        for k in ("node_recall", "edge_jaccard", "adj_edge_jaccard",
-                  "division_jaccard", "score"):
-            if k in summary:
-                print(f"- {k}: {summary[k]:.4f}")
+            if k in counts:
+                print(f"- {k}: {counts[k]:.0f}")
+        print(f"\nmacro  (mean over {macro['n_groups']} "
+              f"embryo{'s' if macro['n_groups'] != 1 else ''}, one vote each)")
+        for k in MACRO_METRICS:
+            if k in macro:
+                label = "cv_score" if k == "score" else k
+                print(f"- {label:<17s}: {macro[k]:.4f}")
 
         # Only when there is more than one, otherwise it just repeats the above.
         if len(per_embryo) > 1:

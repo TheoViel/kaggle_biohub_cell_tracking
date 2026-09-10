@@ -6,6 +6,13 @@ Takes a training run (``--exp_folder``, holding ``args.json`` and
 (``--coords_log_folder``, holding ``<sample>.npz`` with a ``coords`` array of
 ``(t, z, y, x)`` rows), and writes one embedding per detected cell.
 
+Both default to the obvious thing, which is also the only *safe* thing: the
+latest run under ``logs/contrastive/``, and the detections that run trained on,
+read straight out of its own ``args.json``. Passing them separately is a chance
+to pass them inconsistently -- embeddings from a model trained on one node set,
+written into another -- and since the rows would still line up, nothing
+downstream would notice.
+
 The embeddings are written **back into the npz they were read from**, under a
 key naming the run that produced them: ``../logs/2026-09-03/13/`` becomes
 ``embeddings_2026-09-03_13``. One detections file therefore accumulates the
@@ -40,12 +47,15 @@ the ones no detection reached, lifting node recall to 1 so the edge model can be
 read on its linking alone. The annotation is sparse -- tens of cells a video
 against tens of thousands of detections -- so this costs almost nothing on top.
 
-Single GPU:
+Latest contrastive run, over the detections it trained on:
+    python inference_contrastive.py
+
+Single GPU, naming both:
     python inference_contrastive.py --exp_folder ../logs/2026-09-03/0/ \\
         --coords_log_folder ../logs/2026-09-02/9/preds_0.50/
 
 Multi-GPU (one process per GPU, samples sharded across ranks):
-    torchrun --standalone --nproc_per_node=4 inference_contrastive.py --exp_folder ../logs/contrastive/2026-09-03/13/ --coords_log_folder ../logs/2026-09-07/4/preds_r6_0.40/
+    torchrun --standalone --nproc_per_node=4 inference_contrastive.py
 """
 
 import argparse
@@ -63,16 +73,20 @@ from embeddings.infer import embed_sample, load_netr
 from embeddings.links import gt_node_coords
 from params import EMBRYOS, LOG_FOLDER, TRAIN_DIR
 from training.distributed import cleanup_distributed, init_distributed
+from utils.logger import get_last_log_folder
 
 
 def parse_args():
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    p.add_argument("--exp_folder", required=True,
-                   help="training run holding args.json and fold_<n>/ckpt_final.pt")
-    p.add_argument("--coords_log_folder", required=True,
-                   help="predictions folder with <sample>.npz holding `coords`")
+    p.add_argument("--exp_folder", default=None,
+                   help="training run holding args.json and fold_<n>/ckpt_final.pt; "
+                        f"default = the latest run under {LOG_FOLDER}contrastive/")
+    p.add_argument("--coords_log_folder", default=None,
+                   help="predictions folder with <sample>.npz holding `coords`; "
+                        "default = the coords_log_folder the exp_folder trained on, "
+                        "read from its args.json")
     p.add_argument("--data_dir", default=TRAIN_DIR,
                    help="where the matching <sample>.zarr volumes live")
     p.add_argument("--key", default=None,
@@ -103,6 +117,50 @@ def parse_args():
                         "`main_edge_predict.py --gt`, which appends the "
                         "unmatched ones to reach a node recall of 1")
     return p.parse_args()
+
+
+def resolve_defaults(args) -> None:
+    """Fill in ``exp_folder`` / ``coords_log_folder`` when they were not given.
+
+    Embedding almost always means "the run I just trained, over the detections
+    it trained on", and both of those are already written down: the run is the
+    latest folder under ``logs/contrastive/``, and the detections are the
+    ``coords_log_folder`` in its own ``args.json``. Naming them again is a
+    chance to name them *differently*, which produces embeddings keyed to one
+    node set and written into another -- the rows would still line up, so
+    nothing downstream would complain.
+
+    Resolved in place, so everything after this reads plain strings and the
+    ``-> exp_folder`` / ``-> detections`` lines report what was actually used.
+
+    Every rank runs this, and both lookups are deterministic reads of the
+    filesystem, so the ranks agree without a broadcast.
+    """
+    if not args.exp_folder:
+        args.exp_folder = get_last_log_folder(str(Path(LOG_FOLDER) / "contrastive"))
+
+    if not args.coords_log_folder:
+        cfg_path = Path(args.exp_folder.rstrip("/")) / "args.json"
+        if not cfg_path.exists():
+            raise FileNotFoundError(
+                f"{cfg_path} does not exist, so there is nothing to take the "
+                "detections folder from; pass --coords_log_folder"
+            )
+        coords = json.load(open(cfg_path)).get("coords_log_folder")
+        if not coords:
+            raise KeyError(
+                f"{cfg_path} records no coords_log_folder; pass it explicitly"
+            )
+        # Paths in args.json are relative to src/, which is also where this runs
+        # from, so they are used as written. A run launched from elsewhere can
+        # have recorded one that does not resolve here -- say so rather than
+        # letting find_coord_files report an empty folder.
+        if not Path(coords).is_dir():
+            raise FileNotFoundError(
+                f"{cfg_path} records coords_log_folder={coords!r}, which is not "
+                "a directory from here; pass --coords_log_folder"
+            )
+        args.coords_log_folder = coords
 
 
 def _ckpt_for(exp_folder: Path, fold) -> Path:
@@ -182,6 +240,12 @@ def _plan(args, exp_folder: Path, files: list[Path], is_main: bool):
 
 def main():
     args = parse_args()
+    defaulted = [
+        name for name in ("exp_folder", "coords_log_folder")
+        if not getattr(args, name)
+    ]
+    resolve_defaults(args)
+
     ctx = init_distributed(None)
     device = ctx.device
 
@@ -209,8 +273,11 @@ def main():
 
     data_dir = Path(args.data_dir)
     if ctx.is_main:
-        print(f"-> exp_folder     : {exp_folder}")
-        print(f"-> detections     : {args.coords_log_folder}  ({len(files)} samples)")
+        mark = " (default)"
+        print(f"-> exp_folder     : {exp_folder}"
+              f"{mark if 'exp_folder' in defaulted else ''}")
+        print(f"-> detections     : {args.coords_log_folder}  ({len(files)} samples)"
+              f"{mark if 'coords_log_folder' in defaulted else ''}")
         print(f"-> writing key    : {key}  (into each detections npz)")
         if args.gt:
             print(f"-> ground truth   : also embedding the annotated nodes into "

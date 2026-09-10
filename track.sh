@@ -13,8 +13,19 @@ n_gpus=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
 
 cd src
 
-torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" main_track.py
+# torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" main_track.py --mixup '{"p": 0.0, "alpha": 4.0}'
 
 # torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" main_predict.py \
 #     --det_threshold 0.4,0.5 \
-#     --nms_radius_um 5,6,7 \
+#     --nms_radius_um 6,7 \
+
+# python main_postprocess.py 
+
+
+# torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" main_track.py
+
+torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" main_predict.py \
+    --det_threshold 0.4,0.5 \
+    --nms_radius_um 6,7 \
+
+python main_postprocess.py 

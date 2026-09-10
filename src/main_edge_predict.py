@@ -196,6 +196,8 @@ def _ranked_by(summary: dict) -> tuple[str | None, float]:
     where ``score`` could not be formed, which is what ``_folder_score`` in
     main_edge_postprocess.py does with the same numbers.
     """
+    # Both are macro means over embryos -- see `_summarise` -- so this ranks on
+    # cv, not on the sample-count-weighted pooling it used to.
     for key in ("score", "edge_jaccard"):
         value = summary.get(key, float("nan"))
         # NaN compares False against everything, so a failed threshold would
@@ -221,18 +223,21 @@ def _best_threshold(summaries: dict):
 def _print_sweep(summaries: dict) -> None:
     """Rank the swept thresholds, best first, so the choice is one glance."""
     columns = ("edge_jaccard", "adj_edge_jaccard", "node_recall", "score")
+    # Every column is a macro mean over embryos, so `score` is cv_score.
+    headers = ["cv_score" if c == "score" else c for c in columns]
     best, metric, best_value = _best_threshold(summaries)
     ranked = metric is not None
 
     print(f"\n{'=' * 78}")
     print("THRESHOLD SWEEP")
     print(f"{'=' * 78}")
-    print("  thr  " + "".join(f"{c:>18s}" for c in columns))
+    print("  thr  " + "".join(f"{c:>18s}" for c in headers))
     for th in sorted(summaries):
         cells = "".join(f"{summaries[th].get(c, float('nan')):>18.4f}" for c in columns)
         print(f"{th:>5g}  {cells}{'   <- best' if ranked and th == best else ''}")
     if ranked:
-        print(f"\n-> best {metric} {best_value:.4f} at threshold {best:g}")
+        label = "cv_score" if metric == "score" else metric
+        print(f"\n-> best {label} {best_value:.4f} at threshold {best:g}")
     else:
         print("\n-> every threshold scored NaN; nothing to rank")
 
@@ -503,7 +508,10 @@ def main():
                        "tta": bool(args.tta),
                        "tta_fusion": args.tta_fusion if args.tta else None,
                        "tta_weight": args.tta_weight if args.tta else None,
-                       "overall": summary,
+                       "cv_score": summary.get("cv_score"),
+                       "macro": {k: v for k, v in summary.items()
+                                 if k not in ("per_embryo",)},
+                       "per_embryo": summary.get("per_embryo", {}),
                        "per_sample": {r["sample_name"]: {
                            k: v for k, v in r.items() if k != "sample_name"
                        } for r in th_rows}},
@@ -518,8 +526,11 @@ def main():
         print(f"{'=' * 60}")
         for k in ("edge_tp", "edge_fp", "edge_fn"):
             print(f"- {k}: {summary[k]:.0f}")
+        print(f"macro  (mean over {summary['n_groups']} "
+              f"embryo{'s' if summary['n_groups'] != 1 else ''}, one vote each)")
         for k in ("node_recall", "edge_jaccard", "adj_edge_jaccard", "score"):
-            print(f"- {k}: {summary[k]:.4f}")
+            label = "cv_score" if k == "score" else k
+            print(f"- {label:<17s}: {summary[k]:.4f}")
         print(f"-> scores  : {scores_file}")
 
     if sweeping and summaries:
@@ -616,17 +627,29 @@ def _score(video, coords, edges, data_dir: Path):
         rec = node_recall(graph, gt_graph)
     row = per_sample_metrics(res, n_total, rec)
     row["sample_name"] = video.name
+    # Without this every row groups under "?" and the macro mean collapses back
+    # into the pooled one it exists to replace.
+    row["embryo"] = video.name.split("_")[0]
     row["n_nodes_pred"] = int(len(coords))
     row["n_edges_pred"] = int(len(edges))
     return row
 
 
 def _summarise(rows):
-    from tracking_cellmot.metrics import summarise
+    """Macro metrics -- one vote per embryo -- plus the pooled counts.
 
-    out = dict(summarise(rows))
-    for key in ("edge_tp", "edge_fp", "edge_fn"):
-        out[key] = float(sum(r[key] for r in rows))
+    The pooled rates `summarise` also returns are deliberately not here: with
+    128 stacks of 6bba against 71 of 44b6 a pooled score sits close to 6bba's
+    alone, and a threshold sweep ranked on it picks whichever cutoff suits the
+    larger embryo. See metrics.pooled_counts.
+    """
+    from tracking_cellmot.metrics import macro_summarise, pooled_counts
+
+    per_embryo, macro = macro_summarise(rows)
+    out = dict(macro)
+    out.update(pooled_counts(rows))
+    out["cv_score"] = macro["score"]
+    out["per_embryo"] = {e: dict(s) for e, s in per_embryo.items()}
     return out
 
 
