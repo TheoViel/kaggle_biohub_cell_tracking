@@ -26,6 +26,7 @@ Nothing here needs a GPU or the image data.
 import warnings
 import argparse
 import json
+import re
 import sys
 from multiprocessing import Pool
 from pathlib import Path
@@ -72,6 +73,28 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # embryos on its own as well, which is the bar README_edge.md sets. The four sit
 # on a plateau -- gap 2 scores 0.8507 to gap 3's 0.8506, min_track 6/7/8 span
 # 0.0011 -- so read the values as "somewhere in here", not as a peak.
+#
+# Retuned again, with `postprocessing/tune_edge_pp.py`, on the 199 out-of-fold
+# stacks of `logs/edge_run/2026-09-11/0/preds_0.45` -- nodes from the
+# `annot_head` detector `logs/2026-09-11/1/preds_r7_0.40`. Four knobs moved and
+# together they are worth +0.0046 (0.8568 -> 0.8614): `min_track` 7 -> 5,
+# `recover_min_dup` 4.0 -> 5.0, `div_min_prob` 0.40 -> 0.30, `div_diverge_um`
+# 3.5 -> 3.0. Every other knob held, including all three of `threshold`,
+# `linefit` and `vel_weight`.
+#
+# Read that gain as one embryo's worth, not two: it is +0.0097 on 44b6 and
+# -0.0006 on 6bba. The second number is flat rather than a loss, but the bar
+# README_edge.md sets is a gain on both and this does not clear it.
+#
+# These values are *not* portable backwards. On the older
+# `logs/edge_run/2026-09-09/0/preds_0.45` the same four cost -0.0066 (0.8506 ->
+# 0.8440), losing on both embryos. The block above was right for that
+# checkpoint and this one is right for this one; the knobs trade against how
+# much the detector over-detects and how well its probabilities separate a
+# fork, and neither is a property of the post-processing. So retune on every
+# new checkpoint -- that is what `tune_edge_pp.py` is for -- and do not read a
+# scores json written under one set of defaults against one written under
+# another.
 DEFAULTS = dict(
     threshold=0.4,
     recover=1,
@@ -83,18 +106,22 @@ DEFAULTS = dict(
     # place -- at a shorter reach.
     recover_max_gap=3,
     recover_max_residual=4.0,
-    # Back to 4.0, undoing the preds_0.45 retune below. Same reasoning read the
-    # other way: this checkpoint over-detects less, so a node recover would skip
-    # as "too close to an existing one" is once again more often a real
-    # duplicate than a genuine miss. +0.0037 on its own, both embryos.
-    recover_min_dup=4.0,
+    # 5.0 on the 09-11 checkpoint, having been 3.0 then 4.0 before it: the same
+    # reasoning each time, run against however much this detector over-detects.
+    # A node `recover` would skip as "too close to an existing one" is, on this
+    # checkpoint, more often a real duplicate than a genuine miss -- so refuse
+    # from further out. +0.0005 on its own and positive on both embryos, which
+    # is small; 6.0 is -0.0010, so this is the top of the curve, not a plateau
+    # that happens to include it.
+    recover_min_dup=5.0,
     through=0.0,          # measured, finds nothing -- see the README
     through_max_gap=2,
-    # 7, up from 5, and the direction is the same as every retune before it:
-    # whatever the chain leaves as short fragments, pruning them pays. +0.0027
-    # on its own; 6 and 8 are within 0.0011 of 7 once the recover block is
-    # tightened, and 9 gives a third of it back.
-    min_track=7,
+    # 5, back down from 7 -- the first retune to reverse this knob's direction.
+    # The 09-11 detector's extra recall arrives as genuine short chains rather
+    # than as fragments, so pruning at 7 now deletes tracks that are real:
+    # +0.0016 going 7 -> 5, gaining on both embryos, while 8 costs -0.0014 and
+    # 9 costs -0.0043. 6 is within 0.0003 of 5, so read this as "5 or 6".
+    min_track=5,
     linefit=0.6,
     linefit_window=3,
     vel_weight=0.02,
@@ -141,11 +168,13 @@ DEFAULTS = dict(
     # since it works from geometry with no scored candidate graph.
     # See README_edge.md, "Divisions".
     divisions=1,
-    # 0.40 and 0.35 are within 0.0001 of each other on the 199 out-of-fold
-    # stacks of 2026-09-09/0 (0.8374 against 0.8375) and both gain on both
-    # embryos; 0.40 is the conservative end of that tie, proposing 6/50 false
-    # divisions against 0.35's 10/73 for the same score. 0.45 costs 0.0014.
-    div_min_prob=0.40,
+    # 0.30 on the 09-11 checkpoint, down from the 0.40 that was the conservative
+    # end of a tie on 09-09/0. This detector's division term starts far weaker
+    # (0.083 macro against 0.136) and the gate is what is holding it down:
+    # 0.40 -> 0.30 is +0.0017 with the whole gain in `division_jaccard`
+    # (0.083 -> 0.101). 0.25 matches it to 0.0001 and 0.20 gives half back, so
+    # 0.25-0.30 is the floor; 0.45 is -0.0046 and falls off a cliff.
+    div_min_prob=0.30,
     div_max_parent_um=9.0,
     div_max_existing_child_um=10.0,
     div_max_sister_um=14.0,
@@ -161,12 +190,12 @@ DEFAULTS = dict(
     # the rejecting, moved it much further -- see DIVISIONS_TUNED in
     # main_postprocess.py.
     div_symmetry_tau=0.0,
-    # 3.5 with the symmetry gate off, where the old 3.0 was tuned with it on.
-    # Read 3.0-4.5 as one plateau at ~0.8365 +- 0.001: the curve is not monotone
-    # inside it (3.5 and 4.5 both 0.8374, 3.75 0.8361), so that spread is noise
-    # on 151 divisions and only the ends mean anything -- 2.25 is -0.0048 and
-    # 5.0 is -0.0031.
-    div_diverge_um=3.5,
+    # 3.0 on the 09-11 checkpoint. The plateau the comment below describes has
+    # narrowed rather than moved: 3.0 and 2.5 are within 0.0008 of each other
+    # and both beat 3.5 (+0.0022 and +0.0023 over it), while 4.5 is -0.0008.
+    # 3.0 is preferred over 2.5 on the per-embryo split -- 2.5 takes another
+    # 0.0003 on 44b6 and gives 0.0015 back on 6bba.
+    div_diverge_um=3.0,
     div_require_divergence=1,
     div_require_mutual_nn=1,
     div_frame_frac_cap=0.0076,
@@ -190,9 +219,16 @@ def parse_args():
                         f"{LOG_FOLDER}edge_run/, which is the one a threshold "
                         "sweep meant you to use")
     p.add_argument("--out_dir", default=None,
-                   help="default: <preds_dir>_pp")
+                   help="default: <preds_dir>_pp, bumped to _pp2, _pp3 ... "
+                        "while anything would be overwritten")
     p.add_argument("--geff_dir", default=None,
-                   help="default: <out_dir> with 'preds' replaced by 'geff'")
+                   help="default: <out_dir> with 'preds' replaced by 'geff'")    
+    p.add_argument("--name", default=None,
+                   help="label this version: <preds_dir>_pp_<name>. Worth using "
+                        "-- _pp2 vs _pp7 says nothing about what was changed")
+    p.add_argument("--overwrite", action="store_true",
+                   help="write to the unversioned folder, replacing a previous "
+                        "run's npz, geff and scores json")
     p.add_argument("--threshold", type=float, default=DEFAULTS["threshold"],
                    help="probability a link must beat to be committed "
                         "(default %(default)s)")
@@ -281,6 +317,37 @@ def parse_args():
     return p.parse_args()
 
 
+# `preds_0.45_pp`, `_pp2`, `_pp_divgate`, `_pp_divgate2` -- this script's own
+# output, at any version and under any --name. Matched rather than compared to a
+# literal `_pp` so that versioned or named folders are not mistaken for raw
+# candidates to post-process.
+_PP_SUFFIX = re.compile(r"_pp\d*(_[^/]*)?$")
+
+
+def _versioned(out_dir: Path, geff_dir: Path) -> tuple[Path, Path]:
+    """The first version index at which nothing would be overwritten.
+
+    Post-processing is knob-turning: the same input is re-run a dozen times with
+    different gates, and the numbers are only comparable if the earlier runs are
+    still on disk to compare against. Overwriting `preds_0.45_pp` and
+    `scores_preds_0.45_pp.json` in place destroyed exactly the record that made
+    the last configuration worth keeping.
+
+    All three artefacts move together -- npz folder, geff folder and the scores
+    json -- and the index is the first one free for *every* one of them, so a
+    half-deleted version cannot leave the three pointing at different runs.
+    """
+    stem, gstem = out_dir.name, geff_dir.name
+    for n in range(1, 1000):
+        suffix = "" if n == 1 else str(n)
+        out = out_dir.with_name(stem + suffix)
+        geff = geff_dir.with_name(gstem + suffix)
+        scores = out.parent / f"scores_{out.name}.json"
+        if not (out.exists() or geff.exists() or scores.exists()):
+            return out, geff
+    raise SystemExit(f"1000 versions of {out_dir} already exist; clean some up")
+
+
 def _latest_run(base_dir: Path) -> Path:
     """The most recently written run under ``base_dir/<date>/<exp_id>/``."""
     candidates = sorted(base_dir.glob("*/*/args.json"), key=lambda p: p.stat().st_mtime)
@@ -328,15 +395,15 @@ def _best_preds_dir(base_dir: Path) -> tuple[Path, str]:
     scores are sitting right there beside them, so rank by those instead and
     fall back to mtime only when nothing was scored (a ``--no_score`` run).
 
-    Skips folders already suffixed ``_pp``: those are this script's own output,
-    not raw candidates to post-process.
+    Skips folders suffixed ``_pp`` or ``_pp<n>``: those are this script's own
+    output, not raw candidates to post-process.
     """
     run_dir = _latest_run(base_dir)
     # Sorted so a tie resolves the same way twice: the metric only judges edges
     # touching an annotated node, a few dozen of the ~25k committed, so adjacent
     # thresholds routinely score identically and glob order would decide.
     candidates = sorted(
-        d for d in run_dir.glob("preds_*") if d.is_dir() and not d.name.endswith("_pp")
+        d for d in run_dir.glob("preds_*") if d.is_dir() and not _PP_SUFFIX.search(d.name)
     )
     if not candidates:
         raise FileNotFoundError(f"No preds_* folder found under {run_dir}")
@@ -564,10 +631,19 @@ def main():
     else:
         preds_dir, why = _best_preds_dir(Path(LOG_FOLDER) / "edge_run")
         print(f"-> no --preds_dir given, using {preds_dir}  ({why})")
+    # `--name` labels the run; the numeric index below still applies on top, so
+    # re-running the same name twice does not overwrite either.
+    suffix = "_pp" + (f"_{args.name}" if args.name else "")
     out_dir = Path(args.out_dir) if args.out_dir else preds_dir.with_name(
-        preds_dir.name + "_pp")
+        preds_dir.name + suffix)
     geff_dir = Path(args.geff_dir) if args.geff_dir else out_dir.with_name(
         out_dir.name.replace("preds", "geff", 1))
+    if not args.overwrite:
+        versioned, geff_versioned = _versioned(out_dir, geff_dir)
+        if versioned != out_dir:
+            print(f"-> {out_dir.name} exists, writing {versioned.name} instead "
+                  f"(--overwrite to replace it)")
+        out_dir, geff_dir = versioned, geff_versioned
 
     cfg = dict(
         out_dir=str(out_dir), geff_dir=str(geff_dir), no_score=args.no_score,

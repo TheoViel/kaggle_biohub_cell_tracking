@@ -52,6 +52,7 @@ from tracking.main import _paths_for_embryos, build_model
 from tracking.post_process import build_graph
 from tracking.predict import PredictConfig, predict_video_thresholds
 from tracking_cellmot.metrics import (
+    MACRO_METRICS,
     evaluate,
     node_recall,
     macro_summarise,
@@ -94,8 +95,13 @@ def parse_args():
                    help="pseudo-labelling: predict on the fold's TRAIN embryos "
                         "instead of its val one, writing to <log_folder>/preds_pl")
 
-    p.add_argument("--det_tta", action=argparse.BooleanOptionalAction,
-                   default=PredictConfig.det_tta)
+    p.add_argument("--n_tta", type=int, choices=(1, 4, 8), default=PredictConfig.n_tta,
+                   help="test-time augmentation views, averaged in logit space. "
+                        "1 = off, 4 = Y/X flips, 8 = Z as well. Every view is an "
+                        "exact axis flip and its own inverse, so nothing is "
+                        "resampled. Costs one extra forward per view and does "
+                        "not change the node-feature or offset maps, which keep "
+                        "the identity view")
     p.add_argument("--det_threshold", type=_floats, default=[PredictConfig.det_threshold],
                    help="detection threshold, or a comma-separated list to sweep several "
                         "in one forward pass")
@@ -117,7 +123,7 @@ def parse_args():
 def _predict_config(args) -> PredictConfig:
     cfg = PredictConfig()
     for k in (
-        "det_tta", "pool_kernel_um", "nms",
+        "n_tta", "pool_kernel_um", "nms",
         "edge_activation",
         "edge_selection", "edge_threshold", "max_parents_per_node",
         "max_children_per_node",
@@ -135,7 +141,8 @@ def _predict_config(args) -> PredictConfig:
 
 
 def _out_dir_for(
-    base: Path, radius: float, threshold: float, sweep_th: bool, sweep_r: bool
+    base: Path, head: str, radius: float, threshold: float,
+    sweep_th: bool, sweep_r: bool, n_tta: int = 1,
 ) -> Path:
     """Where one grid point's predictions go.
 
@@ -145,16 +152,28 @@ def _out_dir_for(
     it is swept, so a threshold-only sweep keeps the preds_<thr>/ layout the
     downstream scripts were written against.
     """
-    suffix = _key_suffix(radius, threshold, sweep_th, sweep_r)
+    suffix = _key_suffix(head, radius, threshold, sweep_th, sweep_r, n_tta)
     return base.with_name(base.name + suffix) if suffix else base
 
 
 def _key_suffix(
-    radius: float, threshold: float, sweep_th: bool, sweep_r: bool
+    head: str, radius: float, threshold: float, sweep_th: bool, sweep_r: bool,
+    n_tta: int = 1,
 ) -> str:
-    """The ``_r6_0.40``-style tag naming one point of the sweep grid."""
-    return (f"_r{radius:g}" if sweep_r else "") + (
-        f"_{threshold:.2f}" if sweep_th else ""
+    """The ``_r6_0.40``-style tag naming one point of the sweep grid.
+
+    TTA carries its view count rather than a bare ``_tta``: 4 and 8 are
+    different predictions and naming them apart is what lets both sit in one run
+    folder and be compared. Off (``n_tta`` 1) adds nothing, so a run without it
+    keeps the names every downstream script already points at -- same rule as
+    the annotation head, whose ``_annot_head`` stays last so the detection
+    head's folders are the unsuffixed ones.
+    """
+    return (
+        (f"_r{radius:g}" if sweep_r else "")
+        + (f"_{threshold:.2f}" if sweep_th else "")
+        + (f"_tta{n_tta}" if n_tta > 1 else "")
+        + ("_annot_head" if head == "annot" else "")
     )
 
 
@@ -239,6 +258,16 @@ def _reconcile_arch(cfg, state, verbose=False):
                   f"{'present' if has_offset else 'absent'})")
         cfg.offset_head = has_offset
 
+    # The annotation head is a later addition too, and it is optional, so a
+    # checkpoint from before it existed has no such weights and must be rebuilt
+    # without one.
+    has_annot = any(k.startswith("annot_head.") for k in state)
+    if has_annot != bool(getattr(cfg, "annot_head", False)):
+        if verbose:
+            print(f"-> annot_head={has_annot} (annot_head weights "
+                  f"{'present' if has_annot else 'absent'})")
+        cfg.annot_head = has_annot
+
     # Likewise for the extra decoder branch feeding the fine detection head. The
     # count is the number of blocks that were built, which the weights name
     # directly (unet.fine_decoder_blocks.<i>...), so it is read rather than
@@ -257,82 +286,108 @@ def _reconcile_arch(cfg, state, verbose=False):
 def _print_sweep(summaries: dict, per_embryo: dict | None = None):
     """Rank the swept grid points, best score first, so the choice is one glance.
 
-    ``summaries`` and ``per_embryo`` are keyed by ``(nms_radius_um, threshold)``.
-    ``per_embryo`` then maps to embryo -> summary. When several embryos were
-    predicted they get their own table each, because their best grid point need
-    not be the pooled one — the embryos differ in cell density, so the detection
-    cutoff and the suppression radius that balance recall against false
-    positives differ too.
+    ``summaries`` and ``per_embryo`` are keyed by ``(head, nms_radius_um,
+    threshold)``. ``per_embryo`` then maps to embryo -> summary. When several
+    embryos were predicted they get their own table each, because their best
+    grid point need not be the pooled one — the embryos differ in cell density,
+    so the detection cutoff and the suppression radius that balance recall
+    against false positives differ too.
+
+    The head is *not* a swept dimension. It gets its own block of tables, and
+    its own best point, because the two heads answer different questions and
+    ranking them against each other would read as "pick the better detector"
+    when the annotation head is scored against the very labels it was trained
+    to predict. Which head to use is a decision to take on the whole picture,
+    not from one row of a table.
     """
     base_columns = ("score", "edge_jaccard", "adj_edge_jaccard",
                     "division_jaccard", "node_recall")
-    # A column for a dimension that was not swept would repeat one value down
-    # the whole table.
-    sweep_r = len({r for r, _ in summaries}) > 1
-    sweep_th = len({th for _, th in summaries}) > 1
-    labels = (("radius",) if sweep_r else ()) + (("thr",) if sweep_th else ())
 
-    def _label(key):
-        r, th = key
-        return "".join(
-            f"{v:>7g}" for v in
-            ((r,) if sweep_r else ()) + ((th,) if sweep_th else ())
+    def _block(sub_summaries: dict, sub_per_embryo: dict, head_note: str) -> None:
+        # A column for a dimension that was not swept would repeat one value
+        # down the whole table.
+        sweep_r = len({r for r, _ in sub_summaries}) > 1
+        sweep_th = len({th for _, th in sub_summaries}) > 1
+        labels = (("radius",) if sweep_r else ()) + (("thr",) if sweep_th else ())
+
+        def _label(key):
+            r, th = key
+            return "".join(
+                f"{v:>7g}" for v in
+                ((r,) if sweep_r else ()) + ((th,) if sweep_th else ())
+            )
+
+        def _table(title, table: dict, score_label="score"):
+            # The all-embryo table holds macro metrics, so its `score` column
+            # *is* cv_score and is labelled as such; a per-embryo table has one
+            # embryo, where the distinction does not arise.
+            columns = base_columns
+
+            def rank(key):
+                # NaN compares False against everything, so a failed grid point
+                # would otherwise win by being first. Sink it instead.
+                score = table[key].get("score", float("nan"))
+                return float("-inf") if score != score else score
+
+            best = max(table, key=rank)
+            ranked = rank(best) != float("-inf")
+
+            print(f"\n{'=' * 78}")
+            print(title)
+            print(f"{'=' * 78}")
+            headers = [score_label if c == "score" else c for c in columns]
+            print("".join(f"{lbl:>7s}" for lbl in labels) + "  "
+                  + "".join(f"{c:>18s}" for c in headers))
+            for key in sorted(table):
+                cells = "".join(
+                    f"{table[key].get(c, float('nan')):>18.4f}" for c in columns
+                )
+                print(f"{_label(key)}  {cells}"
+                      f"{'   <- best' if ranked and key == best else ''}")
+
+            if ranked:
+                r, th = best
+                at = f"threshold {th:g}" + (
+                    f", nms_radius_um {r:g}" if sweep_r else ""
+                )
+                print(f"\n-> best {score_label} {rank(best):.4f} at {at}{head_note}")
+            else:
+                print("\n-> every grid point scored NaN; nothing to rank")
+
+        title = "SWEEP" if sweep_r and sweep_th else (
+            "NMS RADIUS SWEEP" if sweep_r else "THRESHOLD SWEEP"
+        )
+        title += head_note
+        embryos = sorted({e for pe in sub_per_embryo.values() for e in pe})
+        multi = len(embryos) > 1
+        _table(
+            title + ("  (all embryos)" if multi else ""),
+            sub_summaries,
+            score_label="cv_score" if multi else "score",
         )
 
-    def _table(title, table: dict, rank_key="score", score_label="score"):
-        # The all-embryo table holds macro metrics, so its `score` column *is*
-        # cv_score and is labelled as such; a per-embryo table has one embryo,
-        # where the distinction does not arise.
-        columns = base_columns
+        if multi:
+            for emb in embryos:
+                table = {
+                    key: pe[emb] for key, pe in sub_per_embryo.items() if emb in pe
+                }
+                if table:
+                    folds = sorted(
+                        {f for s in table.values() for f in s.get("fold", [])}
+                    )
+                    suffix = (
+                        f"  (fold {','.join(str(f) for f in folds)})" if folds else ""
+                    )
+                    _table(f"{title}  -  {emb}{suffix}", table)
 
-        def rank(key):
-            # NaN compares False against everything, so a failed grid point
-            # would otherwise win by being first. Sink it instead.
-            score = table[key].get(rank_key, float("nan"))
-            return float("-inf") if score != score else score
-
-        best = max(table, key=rank)
-        ranked = rank(best) != float("-inf")
-
-        print(f"\n{'=' * 78}")
-        print(title)
-        print(f"{'=' * 78}")
-        headers = [score_label if c == "score" else c for c in columns]
-        print("".join(f"{lbl:>7s}" for lbl in labels) + "  "
-              + "".join(f"{c:>18s}" for c in headers))
-        for key in sorted(table):
-            cells = "".join(f"{table[key].get(c, float('nan')):>18.4f}" for c in columns)
-            print(f"{_label(key)}  {cells}"
-                  f"{'   <- best' if ranked and key == best else ''}")
-
-        if ranked:
-            label = score_label
-            r, th = best
-            at = f"threshold {th:g}" + (f", nms_radius_um {r:g}" if sweep_r else "")
-            print(f"\n-> best {label} {rank(best):.4f} at {at}")
-        else:
-            print("\n-> every grid point scored NaN; nothing to rank")
-
-    title = "SWEEP" if sweep_r and sweep_th else (
-        "NMS RADIUS SWEEP" if sweep_r else "THRESHOLD SWEEP"
-    )
-    embryos = sorted({e for pe in (per_embryo or {}).values() for e in pe})
-    multi = len(embryos) > 1
-    _table(
-        title + ("  (all embryos)" if multi else ""),
-        summaries,
-        score_label="cv_score" if multi else "score",
-    )
-
-    if len(embryos) > 1:
-        for emb in embryos:
-            table = {
-                key: pe[emb] for key, pe in per_embryo.items() if emb in pe
-            }
-            if table:
-                folds = sorted({f for s in table.values() for f in s.get("fold", [])})
-                suffix = f"  (fold {','.join(str(f) for f in folds)})" if folds else ""
-                _table(f"{title}  -  {emb}{suffix}", table)
+    heads = list(dict.fromkeys(h for h, _, _ in summaries))
+    for head in heads:
+        note = f"  [{head} head]" if len(heads) > 1 else ""
+        _block(
+            {(r, th): v for (h, r, th), v in summaries.items() if h == head},
+            {(r, th): v for (h, r, th), v in (per_embryo or {}).items() if h == head},
+            note,
+        )
 
 
 def _gather(obj, world_size):
@@ -354,6 +409,10 @@ def _predict_fold(
     different embryo, so the rows stay disjoint and summarise to a single
     out-of-fold score over every stack.
     """
+    # Derived from the grid rather than passed separately, so the two cannot
+    # disagree about which heads are being swept.
+    heads = tuple(dict.fromkeys(h for h, _, _ in keys))
+
     # Shard stacks across ranks; each writes its own npz files.
     mine = paths[ctx.rank :: ctx.world_size]
 
@@ -374,6 +433,7 @@ def _predict_fold(
             progress=False,
             return_det_logits=False,
             nms_radii=radii,
+            heads=heads,
         )
 
         gt = td.graph.IndexedRXGraph.from_geff(train_dir / f"{name}.geff")
@@ -387,8 +447,8 @@ def _predict_fold(
 
         reported = []
         for key in keys:
-            radius, th = key
-            coords, edges, node_probs = per_key[key]
+            head, radius, th = key
+            coords, edges, node_probs, annot_probs, coords_f = per_key[key]
 
             np.savez_compressed(
                 out_dirs[key] / f"{name}.npz",
@@ -399,6 +459,13 @@ def _predict_fold(
                 # and by how much is exactly what a consumer wanting to
                 # discount a shaky detection needs.
                 node_probs=np.asarray(node_probs, dtype=np.float32).reshape(-1),
+                # All-NaN on a model with no annotation head; the column is
+                # always written so a consumer can test for it once.
+                annot_probs=np.asarray(annot_probs, dtype=np.float32).reshape(-1),
+                # Pre-round positions, row-aligned with `coords`. Fusing two
+                # heads or two offset votes has to happen in float; see
+                # _rescale_coords.
+                coords_f=np.asarray(coords_f, dtype=np.float32).reshape(-1, 4),
             )
 
             # build_graph is chatty on some builds; keep the log readable.
@@ -453,12 +520,22 @@ def main():
     sweep_th = len(thresholds) > 1
     sweep_r = len(radii) > 1
     sweeping = sweep_th or sweep_r
+
+    # Read before the grid is built: whether the run has an annotation head
+    # decides how many points there are.
+    cfg = Config(json.load(open(log_folder + "args.json")))
+    # A model with one is swept on both heads: the two heatmaps come out of a
+    # single forward, so the second costs only its NMS and edge passes, and
+    # running them side by side is what makes "is this a cell" and "would an
+    # annotator have labelled it" comparable as detectors.
+    heads = ("det", "annot") if bool(getattr(cfg, "annot_head", False)) else ("det",)
     # The grid, in the order everything downstream iterates it.
-    keys = [(r, th) for r in radii for th in thresholds]
+    keys = [(h, r, th) for h in heads for r in radii for th in thresholds]
 
     base_dir = Path(args.out_dir or (log_folder + ("preds_pl" if args.pl else "preds")))
     out_dirs = {
-        key: _out_dir_for(base_dir, *key, sweep_th, sweep_r) for key in keys
+        key: _out_dir_for(base_dir, *key, sweep_th, sweep_r, args.n_tta)
+        for key in keys
     }
     if ctx.is_main:
         for d in out_dirs.values():
@@ -466,7 +543,6 @@ def main():
     if ctx.distributed:
         dist.barrier()
 
-    cfg = Config(json.load(open(log_folder + "args.json")))
     window_size = getattr(cfg, "window_size", 2)
     downscale_factor = getattr(cfg, "downscale_factor", 1)
 
@@ -595,7 +671,7 @@ def main():
     per_embryo_all = {}
 
     for key in keys:
-        radius, th = key
+        head, radius, th = key
         th_rows = all_rows[key]
         out_dir = out_dirs[key]
 
@@ -665,7 +741,8 @@ def main():
         stem = "scores_pl" if args.pl else "scores"
         # A lone grid point keeps the historical scores_pl.json /
         # scores_0.25.json names.
-        suffix = _key_suffix(radius, th, sweep_th or not args.pl, sweep_r)
+        suffix = _key_suffix(head, radius, th, sweep_th or not args.pl, sweep_r,
+                             args.n_tta)
         # Beside the predictions they score, which is the log folder unless --out_dir
         # sent those elsewhere. A run writing to a scratch directory should not reach
         # back into the log folder and overwrite the scores of a real one.

@@ -48,6 +48,7 @@ class UNetNodeTransformer(nn.Module):
         unet_features: tuple[str, ...] = ("detection",),
         offset_head: bool = False,
         offset_radius: int = 2,
+        annot_head: bool = False,
         verbose: int = 0,
     ):
         super().__init__()
@@ -74,6 +75,34 @@ class UNetNodeTransformer(nn.Module):
         if self.deep_supervision:
             self.detect_head_fine = nn.Sequential(
                 nn.Conv3d(2 * unet_out_channels + 1, unet_out_channels, kernel_size=1),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Conv3d(unet_out_channels, 1, kernel_size=1),
+            )
+
+        # "Is this cell one an annotator would have labelled?" -- a second,
+        # independent question on the same features the detector uses.
+        #
+        # The premise is that the annotation is not a uniform sample of cells:
+        # the public checkpoint trains on the ~3% that are labelled and nothing
+        # else, and reaches a better reachability ceiling than this pipeline
+        # does training on every cell it can find. If annotated cells are
+        # distinguishable in the image -- brighter, better separated, at a
+        # particular stage -- then a head asked only that question learns it,
+        # and its score ranks detections by how likely the metric is to be
+        # looking at them.
+        #
+        # It shares the detection head's input rather than getting its own
+        # branch, so the two differ only in what they are asked. Gradients do
+        # reach the backbone; `annot_loss_weight` is what bounds how far this
+        # auxiliary task is allowed to move the detector.
+        self.annot_head = None
+        if annot_head:
+            annot_in = (
+                2 * unet_out_channels + 1 if self.deep_supervision else unet_out_channels
+            )
+            self.annot_head = nn.Sequential(
+                nn.Conv3d(annot_in, unet_out_channels, kernel_size=1),
                 nn.GELU(),
                 nn.Dropout(dropout),
                 nn.Conv3d(unet_out_channels, 1, kernel_size=1),
@@ -175,7 +204,8 @@ class UNetNodeTransformer(nn.Module):
     def encode(
         self,
         imgs: torch.Tensor,  # (B, W, *spatial) — already downsampled, single channel
-    ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor] | None]:
+    ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor] | None,
+               list[torch.Tensor] | None]:
         """Run the temporal U-Net on W frames.
 
         ``unet_out`` is the node-feature map and never moves: it stays on the
@@ -191,6 +221,9 @@ class UNetNodeTransformer(nn.Module):
         det_logits_ds : list of W tensors on ``unet_out``'s grid, or None when
             the model has no extra decoder branch (then det_logits is on that
             grid too).
+        annot_logits : list of W tensors on ``det_logits``' grid, or None when
+            the annotation head is off. "Would an annotator have labelled this
+            cell", as distinct from "is this a cell".
         """
         if self.verbose >= 1:
             print(f"UNetNodeTransformer - Encode - Input shape: {imgs.shape}")
@@ -203,10 +236,13 @@ class UNetNodeTransformer(nn.Module):
             print(f"UNetNodeTransformer - Encode - UNet output shape: {unet_out.shape}")
 
         W = unet_out.shape[1]
+        annot_logits = [] if self.annot_head is not None else None
         if fine_out is None:
-            det_logits, det_logits_ds = [
-                self.detect_head(unet_out[:, i]) for i in range(W)
-            ], None
+            det_logits, det_logits_ds = [], None
+            for i in range(W):
+                det_logits.append(self.detect_head(unet_out[:, i]))
+                if annot_logits is not None:
+                    annot_logits.append(self.annot_head(unet_out[:, i]))
         else:
             det_logits, det_logits_ds = [], []
             for i in range(W):
@@ -220,15 +256,18 @@ class UNetNodeTransformer(nn.Module):
                     mode="trilinear",
                     align_corners=False,
                 )
-                det_logits.append(
-                    self.detect_head_fine(torch.cat([fine_out[:, i], carry], dim=1))
-                )
+                # The same tensor both heads read, so they differ only in the
+                # question asked of it.
+                fine_in = torch.cat([fine_out[:, i], carry], dim=1)
+                det_logits.append(self.detect_head_fine(fine_in))
                 det_logits_ds.append(ds_logit)
+                if annot_logits is not None:
+                    annot_logits.append(self.annot_head(fine_in))
 
         if self.verbose >= 1:
             print(f"UNetNodeTransformer - Encode - Detect logits shape: {[det.shape for det in det_logits]}")
 
-        return unet_out, det_logits, det_logits_ds
+        return unet_out, det_logits, det_logits_ds, annot_logits
 
     def encode_offsets(
         self,
@@ -354,6 +393,7 @@ def define_track_model(
     unet_features: tuple[str, ...] = ("detection",),
     offset_head: bool = False,
     offset_radius: int = 2,
+    annot_head: bool = False,
     verbose: int = 0,
 ) -> UNetNodeTransformer:
     """Build the full tracking model (UNet + detect head + transformer).
@@ -505,6 +545,7 @@ def define_track_model(
         unet_features=unet_features,
         offset_head=offset_head,
         offset_radius=offset_radius,
+        annot_head=annot_head,
         dropout=transformer_dropout,
         verbose=verbose,
     )

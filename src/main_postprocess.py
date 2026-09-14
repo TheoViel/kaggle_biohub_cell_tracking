@@ -21,6 +21,11 @@ the val scores, which were measured on different embryos:
 
     python main_postprocess.py --log_folder ../logs/2026-08-20/20/ --pl
 
+It also runs a different chain. The pseudo-label consumer reads only `coords`
+from the npz, so a node dropped here is a cell the next run is trained to call
+background, and the stages that prune short or isolated tracks are switched off
+-- see PL_PIPELINE below, and --pl_prune to put them back.
+
 Four stages, each switchable — see src/postprocessing/README.md for how they were
 chosen and what each is worth. Measured over the 71 validation stacks of
 logs/2026-08-20/20/, adjusted edge Jaccard:
@@ -121,6 +126,37 @@ PP_PUBLIC_TUNED = dict(
 )
 ILP_TUNED = dict(appear=0.02, disappear=0.02, division=1.0, timeout=900.0)
 
+# --pl overrides. A pseudo-label pass is not judged on the competition metric --
+# its output is read back by the next training run, and `tracking/dataset.py`
+# loads `coords` from the npz and nothing else (`_load_pl`). The edges are never
+# opened. So the chain is being asked for a different thing here: every
+# detection that survives becomes a weak positive, and every one dropped is a
+# real cell the next model is told is background.
+#
+# That inverts the value of the three stages that delete nodes. On the val split
+# they pay, because a spurious short chain costs edge false positives and drags
+# the node-count adjustment; on a pseudo-label pass they only ever remove
+# supervision, and a cell the detector saw for two frames is still a cell.
+#
+#   pipeline `min_track`              3 -> 0   keep chains of any length
+#   pp_public `filter_short_tracks`   1 -> 0   same, in the public repair
+#   pp_public `prune_isolated`        1 -> 0   keep detections that linked to nothing
+#
+# What stays on is everything that moves or adds a node: the grid-centring
+# correction and `recover`, which interpolates a detection back into a hole in a
+# track it can see both ends of -- exactly the missed cell a pseudo-label pass
+# wants recovered. The linking stages stay too, unchanged: their output is
+# discarded, but `recover` finds its gaps in the linked graph, so relinking is
+# what makes the recovery possible in the first place.
+#
+# `divisions` is skipped instead of retuned: it only ever adds edges, so on a
+# pass whose edges are thrown away it cannot change the result, and it is not
+# free.
+#
+# --pl_prune restores the val chain if you want the two comparable.
+PL_PIPELINE = dict(min_track=0)
+PL_PP_PUBLIC = dict(filter_short_tracks=0, prune_isolated=0)
+
 # The division stage, ported from main_edge_postprocess.py. Every gate but one
 # carries over unchanged; `min_prob` cannot, because it reads the model's
 # probability for the parent/second-child pair and this pipeline's npz holds
@@ -165,7 +201,14 @@ def parse_args():
                         f"recent run under {LOG_FOLDER}")
     p.add_argument("--pl", action="store_true",
                    help="post-process a pseudo-labelling run: read preds_pl "
-                        "instead of preds, and write preds_pl_pp / geff_pl_pp")
+                        "instead of preds, and write preds_pl_pp / geff_pl_pp. "
+                        "Also drops the stages that delete nodes, since every "
+                        "node here is a weak positive for the next run -- see "
+                        "PL_PIPELINE / PL_PP_PUBLIC")
+    p.add_argument("--pl_prune", action="store_true",
+                   help="under --pl, keep the node-dropping stages the val "
+                        "chain uses (short-track pruning, isolated-node "
+                        "pruning), so the two chains are comparable")
     p.add_argument("--preds_dir", default=None,
                    help="override the input directory (default: preds_<th> of the "
                         "best-scoring threshold found in <log_folder>/scores_<th>.json, "
@@ -416,9 +459,12 @@ def process(job):
             recover_max_gap=cfg["recover_max_gap"],
             recover_passes=cfg["recover_passes"],
             recover_max_residual=cfg["recover_max_residual"],
+            **cfg.get("pipeline_kw", {}),
         )
     if not cfg["no_pp_public"]:
-        coords, edges = run_pp_public(coords, edges, sample=sample, **PP_PUBLIC_TUNED)
+        coords, edges = run_pp_public(
+            coords, edges, sample=sample,
+            **cfg.get("pp_public_kw") or PP_PUBLIC_TUNED)
     if cfg["ilp"]:
         coords, edges = run_ilp(coords, edges, **ILP_TUNED)
     # Last: it only ever adds edges, so nothing downstream needs to see it, and
@@ -492,15 +538,25 @@ def main():
     if not paths:
         raise SystemExit(f"No npz files under {preds_dir}")
 
+    # Recall-preserving chain for a pseudo-label pass -- see PL_PIPELINE above.
+    keep_all = args.pl and not args.pl_prune
+    pipeline_kw = dict(PL_PIPELINE) if keep_all else {}
+    pp_public_kw = dict(PP_PUBLIC_TUNED, **(PL_PP_PUBLIC if keep_all else {}))
+    # Edges are discarded by the pseudo-label consumer, and this stage only adds
+    # edges, so it cannot change what is read back.
+    divisions = not args.no_divisions and not keep_all
+
     recover = not args.no_pipeline and not args.no_recover
     stages = [name for name, on in (
-        ("pipeline", not args.no_pipeline),
+        ("pipeline" + (f"(min_track={pipeline_kw['min_track']})"
+                       if pipeline_kw else ""), not args.no_pipeline),
         (f"recover(gap<={args.recover_max_gap}, x{args.recover_passes}, "
          f"r={args.recover_max_residual:g})", recover),
-        ("pp_public(tuned)", not args.no_pp_public),
+        ("pp_public(" + ("keep-all-nodes" if keep_all else "tuned") + ")",
+         not args.no_pp_public),
         ("ILP(tuned)", args.ilp),
         (f"divisions(diverge={args.div_diverge_um:g}, "
-         f"cap={args.div_global_frac_cap:g})", not args.no_divisions),
+         f"cap={args.div_global_frac_cap:g})", divisions),
     ) if on]
 
     print(f"-> split     : {'train (pseudo-label)' if args.pl else 'val'}")
@@ -518,7 +574,9 @@ def main():
         recover_max_gap=args.recover_max_gap,
         recover_passes=args.recover_passes,
         recover_max_residual=args.recover_max_residual,
-        divisions=not args.no_divisions,
+        pipeline_kw=pipeline_kw,
+        pp_public_kw=pp_public_kw,
+        divisions=divisions,
         div=dict(
             DIVISIONS_TUNED,
             max_parent_um=args.div_max_parent_um,

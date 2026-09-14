@@ -52,7 +52,8 @@ from utils.logger import create_logger, prepare_log_folder
 DEFAULTS = {
     # Global
     # "coords_log_folder": "../logs/2026-09-07/4/preds_r6_0.50/",
-    "coords_log_folder": "../logs/2026-09-09/4/preds_r6_0.40/",
+    # "coords_log_folder": "../logs/2026-09-09/4/preds_r6_0.40/",
+    "coords_log_folder": "../logs/2026-09-13/1/preds_r6_0.40/",
     "data_dir": TRAIN_DIR,
     "selected_folds": [0, 1],
     "fullfit": True,
@@ -62,7 +63,7 @@ DEFAULTS = {
     "min_nodes": 8,
     "max_frames_per_video": None,   # cap for debugging
     "patch_zyx": (3, 48, 48),  # (channels, height, width)
-    "n_frames": 1,
+    "n_frames": 3,
     "real_prop": 0.5,  # Share of samples served as a *real* (t, t+1)
 
     # Augmentations

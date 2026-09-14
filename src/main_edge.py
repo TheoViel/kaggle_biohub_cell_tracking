@@ -52,7 +52,12 @@ DEFAULTS = {
     # "nodes_folder": "../logs/2026-09-09/4/preds_r6_0.40/",
     # "nodes_folder": "../logs/2026-09-09/4/preds_r6_0.50/",
     # "nodes_folder": "../logs/2026-09-10/0/preds_r6_0.40/",
-    "nodes_folder": "../logs/2026-09-10/0/preds_r6_0.50/",
+    # "nodes_folder": "../logs/2026-09-10/0/preds_r6_0.50/",
+    # "nodes_folder": "../logs/2026-09-10/0/preds_r7_0.40/",
+    # "nodes_folder": "../logs/2026-09-11/1/preds_r7_0.40/",  <- 0.8568
+    # "nodes_folder": "../logs/2026-09-11/1/preds_r7_0.50/",
+    # "nodes_folder": "../logs/2026-09-11/1/preds_r6_0.40/",  <- 0.8605
+    "nodes_folder": "../logs/2026-09-11/1/preds_r6_0.50/",
 
     # "embeddings_key": "embeddings_contrastive_2026-09-07_3",  # 0.8623 - vit_base_patch16_224
     # "embeddings_key": "embeddings_contrastive_2026-09-08_0",  # 0.8623 - vit_small_patch8_224
@@ -60,7 +65,7 @@ DEFAULTS = {
     
     "data_dir": TRAIN_DIR,
     "selected_folds": [0, 1] , # [0, 1],
-    "fullfit": True,
+    "fullfit": False,
 
     # Data
     "window_size": 2,               # frames per sample; 2 = one scored frame pair

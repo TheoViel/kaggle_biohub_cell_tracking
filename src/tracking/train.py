@@ -118,6 +118,7 @@ def fit(
             # A detection-side head, so it follows the backbone's rate rather
             # than the edge scorer's.
             "offset_head": lr_unet,
+            "annot_head": lr_unet,
         },
         betas=args.optimizer_config["betas"],
         weight_decay=args.optimizer_config["weight_decay"],
@@ -234,7 +235,7 @@ def fit(
                     # Nothing on the detection side is being supervised: there
                     # is no heatmap and no U-Net in the graph at all.
                     det_logits, unet_scaling, offset_maps = [], None, None
-                    det_logits_ds, det_stride = None, None
+                    det_logits_ds, det_stride, annot_logits = None, None, None
                 elif transformer_only:
                     names = batch["name"]
                     if any(name not in fts_cache for name in names):
@@ -249,10 +250,10 @@ def fit(
                     # The detector is frozen here, so neither the heatmap nor
                     # the vote is being supervised.
                     det_logits, unet_scaling, offset_maps = [], None, None
-                    det_logits_ds, det_stride = None, None
+                    det_logits_ds, det_stride, annot_logits = None, None, None
                 else:
                     (frame_det, det_logits, unet_scaling, offset_maps,
-                     det_logits_ds, det_stride) = encode_nodes(
+                     det_logits_ds, det_stride, annot_logits) = encode_nodes(
                         core_model,
                         imgs,
                         coords,
@@ -319,6 +320,7 @@ def fit(
                     # backbone decodes past it; equal otherwise.
                     det_stride=det_stride,
                     det_logits_ds_per_frame=det_logits_ds,
+                    annot_logits_per_frame=annot_logits,
                     weak_pos_per_frame=(
                         [weak_pos[:, i] for i in range(window_size)]
                         if weak_pos is not None else None
@@ -438,9 +440,10 @@ def fit(
                     f"lr={lr_str}  loss={avg['total']:.4f}"
                     + (f" (det={avg['det']:.3f}"
                        + (f" ds={avg['det_ds']:.3f}" if "det_ds" in avg else "")
+                       + (f" ann={avg['annot']:.3f}" if "annot" in avg else "")
                        + (f" off={avg['offset']:.3f}" if "offset" in avg else "")
                        + ")"
-                       if ("offset" in avg or "det_ds" in avg) else "")
+                       if any(k in avg for k in ("offset", "det_ds", "annot")) else "")
                     + f"  t={elapsed:.0f}s \t{val_message}"
                 )
                 interval_losses = dict.fromkeys(interval_losses, 0.0)
@@ -496,6 +499,7 @@ def _model_config(args) -> dict:
         "unet_stem": getattr(args, "unet_stem", "stride"),
         "unet_norm": getattr(args, "unet_norm", "batch"),
         "unet_hires_fusion": bool(getattr(args, "unet_hires_fusion", False)),
+        "annot_head": bool(getattr(args, "annot_head", False)),
         "transformer_hidden": args.transformer_hidden,
         "transformer_heads": args.transformer_heads,
         "transformer_blocks": args.transformer_blocks,

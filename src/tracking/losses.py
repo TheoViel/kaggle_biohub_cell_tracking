@@ -184,6 +184,7 @@ def detection_loss(
     use_weak_positives: bool = True,
     ignore_positives: torch.Tensor | None = None,  # (B, N, 3), -1 padded
     ignore_radius: float = 0.0,  # detection-grid voxels; 0 disables
+    pos_weight_scale: float = 1.0,
 ) -> torch.Tensor:
     """Penalty-reduced focal loss on a Gaussian-splatted detection heatmap.
 
@@ -194,6 +195,13 @@ def detection_loss(
     Normalised by the number of peaks, so the scale is independent of how many
     cells the crop holds. See ``build_detection_target`` for how the target
     heatmap, positive weight, and ignore mask are constructed.
+
+    ``pos_weight_scale`` multiplies the positive term. The normalisation is by
+    peak count, not by voxel count, so the *negative* term is what scales with
+    how sparse the positives are: drop from ~500 peaks a frame to the ~3 that
+    are annotated and each surviving positive is charged 150x more background.
+    A head supervised on the annotation alone therefore needs this above 1 to
+    see its positives at all -- see ``annot_pos_scale`` in ``TrackingLoss``.
     """
     spatial = det_logits.shape[2:]
     logits = det_logits[:, 0]  # (B, Z, Y, X)
@@ -229,7 +237,7 @@ def detection_loss(
         p = torch.sigmoid(logits.float()).clamp(1e-4, 1.0 - 1e-4)
         heat = heat.float()
 
-        pos_loss = -((1.0 - p) ** FOCAL_ALPHA) * torch.log(p) * pos_weight
+        pos_loss = -((1.0 - p) ** FOCAL_ALPHA) * torch.log(p) * pos_weight * pos_weight_scale
         neg_loss = (
             -((1.0 - heat) ** FOCAL_BETA)
             * (p ** FOCAL_ALPHA)
@@ -393,6 +401,19 @@ class TrackingLoss(nn.Module):
         applies on a model whose backbone decodes past the node grid, where the
         coarse head keeps being trained on the target it had before the extra
         stage was added.
+    annot_loss_weight : float
+        Weight for L_annot, the "would an annotator have labelled this cell"
+        head. It is an auxiliary task on shared features, so this also bounds
+        how far it is allowed to move the detector.
+    annot_neg_weight : float
+        Per-voxel negative weight for that head. Lower than the detector's,
+        because its positives are ~150x rarer -- only the ground truth counts,
+        never a weak positive.
+    annot_pos_scale : float
+        Multiplier on its positive term. The focal loss normalises by peak
+        count, so a head with ~3 positives a frame instead of ~500 has each of
+        them charged against the same background; without this above 1 the
+        negatives simply drown it and the head learns to answer "no".
     offset_loss_weight : float
         Weight for L_offset. Ignored when the model has no offset head, in
         which case no vote is produced and the term is absent.
@@ -413,6 +434,9 @@ class TrackingLoss(nn.Module):
         det_use_weak_positives: bool = True,
         det_ignore_radius: float = 0.0,
         det_ds_weight: float = 1.0,
+        annot_loss_weight: float = 1.0,
+        annot_neg_weight: float = 1e-2,
+        annot_pos_scale: float = 1.0,
         offset_loss_weight: float = 1.0,
         offset_radius: int = 2,
         offset_beta: float = 1.0,
@@ -426,6 +450,9 @@ class TrackingLoss(nn.Module):
         self.det_use_weak_positives = det_use_weak_positives
         self.det_ignore_radius = det_ignore_radius
         self.det_ds_weight = det_ds_weight
+        self.annot_loss_weight = annot_loss_weight
+        self.annot_neg_weight = annot_neg_weight
+        self.annot_pos_scale = annot_pos_scale
         self.offset_loss_weight = offset_loss_weight
         self.offset_radius = offset_radius
         self.offset_beta = offset_beta
@@ -452,6 +479,9 @@ class TrackingLoss(nn.Module):
             list[torch.Tensor] | None
         ) = None,  # W × (B, 1, Z, Y, X) on the node grid, None without deep supervision
         det_stride: tuple | None = None,  # image voxels per heatmap voxel
+        annot_logits_per_frame: (
+            list[torch.Tensor] | None
+        ) = None,  # W × (B, 1, Z, Y, X) on det_logits' grid, None when the head is off
         progress: float = 1.0,  # fraction of training elapsed, in [0, 1]
     ) -> tuple[torch.Tensor, dict[str, float]]:
         W = len(det_logits_per_frame)
@@ -520,6 +550,28 @@ class TrackingLoss(nn.Module):
             "det": self.det_loss_weight * l_det.item(),
             "edge": l_edge.item(),
         }
+
+        if annot_logits_per_frame:
+            # Ground truth only: no weak positives, by construction. A weak
+            # positive is a cell the *detector* believes in, which is precisely
+            # the class this head exists to separate the annotation from -- feed
+            # them in and the two heads collapse onto the same question.
+            l_annot = sum(
+                detection_loss(
+                    annot_logits_per_frame[i],
+                    gt_coords_per_frame[i].clone(),
+                    gt_mask_per_frame[i],
+                    self.annot_neg_weight,
+                    unet_scaling=unet_scaling if det_stride is None else det_stride,
+                    weak_smoothing=self.det_weak_smoothing,
+                    gaussian_sigma=self.det_gaussian_sigma,
+                    use_weak_positives=False,
+                    pos_weight_scale=self.annot_pos_scale,
+                )
+                for i in range(len(annot_logits_per_frame))
+            ) / len(annot_logits_per_frame)
+            total = total + self.annot_loss_weight * l_annot
+            breakdown["annot"] = self.annot_loss_weight * l_annot.item()
 
         if det_logits_ds_per_frame:
             l_det_ds = _det_term(det_logits_ds_per_frame, unet_scaling)

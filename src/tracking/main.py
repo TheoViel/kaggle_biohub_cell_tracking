@@ -217,6 +217,7 @@ def build_model(args, ctx):
         unet_features=tuple(getattr(args, "unet_features", ("detection",)) or ()),
         offset_head=bool(getattr(args, "offset_head", False)),
         offset_radius=int(getattr(args, "offset_radius", 2)),
+        annot_head=bool(getattr(args, "annot_head", False)),
     )
 
     if ctx is None:
@@ -248,7 +249,7 @@ def load_weights(
     fold: int,
     ctx,
     prefixes: tuple[str, ...] = (
-        "unet.", "detect_head.", "detect_head_fine.", "offset_head.",
+        "unet.", "detect_head.", "detect_head_fine.", "offset_head.", "annot_head.",
     ),
     run_name: str | None = None,
 ) -> None:

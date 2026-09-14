@@ -230,11 +230,11 @@ def encode_nodes(
     nms: str = "maxpool",
     nms_radius_um: float = 7.0,
     node_features: bool = True,
-) -> tuple[list, list, tuple, list | None, list | None, tuple]:
+) -> tuple[list, list, tuple, list | None, list | None, tuple, list | None]:
     """UNet encode, then peak detection and GT matching on every frame.
 
     Returns ``(frame_det, det_logits, unet_scaling, offset_maps, det_logits_ds,
-    det_stride)`` where ``frame_det`` holds one ``(coords, pos_embed, mask,
+    det_stride, annot_logits)`` where ``frame_det`` holds one ``(coords, pos_embed, mask,
     matches, unet_feat, scores)`` tuple per frame, empty when ``detect`` is
     False (the detection-only warmup never reads it). ``scores`` is each node's
     detection probability, which lets a higher threshold be applied later by
@@ -263,7 +263,7 @@ def encode_nodes(
     embeddings with gradient attached.
     """
     _, window_size, d, h, w = imgs.shape
-    unet_out, det_logits, det_logits_ds = core_model.encode(imgs)
+    unet_out, det_logits, det_logits_ds, annot_logits = core_model.encode(imgs)
     offset_maps = core_model.encode_offsets(unet_out)
 
     d_out, h_out, w_out = unet_out.shape[-3:]
@@ -325,7 +325,8 @@ def encode_nodes(
             (det_coords, det_pos_embed, det_mask, matches, unet_feat, det_scores)
         )
 
-    return frame_det, det_logits, unet_scaling, offset_maps, det_logits_ds, det_stride
+    return (frame_det, det_logits, unet_scaling, offset_maps, det_logits_ds,
+            det_stride, annot_logits)
 
 
 def node_scaling_from_voxel(voxel_size) -> tuple[float, float, float]:

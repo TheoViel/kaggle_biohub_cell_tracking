@@ -276,8 +276,13 @@ def _detect_cells_pooled(
 
     Returns
     -------
-    np.ndarray
+    coords : np.ndarray
         (N, 4) int16 array with columns [t, z, y, x] in downsampled space.
+    probs : np.ndarray
+        (N,) float32, the detection probability at each kept peak, row-aligned
+        with ``coords``. Read off the same TTA-averaged map the threshold is
+        applied to, so it costs nothing beyond carrying it, and it is what a
+        consumer wanting to discount a shaky detection needs.
     """
     logits = det_logits.unsqueeze(0)  # (1, 1, Z, Y, X)
     pad = tuple(k // 2 for k in pool_kernel)
@@ -286,11 +291,15 @@ def _detect_cells_pooled(
     peak_idx = torch.nonzero(is_peak[0, 0])  # (N, 3)
 
     if peak_idx.shape[0] == 0:
-        return np.empty((0, 4), dtype=np.int16)
+        return np.empty((0, 4), dtype=np.int16), np.empty(0, dtype=np.float32)
 
+    probs = (
+        torch.sigmoid(logits[0, 0])[peak_idx[:, 0], peak_idx[:, 1], peak_idx[:, 2]]
+        .float().cpu().numpy().astype(np.float32)
+    )
     coords = peak_idx.float().cpu().numpy()
     t_col = np.full((len(coords), 1), t, dtype=np.float32)
-    return np.concatenate([t_col, coords], axis=1).astype(np.int16)
+    return np.concatenate([t_col, coords], axis=1).astype(np.int16), probs
 
 
 @torch.no_grad()
@@ -315,6 +324,9 @@ def predict_video(
     coords : np.ndarray
         Shape (N, 4) — columns [t, z, y, x] in original resolution.
     edges : list of (src_idx, tgt_idx, prob, distance) tuples
+    node_probs : np.ndarray
+        Shape (N,) float32 — the detection probability at each node, row-aligned
+        with ``coords``.
     """
     ds = open_dataset(ds_path, normalize=False, load_image=False, downsample=downsample)
     if "0.001" not in ds.quantiles or "0.999" not in ds.quantiles:
@@ -339,6 +351,9 @@ def predict_video(
     seen_frames: set[int] = set()
     seen_pairs: set[tuple[int, int]] = set()
     coord_lists: list[np.ndarray] = []
+    # Appended in lockstep with coord_lists below, which is what keeps the
+    # probabilities row-aligned with the coords through the final concatenate.
+    prob_lists: list[np.ndarray] = []
     coord_offset: dict[int, tuple[int, int]] = {}
     global_node_count: int = 0
     all_edges: list[tuple[int, int, float, float]] = []
@@ -392,12 +407,13 @@ def predict_video(
         # --- Detect cells in each frame (dedup across windows) ---
         for f_idx, t in enumerate(frame_indices):
             if t not in seen_frames:
-                arr = _detect_cells_pooled(
+                arr, arr_probs = _detect_cells_pooled(
                     det_logits[f_idx][0], t, cfg.det_threshold, pool_k,
                 )
                 coord_offset[t] = (global_node_count, global_node_count + len(arr))
                 global_node_count += len(arr)
                 coord_lists.append(arr)
+                prob_lists.append(arr_probs)
                 seen_frames.add(t)
 
         coords_so_far = (
@@ -490,11 +506,14 @@ def predict_video(
         del unet_out
 
     coords = np.concatenate(coord_lists) if coord_lists else np.empty((0, 4), dtype=np.int16)
+    node_probs = (
+        np.concatenate(prob_lists) if prob_lists else np.empty(0, dtype=np.float32)
+    )
     # Scale spatial coords back to original resolution.
     coords = coords.astype(np.float32)
     coords[:, 1:] *= ds_arr
     coords = coords.astype(np.int16)
-    return coords, all_edges
+    return coords, all_edges, node_probs
 
 
 # =============================================================================
@@ -512,6 +531,7 @@ def predict(
     unet_batch_size: int = 4,
     video_slice: slice | None = None,
     evaluate: bool = False,
+    dump_nodes: Path | None = None,
 ) -> None:
     """Run inference on the test split and save predictions as .geff files."""
     if debug_video is not None:
@@ -542,14 +562,29 @@ def predict(
         flush=True,
     )
 
+    if dump_nodes is not None:
+        dump_nodes = Path(dump_nodes)
+        dump_nodes.mkdir(parents=True, exist_ok=True)
+
     for name in tqdm(test_names, desc="Predicting", disable=not INTERACTIVE):
         ds_path = data_dir / name
-        coords, edges = predict_video(
+        coords, edges, node_probs = predict_video(
                 model, ds_path, device,
                 cfg=cfg,
                 window_size=window_size,
                 unet_batch_size=unet_batch_size,
                 downsample=downsample,
+            )
+        if dump_nodes is not None:
+            # Written here, before build_graph, so nothing downstream has
+            # touched the node set -- no ILP, no gap closing, no short-track
+            # filter, no safe divisions. Just the detector's peaks, at original
+            # resolution, in the layout the biohub-inf pipeline reads.
+            np.savez_compressed(
+                dump_nodes / f"{name}.npz",
+                coords=coords,
+                edges=np.asarray(edges, dtype=np.float64).reshape(-1, 4),
+                node_probs=np.asarray(node_probs, dtype=np.float32).reshape(-1),
             )
         graph = build_graph(coords, edges)
         if cfg.use_ilp and graph.num_edges() > 0:
@@ -632,6 +667,13 @@ def main() -> None:
                         help="ILP: cost of a track disappearing (default 0.1).")
     parser.add_argument("--ilp-division-weight", type=float, default=1.0,
                         help="ILP: cost of a division; lower to allow more splits (default 1.0).")
+    parser.add_argument("--dump-nodes", type=str, default=None,
+                        help="Also write <dir>/<name>.npz holding the detector's own "
+                             "nodes -- coords / edges / node_probs -- taken before "
+                             "build_graph, so no ILP, gap closing, short-track filter "
+                             "or safe division has touched them. Coordinates are at "
+                             "original resolution, in the layout the biohub-inf "
+                             "pipeline reads.")
 
     args = parser.parse_args()
 
@@ -670,6 +712,7 @@ def main() -> None:
             unet_batch_size=args.unet_batch_size,
             video_slice=video_slice,
             evaluate=args.evaluate,
+            dump_nodes=Path(args.dump_nodes) if args.dump_nodes else None,
         )
 
 

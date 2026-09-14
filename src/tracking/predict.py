@@ -1,3 +1,4 @@
+import itertools
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -21,7 +22,9 @@ class PredictConfig:
     was fitted against the node sets those settings produce.
     """
 
-    det_tta = False
+    # Test-time augmentation over axis flips, averaged in *logit* space. 1 is
+    # off, 4 flips Y/X, 8 adds Z. See _tta_flips.
+    n_tta = 1
 
     # --- Normalisation ---
     # Which stored quantiles map the raw volume into the range the detector was
@@ -52,6 +55,34 @@ class PredictConfig:
 
     max_parents_per_node = 1
     max_children_per_node = 2
+
+
+def _tta_flips(n_tta: int) -> list[tuple[int, ...]]:
+    """The flip sets to average a prediction over, identity first.
+
+    Every axis flip is its own inverse, so undoing one is flipping back along
+    the same dims -- which is what makes this exact rather than a resampling
+    approximation. The sets are all subsets of the chosen axes, so the count is
+    a power of two: 4 over Y/X, 8 once Z joins.
+
+    Z is included at 8 because this model was *trained* with it: `flip_augment`
+    flips Z, Y and X independently at p=0.5, so a z-flipped volume is in
+    distribution. That is not a general licence -- the public notebook excludes
+    Z deliberately, on the grounds that its 4x coarser sampling makes a z-flip
+    out of distribution for a model trained without one, and it buys its eight
+    views from D4 rotations in the XY plane instead. Which is right depends on
+    what the checkpoint saw, not on the geometry.
+    """
+    if n_tta == 1:
+        return [()]
+    if n_tta not in (4, 8):
+        raise ValueError(f"n_tta must be 1, 4 or 8; got {n_tta}")
+    axes = (-1, -2) if n_tta == 4 else (-1, -2, -3)
+    return [
+        tuple(c)
+        for r in range(len(axes) + 1)
+        for c in itertools.combinations(axes, r)
+    ]
 
 
 def _nearest_probs(
@@ -167,6 +198,7 @@ class _NodeRegistry:
         self.coord_lists: list[np.ndarray] = []
         self.offset_lists: list[np.ndarray] = []
         self.score_lists: list[np.ndarray] = []
+        self.annot_lists: list[np.ndarray] = []
         # coord_offset[t] = (start, end), a half-open range into the stacked array.
         self.coord_offset: dict[int, tuple[int, int]] = {}
         self.n_nodes = 0
@@ -178,6 +210,7 @@ class _NodeRegistry:
         arr: np.ndarray,
         offsets: np.ndarray | None = None,
         scores: np.ndarray | None = None,
+        annot: np.ndarray | None = None,
     ) -> None:
         """Register frame t's detections, in detection-grid space.
 
@@ -200,6 +233,13 @@ class _NodeRegistry:
             np.full(len(arr), np.nan, dtype=np.float32) if scores is None
             else np.asarray(scores, dtype=np.float32)
         )
+        # NaN, not 0: "this model has no annotation head" and "this head says
+        # no" are different claims, and a consumer gating on the column has to
+        # be able to tell them apart.
+        self.annot_lists.append(
+            np.full(len(arr), np.nan, dtype=np.float32) if annot is None
+            else np.asarray(annot, dtype=np.float32)
+        )
         self.seen_frames.add(t)
 
     def coords(self) -> np.ndarray:
@@ -213,6 +253,12 @@ class _NodeRegistry:
         if not self.score_lists:
             return np.empty(0, dtype=np.float32)
         return np.concatenate(self.score_lists)
+
+    def annot(self) -> np.ndarray:
+        """The annotation head's probability at every node, as (N,) float32."""
+        if not self.annot_lists:
+            return np.empty(0, dtype=np.float32)
+        return np.concatenate(self.annot_lists)
 
     def offsets(self) -> np.ndarray:
         """The centroid vote at every detection, as (N, 3) in grid voxels."""
@@ -358,12 +404,28 @@ def _gather_offsets(
     return vol[:, idx[:, 0], idx[:, 1], idx[:, 2]].T.float().cpu().numpy()
 
 
+def _gather_scalar(
+    logit_maps: list[torch.Tensor] | None,
+    f_idx: int,
+    arr: np.ndarray,          # (N, 4) [t, z, y, x] on the *heatmap* grid
+) -> np.ndarray | None:
+    """Sigmoid of a per-frame (1, 1, Z, Y, X) logit map at each detection."""
+    if logit_maps is None or len(arr) == 0:
+        return None
+    vol = logit_maps[f_idx][0, 0]           # (Z, Y, X)
+    idx = torch.from_numpy(arr[:, 1:].astype(np.int64)).to(vol.device)
+    for ax in range(3):
+        idx[:, ax] = idx[:, ax].clamp(0, vol.shape[ax] - 1)
+    return torch.sigmoid(vol[idx[:, 0], idx[:, 1], idx[:, 2]]).float().cpu().numpy()
+
+
 def _rescale_coords(
     coords: np.ndarray,
     unet_scaling: tuple[int, int, int] | None,
     downscale_factor: int,
     offsets: np.ndarray | None = None,
     det_stride: tuple[float, float, float] | None = None,
+    keep_float: bool = False,
 ) -> np.ndarray:
     """Scale detection-grid coords back to original resolution.
 
@@ -409,7 +471,15 @@ def _rescale_coords(
         coords[:, 1:] = coords[:, 1:] * downscale_factor + (downscale_factor - 1.0) / 2.0
     # round, not truncate: the centres are half-integers now, and int16() would
     # throw away that half a voxel again.
-    return np.round(coords).astype(np.int16)
+    #
+    # ``keep_float`` returns the position *before* that round. Anything that
+    # wants to combine two estimates -- fusing the two heads, averaging an
+    # offset vote across them -- has to do it here, because the round is not
+    # a small error on the coarse axis: the node grid's z stride is one image
+    # voxel, so a sub-voxel z correction lands on .5 and rounds straight back.
+    # 59% of the localisation MSE is in z, so that round is where a refinement
+    # goes to die. Round once, at the end, after everything has been combined.
+    return coords.astype(np.float32) if keep_float else np.round(coords).astype(np.int16)
 
 
 @torch.no_grad()
@@ -425,7 +495,8 @@ def predict_video_thresholds(
     downscale_factor: int = 1,
     return_det_logits: bool = True,
     nms_radii: Sequence[float] | None = None,
-) -> tuple[dict[tuple[float, float], tuple[np.ndarray, list]], torch.Tensor | None]:
+    heads: Sequence[str] = ("det",),
+) -> tuple[dict[tuple[str, float, float], tuple[np.ndarray, list]], torch.Tensor | None]:
     """Run inference on a single video over a grid of NMS radii x thresholds.
 
     Windows slide with stride ``W - 1`` so every consecutive pair is covered
@@ -449,10 +520,18 @@ def predict_video_thresholds(
     and ``nms_radii`` replace them. ``nms_radii`` defaults to
     ``[cfg.nms_radius_um]``.
 
+    ``heads`` selects which heatmap the peaks are found in: ``"det"`` is the
+    detection head, ``"annot"`` the annotation head on a model that has one.
+    Both come out of the *same* forward pass, so sweeping the second costs only
+    its NMS and edge passes -- and it is the honest way to ask whether "would an
+    annotator have labelled this" is a better detector than "is this a cell",
+    since anything else would confound the two heads with two forwards.
+
     Returns
     -------
     per_key : dict
-        ``(nms_radius_um, threshold)`` -> ``(coords, edges, node_probs)``.
+        ``(head, nms_radius_um, threshold)`` -> ``(coords, edges, node_probs,
+        annot_probs)``.
         ``node_probs`` is the (N,) detection probability at each node,
         row-aligned with ``coords``.
     det_logits : torch.Tensor or None
@@ -465,6 +544,16 @@ def predict_video_thresholds(
     thresholds = sorted({float(th) for th in thresholds})
     if not thresholds:
         raise ValueError("thresholds must not be empty")
+
+    heads = tuple(dict.fromkeys(heads))     # de-duplicate, keep order
+    unknown = set(heads) - {"det", "annot"}
+    if unknown:
+        raise ValueError(f"unknown head(s) {sorted(unknown)}, expected 'det' / 'annot'")
+    if "annot" in heads and getattr(model, "annot_head", None) is None:
+        raise ValueError(
+            "heads includes 'annot' but this model was built without an "
+            "annotation head; rebuild with annot_head=True or drop it"
+        )
 
     radii = sorted({float(r) for r in (nms_radii or [cfg.nms_radius_um])})
     if not radii:
@@ -503,9 +592,11 @@ def predict_video_thresholds(
     out_shape: tuple[int, int, int] | None = None
     pool_k: tuple[int, int, int] | None = None
 
-    # One node registry per (radius, threshold): the node sets differ, so the
-    # indices the edges refer to do too.
-    registries = {(r, th): _NodeRegistry() for r in radii for th in thresholds}
+    # One node registry per (head, radius, threshold): the node sets differ, so
+    # the indices the edges refer to do too.
+    registries = {
+        (h, r, th): _NodeRegistry() for h in heads for r in radii for th in thresholds
+    }
 
     # Sliding windows with stride W-1 cover every consecutive pair exactly once.
     stride = max(W - 1, 1)
@@ -540,7 +631,7 @@ def predict_video_thresholds(
 
         imgs = imgs.unsqueeze(0).to(device)  # (1, W, Z, Y, X)
 
-        unet_out, det_logits, _ = model.encode(imgs)
+        unet_out, det_logits, _, annot_logits = model.encode(imgs)
         offset_maps = model.encode_offsets(unet_out) if use_offset else None
         if return_det_logits:
             det_logits_list.append(torch.stack(det_logits, 0).detach().cpu())
@@ -582,16 +673,31 @@ def predict_video_thresholds(
             # print("VOXEL SIZE OUT: ", voxel_size_out)
             # print("POOL K: ", pool_k)
 
-        # Detection TTA: average logits over Y/X flips.
-        if cfg.det_tta:
-            for dims in [(-1,), (-2,), (-2, -1)]:
+        # Test-time augmentation. Averaged in logit space, not probability:
+        # the heads are trained with a focal/BCE loss on logits, the sigmoid is
+        # monotone but not affine, and averaging after it pulls confident views
+        # toward the middle. The identity forward above is the first view.
+        #
+        # Only the heatmaps are averaged. `unet_out` keeps the identity view's
+        # features, because the node features are read at integer coordinates
+        # and a flipped forward's feature map is not registered to them at the
+        # sub-voxel level; likewise the offset vote, which is a direction in
+        # grid space. Both are the detector's, and both would need their own
+        # un-flip to be combined honestly.
+        flips = _tta_flips(getattr(cfg, "n_tta", 1))
+        if len(flips) > 1:
+            for dims in flips[1:]:
                 imgs_flip = imgs.flip(dims)
-                _, det_flip, _ = model.encode(imgs_flip)
+                _, det_flip, _, annot_flip = model.encode(imgs_flip)
                 for f in range(W):
                     det_logits[f] = det_logits[f] + det_flip[f].flip(dims)
-                del imgs_flip, det_flip
+                    if annot_logits is not None:
+                        annot_logits[f] = annot_logits[f] + annot_flip[f].flip(dims)
+                del imgs_flip, det_flip, annot_flip
             for f in range(W):
-                det_logits[f] = det_logits[f] / 4
+                det_logits[f] = det_logits[f] / len(flips)
+                if annot_logits is not None:
+                    annot_logits[f] = annot_logits[f] / len(flips)
 
         # imgs is needed until the edge pass below when a contrastive branch
         # exists, so it is freed at the end of the window instead of here.
@@ -601,38 +707,49 @@ def predict_video_thresholds(
         # det_logits / unet_out), matching tracking/targets.py. One NMS pass
         # answers every threshold at once.
         for f_idx, t in enumerate(frame_indices):
-            probas = None
-            for r in radii:
-                pending = [
-                    th for th in thresholds
-                    if t not in registries[(r, th)].seen_frames
-                ]
-                if not pending:
-                    continue
-                if probas is None:  # one sigmoid for every radius
-                    probas = det_logits[f_idx][0].sigmoid()
-                per_threshold = detect_cells_multi_threshold(
-                    probas,
-                    t,
-                    pending,
-                    nms=cfg.nms,
-                    pool_kernel=pool_k,
-                    voxel_size=voxel_size_det,
-                    nms_radius_um=r,
-                    return_scores=True,
-                )
-                for th, (arr, node_scores) in per_threshold.items():
-                    # Onto the node grid, which is what the registry, the offset
-                    # head and the edge scorer all read.
-                    arr = arr.astype(np.float32)
-                    arr[:, 1:] /= det_scaling
-                    registries[(r, th)].add_frame(
-                        t, arr, _gather_offsets(offset_maps, f_idx, arr), node_scores
+            # Both heads sit on the same grid and come from the same forward;
+            # only which map the peaks are found in differs.
+            source = {"det": det_logits, "annot": annot_logits}
+            cache: dict[str, torch.Tensor] = {}
+            for h in heads:
+                for r in radii:
+                    pending = [
+                        th for th in thresholds
+                        if t not in registries[(h, r, th)].seen_frames
+                    ]
+                    if not pending:
+                        continue
+                    if h not in cache:  # one sigmoid per head, for every radius
+                        cache[h] = source[h][f_idx][0].sigmoid()
+                    per_threshold = detect_cells_multi_threshold(
+                        cache[h],
+                        t,
+                        pending,
+                        nms=cfg.nms,
+                        pool_kernel=pool_k,
+                        voxel_size=voxel_size_det,
+                        nms_radius_um=r,
+                        return_scores=True,
                     )
+                    for th, (arr, node_scores) in per_threshold.items():
+                        # Read on the heatmap's grid, before the coords are
+                        # divided back onto the node grid. Both columns are
+                        # filled whichever head found the peak, so the two runs
+                        # are directly comparable -- `node_probs` is always the
+                        # detector's opinion and `annot_probs` always the
+                        # annotation head's, at the same voxel.
+                        node_det = _gather_scalar(det_logits, f_idx, arr)
+                        node_annot = _gather_scalar(annot_logits, f_idx, arr)
+                        arr = arr.astype(np.float32)
+                        arr[:, 1:] /= det_scaling
+                        registries[(h, r, th)].add_frame(
+                            t, arr, _gather_offsets(offset_maps, f_idx, arr),
+                            node_det, node_annot,
+                        )
 
         # --- Edge prediction for each consecutive pair in the window ---
-        # Repeated per (radius, threshold): each one has its own nodes, so its
-        # own pairs.
+        # Repeated per (head, radius, threshold): each one has its own nodes,
+        # so its own pairs.
         for reg in registries.values():
             _predict_window_edges(
                 model, reg, frame_indices, node_feat_maps, out_shape, cfg, device,
@@ -650,6 +767,15 @@ def predict_video_thresholds(
             ),
             reg.edges,
             reg.scores(),
+            reg.annot(),
+            # The same positions before the round, for a consumer that still
+            # has combining to do. Rounding twice is not idempotent once an
+            # offset vote or a fusion has moved a coordinate off the grid.
+            _rescale_coords(
+                reg.coords(), unet_scaling, downscale_factor,
+                offsets=reg.offsets() if use_offset else None,
+                det_stride=det_stride, keep_float=True,
+            ),
         )
         for key, reg in registries.items()
     }
@@ -694,7 +820,9 @@ def predict_video(
         progress=progress,
         downscale_factor=downscale_factor,
     )
-    coords, edges, _ = results[(float(cfg.nms_radius_um), float(cfg.det_threshold))]
+    coords, edges = results[
+        ("det", float(cfg.nms_radius_um), float(cfg.det_threshold))
+    ][:2]
     return coords, edges, det_logits
 
 

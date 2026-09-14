@@ -478,7 +478,7 @@ def evaluate_videos(
             # [:2] drops the node probabilities: the precomputed branch above
             # has none, and the metrics below read neither, so both branches
             # stay the same (coords, edges) shape.
-            per_threshold = {th: per_key[(float(cfg.nms_radius_um), th)][:2]
+            per_threshold = {th: per_key[("det", float(cfg.nms_radius_um), th)][:2]
                              for th in thresholds}
 
         gt = td.graph.IndexedRXGraph.from_geff(data_dir / f"{path.name}.geff")

@@ -113,7 +113,7 @@ DEFAULTS = {
     # Model
     "unet_arch": "temporal",          # "temporal" (two-conv) or "resenc" (nnU-Net ResEnc)
     "unet_out_channels": 32,
-    "unet_layers": (32, 64, 128),
+    "unet_layers": (64, 128, 256),
     "unet_pool_stride": (1, 2, 2),    # pool Y/X only; full-scale Z preserved
     "unet_n_anisotropic": 2,          # downsampling steps using unet_pool_stride
     # Decoder
@@ -160,12 +160,25 @@ DEFAULTS = {
     "nms_radius_um": 7.0,   # for greedy NMS
     "max_dets_per_sample": 768,   # cap nodes per sample (bounds the N^2 edge matrix)
     "top_k_nodes": None,  # 64,            # min nodes/sample: below this, ignore the threshold & take the top-k peaks
+    # The centroid vote: every grid voxel near a cell predicts the vector to its
+    # centre, and a detection is reported at (g + o) * stride instead of at its
+    # own voxel. Worth having for y/x -- RMS 1.105 -> 1.070 and 1.095 -> 1.052
+    # on 2026-09-10/7 against the same config without it.
+    #
+    # It does *not* move z, and that is structural rather than a tuning problem:
+    # the node grid's z stride is one image voxel, so `round(g + o_z)` returns g
+    # unless the vote exceeds half a voxel, and the annotation is itself
+    # integer-valued on that grid (verified: 100% of GT coordinates are exact
+    # integers). So there is no sub-voxel z truth to regress toward -- the task
+    # in z is picking the right slice, which is a discrete choice this head
+    # expresses only by clearing 0.5. z still holds 60% of the localisation MSE.
     "offset_head": False,
     "offset_radius": 2,       # grid voxels a cell's vote reaches
+    "annot_head": True,  # A second head asking "would an annotator have labelled this cell"
 
     # Stage 1 - Synthetic data pretraining
     "synthetic_pretraining": {
-        "enabled": True,
+        "enabled": False,
         "synthetic_dir": "../input/synthetic/v5/",
         "synthetic_proportion": 1,
         "weights": None,
@@ -207,14 +220,14 @@ DEFAULTS = {
         # Override the image peaks above; combined with pl_folder when both are
         # set, the pl_folder point winning any duplicate. A stack the folder does
         # not cover or that fails a gate below falls back to the image peaks.
-        "use_focus_3d": True,
+        "use_focus_3d": False,
         "focus_3d_dir": OUTPUT_FOLDER + "focus3d/",
         "focus_3d_min_recall": 0.,   # drop a stack that misses annotated cells
         "focus_3d_max_ratio": 1.75,    # drop a stack predicting far too many cells
         # Weak positives from pl_folder
         # "pl_folder": "../logs/2026-08-31/33/preds_pl_0.50/",  # 1st round PL
-        # "pl_folder": "../logs/2026-09-01/9/preds_pl_pp/",  # 2nd round PL + PP
-        "pl_folder": "../logs/2026-09-09/4/preds_pl_pp/",  # Extra head 3rd round PL + PP
+        "pl_folder": "../logs/2026-09-01/9/preds_pl_pp/",  # 2nd round PL + PP
+        # "pl_folder": "logs/2026-09-13/1/preds_pl_pp/",  # New best
         "pl_ignore_folder": None,  # Expects lower threshold coords
         "ignore_min_dist_um": 7.0,  # the pl_ignore_folder path only
     },
@@ -222,14 +235,15 @@ DEFAULTS = {
     # Stage 1.5 - Pretraining
     "pretraining": {
         "enabled": True,
-        "weights": "../logs/2026-09-09/0/fold_0/ckpt_synthetic.pt",
+        "weights": "../logs/2026-09-13/1/fold_0/ckpt_synthetic.pt",  # "../logs/2026-09-09/4/fold_0/ckpt_synthetic.pt",
+        # "weights": "../logs/2026-09-10/0/fold_0/ckpt_synthetic.pt",
         # Data
         "crop_size": (32, 128, 128),
         "aug_strength": 3,
         "synthetic_dir": "../input/synthetic/v4/",
-        "synthetic_proportion": 0.5,
+        "synthetic_proportion": 0., # 0.5
         # Training
-        "iterations": 1000,
+        "iterations": 5000,
         "epochs": None,
         "batch_size": 16,
         "loss_config": {
@@ -301,6 +315,14 @@ DEFAULTS = {
         "det_weak_smoothing": 0.01,      # smoothing factor for weak positives
         "det_gaussian_sigma": 1.0,
         "det_ds_weight": 1.0,          # deep-supervision heatmap, relative to the fine one
+        # The annotation head. Its positives are the ~3 annotated cells a frame
+        # rather than the ~500 the detector sees, and the focal loss normalises
+        # by peak count -- so each positive is charged against the same
+        # background and needs `annot_pos_scale` above 1 to survive it. Start
+        # from the ratio of positive counts and tune from there.
+        "annot_loss_weight": 1.0,
+        "annot_neg_weight": 1e-3,
+        "annot_pos_scale": 1.0,
         "det_ignore_radius": 0.0,      # Ignore radius around ignored_peaks
         "offset_loss_weight": 1.0,     # Offset loss weight
         "offset_beta": 1.0,            # SmoothL1 knee, grid voxels
