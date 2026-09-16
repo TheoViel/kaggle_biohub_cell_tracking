@@ -310,27 +310,46 @@ Leave-one-embryo-out on 107,613 forks from `edge_run/2026-09-13/0`, of which
 Chance AP is 0.025 / 0.021, so the CNN runs 25× and 20× chance, and **both
 folds learn** — including fold 1, trained on 13 positives.
 
-Dropping the forks it disbelieves, against the production chain:
+Dropping the forks it disbelieves. Both columns are the **ILP-enabled** chain
+(`--ilp --ilp_disappearance 0.75 --ilp_threshold 0.4`, the ~0.8720 variant)
+measured in one harness, because the fork candidates are generated with ILP on
+and comparing them against the non-ILP 0.8699 baseline credits the ILP's own
++0.0031 to the classifier:
 
-| | production | + gated forks | div_jaccard |
-|---|---|---|---|
-| 44b6 | 0.9016 | **0.9075** | 0.1250 → 0.2162 |
-| 6bba | 0.8382 | **0.8424** | 0.1667 → 0.2316 |
+| | production (ILP) | + gated forks | Δ | div_jaccard |
+|---|---|---|---|---|
+| 44b6 | 0.9010 | **0.9075** | +0.0065 | 0.1250 → 0.2162 |
+| 6bba | 0.8429 | 0.8424 | −0.0005 | 0.1647 → 0.2316 |
+| macro | 0.8720 | **0.8750** | +0.0030 | |
+
+**The gain is one embryo.** 6bba is flat — its `division_jaccard` rises
+0.1647 → 0.2316, and `adj_edge_jaccard` gives all of it back (0.8264 → 0.8193)
+paying for the surviving fork edges. Only on 44b6 does the division term win
+that trade. A first version of this table compared against the *non-ILP*
+baseline and reported 6bba at +0.0042; that was the ILP's contribution, not the
+classifier's.
 
 **The threshold is not a tuned parameter.** The CNN saturates — positives
 median 1.000, negatives 0.000 — and the result is bit-identical from tau 0.05
 to 0.70 on fold 0 and 0.01 to 0.90 on fold 1. That is what separates this from
-the logistic baseline, which peaks narrowly at 0.60 and *loses* 0.0086 on
+the logistic baseline, which peaks narrowly at 0.60 and *loses* 0.0133 on
 fold 1. A gain that survives a 14× range of its own threshold is not a fitted
 one.
 
 Read with three caveats. One seed, and the package README records a noise floor
 of 0.10 AP on fold 0 and 0.15 on fold 1 across seeds of an identical config;
-training loss also reaches exactly 0, so the model memorises its positives. The
-sweep numbers come from an in-process harness that reads fold 0's production
-baseline as 0.9010 where the CLI reads 0.9016. And no end-to-end CLI run has
-written a `scores_pp.json` for this variant yet, so 0.8699 remains the best
-*chain* until one does.
+training loss also reaches exactly 0, so the model memorises its positives.
+`+0.0030` from a single embryo, with the other flat, is not yet a result to
+build on — repeat it across seeds before trusting it. And no end-to-end CLI run
+has written a `scores_pp.json` for this variant, so the best *chain* on record
+is still the one at the top of this file.
+
+**Always measure a division change against a baseline that is otherwise
+identical**, and on the whole fold. The fold-1 error above came from a baseline
+that differed in more than the thing being tested; an earlier pass at this
+measured only the 21 stacks that contain divisions and read +0.0013 where the
+full fold said −0.0061, because the other 50 stacks contribute division false
+positives and no true ones.
 
 Recall is the remaining headroom: this keeps 8 of 26 and 44 of 125 divisions,
 where the ILP proposed 18 and 64 — the classifier discards true forks along
@@ -395,7 +414,7 @@ Recorded so nobody spends the compute twice.
 | Reverse-time division detection (as generator) | fold 0: best arm +0.0008 with 6,804 forks for 2 true positives. Thousands of track starts against 26 divisions — the base rate defeats it |
 | Reverse-time division test (as filter) | +0.0003, drops 1 false fork of 11. Directionally right, inside the noise |
 | ILP forks as divisions, **ungated** (`ilp_div_forks`) | fold 0 −0.0061: 10 of 26 divisions found against the chain's 4, at 106 false against 6. Precision 4–12% vs 40%. Kept, off by default, as the candidate generator for [5b] |
-| Gating those forks on geometry alone (logistic, AUC 0.94/0.86) | fold 0 +0.0014 at a narrow peak, fold 1 −0.0086. The features the fork was *proposed* with cannot rank it; see [5b] |
+| Gating those forks on geometry alone (logistic, AUC 0.94/0.86) | fold 0 +0.0014 at a narrow peak, fold 1 −0.0133. The features the fork was *proposed* with cannot rank it; see [5b] |
 
 ---
 
