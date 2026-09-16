@@ -329,6 +329,22 @@ that trade. A first version of this table compared against the *non-ILP*
 baseline and reported 6bba at +0.0042; that was the ILP's contribution, not the
 classifier's.
 
+**What the `adj` cost actually is.** Since `adj = J · (1 − 0.1·r)` and the
+stored `J`/`adj` pair gives `r` (0.135 on 44b6, 0.021 on 6bba), the two
+mechanisms can be bounded without measuring anything further. Node count is
+*not* it: the forks add ~60–90 nodes a stack by rescuing fragments from
+`prune_short`, worth about −0.0002, where explaining −0.0026 that way would
+take ~1 000. It is scored **edge false positives** — holding `tp`/`fn` fixed,
+the drops need fp +61 on 44b6 and +1 012 on 6bba.
+
+That also explains why 6bba is hit 2.7× harder. Only forks landing on an
+annotated lineage are visible to the edge metric at all — 2–3% of the ~2 300
+that survive gating on 44b6 — and 6bba's annotation is far denser (125
+divisions against 26), so a much larger share of its surviving forks sit where
+they can be charged. **The lever is fork precision on annotated lineages**, not
+node bookkeeping; re-pruning after gating recovers ~0.0002 of 0.0026 and is not
+worth building.
+
 **The threshold is not a tuned parameter.** The CNN saturates — positives
 median 1.000, negatives 0.000 — and the result is bit-identical from tau 0.05
 to 0.70 on fold 0 and 0.01 to 0.90 on fold 1. That is what separates this from
