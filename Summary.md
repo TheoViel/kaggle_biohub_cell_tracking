@@ -43,6 +43,11 @@ The sample-weighted pooling was removed on purpose: the embryos differ 71 vs
         |                                              every candidate link, scored
   [5] edge postprocess    main_edge_postprocess.py -> preds_<th>_pp*/ + geff_<th>_pp*/
         |                                              assign -> recover -> divisions -> prune -> linefit
+        |
+        |  [5b] division classifier   main_division.py      -> logs/division/<date>/<id>/
+        |       (optional)            score_forks.py        -> one probability per proposed fork
+        |                             keeps the divisions it believes; reads the image
+        |
   [6] submission          submission.py            -> submission.csv
 ```
 
@@ -256,6 +261,83 @@ plus its own post-processing is worth about **+0.032**.
 
 ---
 
+## [5b] Division classifier — `main_division.py`
+
+Optional, and the only stage besides the detector that reads the image. It does
+not link anything; it decides which *proposed* divisions to keep.
+
+### Why it exists
+
+`division_jaccard` is 0.1 of the score and the chain converts about one
+annotated division in seven. Every downstream attempt to fix that by
+re-weighting geometry and link probability failed (see
+`postprocessing/README_edge.md`), because those are the features the proposal
+was made with. This reads the pixels, where the mitotic figure actually is.
+
+### Two datasets, and the second is the one that pays
+
+| `--candidates` | the question | positives |
+|---|---|---|
+| unset (default) | does this **annotated cell** divide at this frame? | 151 GT divisions, negatives mined from the dividing cells' own lineages |
+| set | is this **fork the chain proposed** real? | 59, negatives are the chain's own false forks |
+
+The second is better posed for post-processing. The ILP finds far more
+divisions than `propose_divisions` — on fold 0, 18 of 26 against 4 — and cannot
+price them, emitting 442 false forks against 6. Recall was never the
+constraint, so train on the proposals and let the negatives be the false ones:
+hard by construction, and exactly the distribution met at inference.
+
+```bash
+# 1. every fork the chain proposes, labelled against the annotation
+python division_cls/gen_fork_candidates.py --preds_dir <preds> --out forks.npz
+# 2. leave-one-embryo-out
+python main_division.py --candidates forks.npz --iterations 2000
+# 3. score all of them with the out-of-fold model, then sweep the threshold
+python division_cls/score_forks.py --candidates forks.npz --run_dir <run> --out scores.npz
+python division_cls/tune_fork_threshold.py --preds_dir <preds> --scores scores.npz --embryo 44b6
+```
+
+### Measured
+
+Leave-one-embryo-out on 107,613 forks from `edge_run/2026-09-13/0`, of which
+59 are labelled positive and 2,632 negative:
+
+| | features only (logistic) | CNN (`convnext_tiny`) |
+|---|---|---|
+| fold 0 — val 44b6, 13 pos / 527 | AUC 0.940, AP 0.238 | **AUC 0.967, AP 0.627** |
+| fold 1 — val 6bba, 46 pos / 2,164 | AUC 0.862, AP 0.233 | **AUC 0.916, AP 0.426** |
+
+Chance AP is 0.025 / 0.021, so the CNN runs 25× and 20× chance, and **both
+folds learn** — including fold 1, trained on 13 positives.
+
+Dropping the forks it disbelieves, against the production chain:
+
+| | production | + gated forks | div_jaccard |
+|---|---|---|---|
+| 44b6 | 0.9016 | **0.9075** | 0.1250 → 0.2162 |
+| 6bba | 0.8382 | **0.8424** | 0.1667 → 0.2316 |
+
+**The threshold is not a tuned parameter.** The CNN saturates — positives
+median 1.000, negatives 0.000 — and the result is bit-identical from tau 0.05
+to 0.70 on fold 0 and 0.01 to 0.90 on fold 1. That is what separates this from
+the logistic baseline, which peaks narrowly at 0.60 and *loses* 0.0086 on
+fold 1. A gain that survives a 14× range of its own threshold is not a fitted
+one.
+
+Read with three caveats. One seed, and the package README records a noise floor
+of 0.10 AP on fold 0 and 0.15 on fold 1 across seeds of an identical config;
+training loss also reaches exactly 0, so the model memorises its positives. The
+sweep numbers come from an in-process harness that reads fold 0's production
+baseline as 0.9010 where the CLI reads 0.9016. And no end-to-end CLI run has
+written a `scores_pp.json` for this variant yet, so 0.8699 remains the best
+*chain* until one does.
+
+Recall is the remaining headroom: this keeps 8 of 26 and 44 of 125 divisions,
+where the ILP proposed 18 and 64 — the classifier discards true forks along
+with false ones.
+
+---
+
 ## Inference / submission
 
 `notebooks/biohub-inf.ipynb` runs the whole chain on Kaggle: detector →
@@ -312,6 +394,8 @@ Recorded so nobody spends the compute twice.
 | Terminal-extrapolation FN recovery | +0.0101 on FN-dense stacks, −0.0009 on a difficulty spread. Precision per insertion is the binding constraint, not locating the misses |
 | Reverse-time division detection (as generator) | fold 0: best arm +0.0008 with 6,804 forks for 2 true positives. Thousands of track starts against 26 divisions — the base rate defeats it |
 | Reverse-time division test (as filter) | +0.0003, drops 1 false fork of 11. Directionally right, inside the noise |
+| ILP forks as divisions, **ungated** (`ilp_div_forks`) | fold 0 −0.0061: 10 of 26 divisions found against the chain's 4, at 106 false against 6. Precision 4–12% vs 40%. Kept, off by default, as the candidate generator for [5b] |
+| Gating those forks on geometry alone (logistic, AUC 0.94/0.86) | fold 0 +0.0014 at a narrow peak, fold 1 −0.0086. The features the fork was *proposed* with cannot rank it; see [5b] |
 
 ---
 
@@ -329,6 +413,13 @@ Recorded so nobody spends the compute twice.
 | `src/model_zoo/temporal_unet.py` | the detector backbone |
 | `src/model_zoo/models_track.py` | heads + `UNET_BACKBONES` registry |
 | `src/model_zoo/simple_node_transformer.py` | edge scorer, `estimate_drift` |
+| `src/main_division.py` | division classifier training, `--candidates` for the fork dataset |
+| `src/division_cls/gen_fork_candidates.py` | every proposed fork, labelled against the annotation |
+| `src/division_cls/score_forks.py` | one out-of-fold probability per fork |
+| `src/division_cls/tune_fork_threshold.py` | drop low-scoring forks, re-score the graph |
+| `src/division_cls/fork_baseline.py` | features-only baseline, the number the CNN must beat |
+| `src/division_cls/README.md` | the classifier, its noise floor, and the 71-job sweep |
+| `src/postprocessing/fork_filter.py` | the ILP's forks as division proposals; off by default |
 | `src/postprocessing/edge_pp.py` | `assign`, `recover_nodes`, `propose_divisions`, … |
 | `src/postprocessing/tune_edge_pp.py` | coordinate descent over the PP knobs |
 | `src/postprocessing/README_edge.md` | why each edge-PP stage exists |
