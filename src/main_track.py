@@ -107,26 +107,50 @@ DEFAULTS = {
     "window_size": 2,
     "crop_size": None,  # (16, 64, 64),  # None,  # (16, 64, 64),     # Crop
     "selected_folds": [0, 1],
-    "fullfit": True,
+    "fullfit": False,
     "fullfit_n_val_videos": 1,     # leaky either way, so keep the eval cheap
 
     # Model
-    "unet_arch": "temporal",          # "temporal" (two-conv) or "resenc" (nnU-Net ResEnc)
+    # "temporal" (two-conv), "resenc" (nnU-Net ResEnc), or a temporal_v* model.
+    "unet_arch": "temporal_v4",
     "unet_out_channels": 32,
-    "unet_layers": (64, 128, 256),
+    "unet_layers": (32, 64, 128),  # (64, 128, 256),
     "unet_pool_stride": (1, 2, 2),    # pool Y/X only; full-scale Z preserved
     "unet_n_anisotropic": 2,          # downsampling steps using unet_pool_stride
     # Decoder
     "unet_n_decode_steps": 1,         # 1 decoder stage → node features at 1/4 Y/X, full-scale Z
     "unet_n_extra_decode_steps": 1,  # Extra decoder stage for the detection head
     "unet_temporal_attention": True,  # False = encode each frame independently
+    # "temporal_v2" only, and mutually exclusive with unet_temporal_attention.
+    # Where the frames meet: "head" is the features the detection head reads,
+    # which is where a suppressed voxel is actually suppressed in the output;
+    # "bottleneck" is far cheaper but its verdict is blurred by the upsampling
+    # before the head sees it. "auto" dilation sizes the correlation window per
+    # site from the measured p99 frame-to-frame displacement.
+    "unet_temporal_fusion_at": ("head",),
+    "unet_temporal_match_channels": 32,
+    "unet_temporal_taps": (5, 3, 3),
+    "unet_temporal_dilation": "auto",
+    "unet_temporal_agree": "mean",    # "min" = corroborated by *every* frame
+    "unet_temporal_max_neighbours": None,
+    # "temporal_v3" only: the FN-recovery block. The prior costs one logit per
+    # median-length step; the smoothing spreads the displacement field out of the
+    # cells that matched and into the voxels that did not (0 = ablation).
+    "unet_temporal_motion_prior": 1.0,
+    "unet_temporal_flow_smooth_iters": 3,
+    # "temporal_v4": motion is estimated on the bottleneck and low-rank
+    # neighbour features are warped onto the coarse and fine output grids.
+    "unet_temporal_flow_channels": 8,
+    "unet_temporal_flow_hidden_channels": 32,
+    "unet_temporal_value_channels": 8,
     # Attention
     "unet_spatial_attention": "none",   # "none" / "pooled" / "window" / "cbam"
     "unet_spatial_attention_stages": 1,   # deepest N encoder stages, 0 = off
     "unet_spatial_attention_heads": 4,
     "unet_spatial_attention_reduction": 4,      # "pooled": K/V conv stride
     "unet_spatial_attention_window": (4, 8, 8),  # "window": the attended window
-    "unet_blocks_per_stage": (3, 3, 3),    # (1, 3, 4) residual depth per stage;  None = two-conv blocks
+    # Encoder
+    "unet_blocks_per_stage": (2, 2, 3),    # (1, 3, 4) residual depth per stage;  None = two-conv blocks
     "unet_stem": "unshuffle",         # "unshuffle" keeps every voxel, "stride" drops 3 in 4
     "unet_norm": "batch",             # "batch" / "instance" / "group"
     "unet_hires_fusion": True,       # feed the skips finer than the head's grid into the head
@@ -178,7 +202,7 @@ DEFAULTS = {
 
     # Stage 1 - Synthetic data pretraining
     "synthetic_pretraining": {
-        "enabled": False,
+        "enabled": True,
         "synthetic_dir": "../input/synthetic/v5/",
         "synthetic_proportion": 1,
         "weights": None,
@@ -235,13 +259,14 @@ DEFAULTS = {
     # Stage 1.5 - Pretraining
     "pretraining": {
         "enabled": True,
-        "weights": "../logs/2026-09-13/1/fold_0/ckpt_synthetic.pt",  # "../logs/2026-09-09/4/fold_0/ckpt_synthetic.pt",
+        # "weights": "../logs/2026-09-13/1/fold_0/ckpt_synthetic.pt",  # "../logs/2026-09-09/4/fold_0/ckpt_synthetic.pt",
         # "weights": "../logs/2026-09-10/0/fold_0/ckpt_synthetic.pt",
+        "weights": None,  # "../logs/2026-09-11/3/fold_*/ckpt_pretrain.pt",
         # Data
         "crop_size": (32, 128, 128),
         "aug_strength": 3,
         "synthetic_dir": "../input/synthetic/v4/",
-        "synthetic_proportion": 0., # 0.5
+        "synthetic_proportion": 0.5,
         # Training
         "iterations": 5000,
         "epochs": None,

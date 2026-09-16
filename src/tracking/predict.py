@@ -32,6 +32,15 @@ class PredictConfig:
     # checkpoint's model_config carries it so main_predict can restore it.
     normalization = None
 
+    # Average a frame's heatmap over every window that contains it, instead of
+    # keeping whichever window reached it first. With window_size=2 and the
+    # stride-1 sweep, frame t appears in (t-1, t) and (t, t+1); first-wins gave
+    # it the left neighbour only, so half the temporal evidence -- everything a
+    # cell's *future* says about it -- never reached the detector. Both forwards
+    # already happen, so this costs no extra compute, only the memory to hold a
+    # frame's logits for one more window. See `predict_video_thresholds`.
+    merge_windows = True
+
     # --- Nodes ---
     nms = "greedy"           # "greedy" (exact radius) or "maxpool" (grid-quantised)
     nms_radius_um = 7.0      # greedy only
@@ -183,6 +192,27 @@ def _load_frame(zarr_arr, t: int) -> torch.Tensor:
     """Load one full-resolution frame from zarr (no normalisation)."""
     raw = zarr_arr[t].astype(np.float32)
     return torch.from_numpy(raw)
+
+
+def _split_prepared_frames(prepared, keys: Sequence[int]) -> dict[int, tuple]:
+    """Split a flat prepared-frame batch without retaining its full allocation."""
+    return {
+        key: tuple(
+            None if tensor is None else tensor[i].clone()
+            for tensor in prepared
+        )
+        for i, key in enumerate(keys)
+    }
+
+
+def _collate_prepared_window(cache: dict[int, tuple], keys: Sequence[int]) -> tuple:
+    """Stack cached per-frame tensors into the ``(B=1,T,...)`` v4 contract."""
+    return tuple(
+        None
+        if cache[keys[0]][j] is None
+        else torch.stack([cache[key][j] for key in keys], dim=0).unsqueeze(0)
+        for j in range(len(cache[keys[0]]))
+    )
 
 
 class _NodeRegistry:
@@ -483,6 +513,75 @@ def _rescale_coords(
 
 
 @torch.no_grad()
+def _detect_frame(
+    t: int,
+    det_logits_t: torch.Tensor,
+    annot_logits_t: torch.Tensor | None,
+    offsets_t: torch.Tensor | None,
+    registries: dict,
+    heads: Sequence[str],
+    radii: Sequence[float],
+    thresholds: Sequence[float],
+    cfg,
+    pool_k,
+    voxel_size_det,
+    det_scaling,
+) -> None:
+    """NMS one frame's (already merged) heatmaps into every registry.
+
+    Split out of the window loop because a frame is no longer detected while
+    the window that produced it is on the stack: with ``merge_windows`` its
+    heatmap is the average over both windows that contain it, so detection
+    happens once, later, when no window can still contribute. One NMS pass
+    answers every threshold at once.
+
+    Coordinates come out in detection-grid space (same grid as det_logits /
+    unet_out), matching tracking/targets.py.
+    """
+    source = {"det": [det_logits_t], "annot": [annot_logits_t]}
+    cache: dict[str, torch.Tensor] = {}
+    for h in heads:
+        for r in radii:
+            pending = [
+                th for th in thresholds
+                if t not in registries[(h, r, th)].seen_frames
+            ]
+            if not pending:
+                continue
+            if h not in cache:  # one sigmoid per head, for every radius
+                cache[h] = source[h][0][0].sigmoid()
+            per_threshold = detect_cells_multi_threshold(
+                cache[h],
+                t,
+                pending,
+                nms=cfg.nms,
+                pool_kernel=pool_k,
+                voxel_size=voxel_size_det,
+                nms_radius_um=r,
+                return_scores=True,
+            )
+            for th, (arr, node_scores) in per_threshold.items():
+                # Read on the heatmap's grid, before the coords are divided
+                # back onto the node grid. Both columns are filled whichever
+                # head found the peak, so the two runs are directly comparable
+                # -- `node_probs` is always the detector's opinion and
+                # `annot_probs` always the annotation head's, at the same voxel.
+                node_det = _gather_scalar([det_logits_t], 0, arr)
+                node_annot = _gather_scalar(
+                    None if annot_logits_t is None else [annot_logits_t], 0, arr
+                )
+                arr = arr.astype(np.float32)
+                arr[:, 1:] /= det_scaling
+                registries[(h, r, th)].add_frame(
+                    t, arr,
+                    _gather_offsets(
+                        None if offsets_t is None else [offsets_t], 0, arr
+                    ),
+                    node_det, node_annot,
+                )
+
+
+@torch.no_grad()
 def predict_video_thresholds(
     model: UNetNodeTransformer,
     ds_path: str | Path,
@@ -496,6 +595,7 @@ def predict_video_thresholds(
     return_det_logits: bool = True,
     nms_radii: Sequence[float] | None = None,
     heads: Sequence[str] = ("det",),
+    det_logits_fn=None,
 ) -> tuple[dict[tuple[str, float, float], tuple[np.ndarray, list]], torch.Tensor | None]:
     """Run inference on a single video over a grid of NMS radii x thresholds.
 
@@ -519,6 +619,14 @@ def predict_video_thresholds(
     ``cfg.det_threshold`` and ``cfg.nms_radius_um`` are ignored;  ``thresholds``
     and ``nms_radii`` replace them. ``nms_radii`` defaults to
     ``[cfg.nms_radius_um]``.
+
+    ``det_logits_fn`` rewrites the detection logits between the forward and
+    everything that reads them -- NMS, the node probabilities, and the logits
+    returned. It is called as ``fn(window_index, det_logits)`` with the list of
+    per-frame ``(1, 1, Z, Y, X)`` tensors the forward produced, and must return
+    a list of the same shape. This is the injection point for a second
+    detector's logits; the edge pass still reads *this* model's features, so a
+    blend changes which cells are found and not how they are linked.
 
     ``heads`` selects which heatmap the peaks are found in: ``"det"`` is the
     detection head, ``"annot"`` the annotation head on a model that has one.
@@ -614,8 +722,31 @@ def predict_video_thresholds(
         getattr(model, "offset_head", None) is not None
     )
 
+    # Merging a frame across its windows means its detections cannot be read
+    # until the last window holding it has been forwarded, and a pair's edges
+    # cannot be scored until both its frames are final. `last_window_of[t]` is
+    # what says when that moment has come; `pending_frames` accumulates the
+    # heatmaps until then and `pending_windows` retains the feature maps an
+    # already-forwarded window will still need for its edge pass.
+    merge = bool(getattr(cfg, "merge_windows", True))
+    last_window_of: dict[int, int] = {}
+    for ws in window_starts:
+        for t in range(ws, min(ws + W, T)):
+            last_window_of[t] = ws
+    pending_frames: dict[int, dict] = {}
+    pending_windows: list[tuple[list[int], list]] = []
+
     det_logits_list: list[torch.Tensor] = []
-    for ws in tqdm(window_starts, desc="windows", leave=False, disable=not progress):
+    # V4's complete spatial trunk is frame-independent. Cache its output so an
+    # interior frame is prepared once rather than once in each overlapping
+    # window. The temporal fusion and heads still run per window.
+    can_prepare = callable(getattr(model, "prepare_backbone_frames", None)) and callable(
+        getattr(getattr(model, "unet", None), "prepare_frames", None)
+    )
+    prepared_cache: dict[int, tuple] = {}
+
+    window_iter = tqdm(window_starts, desc="windows", leave=False, disable=not progress)
+    for window_i, ws in enumerate(window_iter):
         frame_indices = list(range(ws, ws + W))
 
         # --- UNet encode (single window, batch_size=1), full resolution ---
@@ -631,7 +762,27 @@ def predict_video_thresholds(
 
         imgs = imgs.unsqueeze(0).to(device)  # (1, W, Z, Y, X)
 
-        unet_out, det_logits, _, annot_logits = model.encode(imgs)
+        if can_prepare:
+            missing_positions = [
+                i for i, t in enumerate(frame_indices)
+                if t < T and t not in prepared_cache
+            ]
+            if missing_positions:
+                missing_keys = [frame_indices[i] for i in missing_positions]
+                fresh = model.prepare_backbone_frames(
+                    imgs[0, missing_positions]
+                )
+                prepared_cache.update(
+                    _split_prepared_frames(fresh, missing_keys)
+                )
+            prepared = _collate_prepared_window(prepared_cache, frame_indices)
+            unet_out, det_logits, _, annot_logits = model.encode_prepared_window(
+                prepared
+            )
+        else:
+            unet_out, det_logits, _, annot_logits = model.encode(imgs)
+        if det_logits_fn is not None:
+            det_logits = det_logits_fn(window_i, det_logits)
         offset_maps = model.encode_offsets(unet_out) if use_offset else None
         if return_det_logits:
             det_logits_list.append(torch.stack(det_logits, 0).detach().cpu())
@@ -702,61 +853,93 @@ def predict_video_thresholds(
         # imgs is needed until the edge pass below when a contrastive branch
         # exists, so it is freed at the end of the window instead of here.
 
-        # --- Detect cells in each frame (dedup across windows) ---
-        # Coordinates come out in detection-grid space (same grid as
-        # det_logits / unet_out), matching tracking/targets.py. One NMS pass
-        # answers every threshold at once.
+        # --- Accumulate this window's vote on each of its frames ---
+        # Logit space, like the TTA average above and for the same reason: the
+        # heads are trained on logits and the sigmoid is monotone but not
+        # affine, so averaging after it drags a confident window toward the
+        # undecided one.
         for f_idx, t in enumerate(frame_indices):
-            # Both heads sit on the same grid and come from the same forward;
-            # only which map the peaks are found in differs.
-            source = {"det": det_logits, "annot": annot_logits}
-            cache: dict[str, torch.Tensor] = {}
-            for h in heads:
-                for r in radii:
-                    pending = [
-                        th for th in thresholds
-                        if t not in registries[(h, r, th)].seen_frames
-                    ]
-                    if not pending:
-                        continue
-                    if h not in cache:  # one sigmoid per head, for every radius
-                        cache[h] = source[h][f_idx][0].sigmoid()
-                    per_threshold = detect_cells_multi_threshold(
-                        cache[h],
-                        t,
-                        pending,
-                        nms=cfg.nms,
-                        pool_kernel=pool_k,
-                        voxel_size=voxel_size_det,
-                        nms_radius_um=r,
-                        return_scores=True,
-                    )
-                    for th, (arr, node_scores) in per_threshold.items():
-                        # Read on the heatmap's grid, before the coords are
-                        # divided back onto the node grid. Both columns are
-                        # filled whichever head found the peak, so the two runs
-                        # are directly comparable -- `node_probs` is always the
-                        # detector's opinion and `annot_probs` always the
-                        # annotation head's, at the same voxel.
-                        node_det = _gather_scalar(det_logits, f_idx, arr)
-                        node_annot = _gather_scalar(annot_logits, f_idx, arr)
-                        arr = arr.astype(np.float32)
-                        arr[:, 1:] /= det_scaling
-                        registries[(h, r, th)].add_frame(
-                            t, arr, _gather_offsets(offset_maps, f_idx, arr),
-                            node_det, node_annot,
-                        )
+            if t >= T:
+                continue
+            slot = pending_frames.get(t)
+            det_f = det_logits[f_idx].detach()
+            annot_f = None if annot_logits is None else annot_logits[f_idx].detach()
+            off_f = None if offset_maps is None else offset_maps[f_idx]
+            if slot is None:
+                pending_frames[t] = {
+                    "det": det_f.clone(), "n": 1,
+                    "annot": None if annot_f is None else annot_f.clone(),
+                    # The offset vote and the node features are *not* averaged:
+                    # they are read at integer coordinates and are a direction
+                    # in grid space, the same reason TTA leaves them alone. The
+                    # first window's are kept, arbitrarily but consistently.
+                    "offsets": off_f,
+                }
+            elif merge:
+                slot["det"] += det_f
+                slot["n"] += 1
+                if slot["annot"] is not None and annot_f is not None:
+                    slot["annot"] += annot_f
+        pending_windows.append((frame_indices, node_feat_maps))
 
-        # --- Edge prediction for each consecutive pair in the window ---
-        # Repeated per (head, radius, threshold): each one has its own nodes,
-        # so its own pairs.
-        for reg in registries.values():
-            _predict_window_edges(
-                model, reg, frame_indices, node_feat_maps, out_shape, cfg, device,
-                voxel_size=voxel_size_out,
+        # --- Detect in every frame this window completes ---
+        # A frame is complete once the last window containing it has been
+        # forwarded; with merge off that is the first one, which reproduces the
+        # previous first-wins behaviour exactly.
+        done = sorted(
+            t for t in list(pending_frames)
+            if (last_window_of.get(t, ws) <= ws) or not merge
+        )
+        for t in done:
+            slot = pending_frames.pop(t)
+            det_logits_t = slot["det"] / slot["n"]
+            annot_logits_t = None if slot["annot"] is None else slot["annot"] / slot["n"]
+            offsets_t = slot["offsets"]
+            _detect_frame(
+                t, det_logits_t, annot_logits_t, offsets_t, registries,
+                heads, radii, thresholds, cfg, pool_k, voxel_size_det, det_scaling,
             )
 
+        # --- Edges, for every retained window whose frames are all final ---
+        still_pending = []
+        for w_frames, w_feats in pending_windows:
+            if any(t in pending_frames for t in w_frames if t < T):
+                still_pending.append((w_frames, w_feats))
+                continue
+            for reg in registries.values():
+                _predict_window_edges(
+                    model, reg, w_frames, w_feats, out_shape, cfg, device,
+                    voxel_size=voxel_size_out,
+                )
+        pending_windows = still_pending
+
+        if prepared_cache:
+            next_frames = (
+                set(range(window_starts[window_i + 1], window_starts[window_i + 1] + W))
+                if window_i + 1 < len(window_starts)
+                else set()
+            )
+            for t in list(prepared_cache):
+                if t not in next_frames:
+                    del prepared_cache[t]
+
         del unet_out
+
+    # The tail: the last frames have no further window to wait for.
+    for t in sorted(pending_frames):
+        slot = pending_frames.pop(t)
+        _detect_frame(
+            t, slot["det"] / slot["n"],
+            None if slot["annot"] is None else slot["annot"] / slot["n"],
+            slot["offsets"], registries,
+            heads, radii, thresholds, cfg, pool_k, voxel_size_det, det_scaling,
+        )
+    for w_frames, w_feats in pending_windows:
+        for reg in registries.values():
+            _predict_window_edges(
+                model, reg, w_frames, w_feats, out_shape, cfg, device,
+                voxel_size=voxel_size_out,
+            )
 
     results = {
         key: (

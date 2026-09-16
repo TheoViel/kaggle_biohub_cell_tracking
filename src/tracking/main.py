@@ -185,6 +185,28 @@ def build_model(args, ctx):
         unet_n_decode_steps=getattr(args, "unet_n_decode_steps", None),
         unet_n_extra_decode_steps=int(getattr(args, "unet_n_extra_decode_steps", 0) or 0),
         unet_temporal_attention=bool(getattr(args, "unet_temporal_attention", True)),
+        # "temporal_v2" only; ignored by the other backbones.
+        unet_temporal_fusion_at=tuple(
+            getattr(args, "unet_temporal_fusion_at", ("head",))
+        ),
+        unet_temporal_match_channels=int(getattr(args, "unet_temporal_match_channels", 32)),
+        unet_temporal_taps=tuple(getattr(args, "unet_temporal_taps", (5, 3, 3))),
+        unet_temporal_dilation=getattr(args, "unet_temporal_dilation", "auto"),
+        unet_temporal_agree=getattr(args, "unet_temporal_agree", "mean"),
+        unet_temporal_max_neighbours=getattr(args, "unet_temporal_max_neighbours", None),
+        unet_temporal_motion_prior=float(getattr(args, "unet_temporal_motion_prior", 1.0)),
+        unet_temporal_flow_smooth_iters=int(
+            getattr(args, "unet_temporal_flow_smooth_iters", 3)
+        ),
+        unet_temporal_flow_channels=int(
+            getattr(args, "unet_temporal_flow_channels", 8)
+        ),
+        unet_temporal_flow_hidden_channels=int(
+            getattr(args, "unet_temporal_flow_hidden_channels", 32)
+        ),
+        unet_temporal_value_channels=int(
+            getattr(args, "unet_temporal_value_channels", 8)
+        ),
         unet_spatial_attention=getattr(args, "unet_spatial_attention", "none"),
         unet_spatial_attention_stages=int(
             getattr(args, "unet_spatial_attention_stages", 1)

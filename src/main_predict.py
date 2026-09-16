@@ -95,6 +95,13 @@ def parse_args():
                    help="pseudo-labelling: predict on the fold's TRAIN embryos "
                         "instead of its val one, writing to <log_folder>/preds_pl")
 
+    p.add_argument("--no_window_merge", action="store_true",
+                   help="revert to first-window-wins: a frame is detected in "
+                        "the first window that contains it and the second is "
+                        "discarded. With window_size=2 that gives every frame "
+                        "its LEFT neighbour only; the default averages the "
+                        "(t-1,t) and (t,t+1) heatmaps, which costs no extra "
+                        "forward because both windows are computed either way")
     p.add_argument("--n_tta", type=int, choices=(1, 4, 8), default=PredictConfig.n_tta,
                    help="test-time augmentation views, averaged in logit space. "
                         "1 = off, 4 = Y/X flips, 8 = Z as well. Every view is an "
@@ -132,6 +139,7 @@ def _predict_config(args) -> PredictConfig:
     # Only meaningful on a model built with the head; a model without one
     # produces no vote and the flag is a no-op.
     cfg.use_offset = bool(getattr(args, "use_offset", True))
+    cfg.merge_windows = not bool(getattr(args, "no_window_merge", False))
     # predict_video_thresholds takes both sweeps as its own arguments and
     # ignores these, but a single-valued cfg should still read back what it ran
     # at.

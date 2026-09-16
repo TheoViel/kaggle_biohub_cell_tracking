@@ -63,25 +63,66 @@ DEFAULTS = {
     "negatives": "track",           # "track" | "stack" | "all"
     "neg_per_pos": 12.0,
     "exclude_window": 1,            # frames flanking a division, dropped
-    "positive_multiplier": 4,       # oversampling, training split only
+    # Oversampling, training split only. 8 lost to 4 on the first sweep (0.457
+    # against 0.577), but that was against the weaker augmentation above: a
+    # repeat is only worth having if it comes back as a different image, so the
+    # multiplier and the augmentation strength have to be tuned together, and
+    # the sweep re-runs both.
+    "positive_multiplier": 8,
     "pos_weight": 1.0,              # on top of oversampling; usually leave at 1
     "max_stacks": None,
 
+    # Train on the pipeline's own fork proposals instead of on annotated cells.
+    # An .npz from `division_cls/gen_fork_candidates.py`; when set, `negatives`,
+    # `neg_per_pos` and `exclude_window` are unused, because the negatives are
+    # the chain's false forks rather than mined ones. See `dataset.py`.
+    "candidates": None,
+
+    # Generated divisions. Fold 1 trains on 44b6's 26 and reaches AP 0.449 where
+    # fold 0, with 125, reaches 0.705 -- the gap is labels, and the generator
+    # has thousands. Build the cache once with `main_division_cache.py`; the
+    # proportion is the share of *training* samples drawn from it, validation
+    # is always the annotation alone.
+    "synthetic_cache": None,
+    "synthetic_proportion": 0.0,
+
+    # Frame-wide draws come from `embeddings/augment.py`, clip-level ones from
+    # `division_cls/augment.py`; both are set here in one flat dict and split by
+    # `resolve_div_aug`, which rejects a name neither owns. Stronger than the
+    # first pass because synthetic data is not going to supply more positives
+    # (three generators, all of them degraded training), so the 151 real ones
+    # have to be worth more each.
     "augmentations": {
+        # --- frame-wide (shared by the clip, so motion survives) ---
         "jitter_um": 1.5,
         "rot_p": 0.75,
         "rot_deg": 180.0,           # no canonical orientation for a division
-        "elastic_p": 0.5,
-        "elastic_um": 1.0,
+        "elastic_p": 0.6,
+        "elastic_um": 1.4,
         "elastic_sigma_um": 5.0,
-        "scale_p": 0.5,
-        "scale_range": (0.9, 1.1),
+        "scale_p": 0.6,
+        "scale_range": (0.85, 1.18),
         "intensity_p": 0.8,
-        "brightness": 0.2,
-        "contrast": 0.2,
-        "gamma": 0.2,
-        "noise_std": 0.0,
+        "brightness": 0.25,
+        "contrast": 0.25,
+        "gamma": 0.25,
+        "noise_std": 0.0,           # `shot_noise` below is the signal-dependent one
         "dropout_p": 0.0,
+        # --- clip-level ---
+        "flip_p": 0.5,
+        "rot90_p": 0.5,
+        "z_jitter": 1,
+        "frame_shift_um": 0.4,
+        "frame_brightness": 0.06,
+        "frame_contrast": 0.06,
+        "shot_noise": 0.04,
+        "blur_p": 0.25,
+        "blur_sigma": (0.4, 1.1),
+        "cutout_p": 0.25,
+        "cutout_frac": (0.1, 0.3),
+        # Off: these change or remove the label. See `division_cls/augment.py`.
+        "time_reverse_p": 0.0,
+        "drop_context_p": 0.0,
     },
 
     # Model

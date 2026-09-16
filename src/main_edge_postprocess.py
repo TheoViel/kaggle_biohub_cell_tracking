@@ -95,6 +95,30 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # new checkpoint -- that is what `tune_edge_pp.py` is for -- and do not read a
 # scores json written under one set of defaults against one written under
 # another.
+#
+# CURRENT: the configuration that scored **cv 0.8699** on
+# `logs/edge_run/2026-09-13/0/preds_0.45` -- the best chain to date, over the
+# `logs/2026-09-13/1/preds_r6_0.40` node set with the 2026-09-09_1 contrastive
+# embeddings. Recorded in `scores_preds_0.45_pp2.json`; macro adj_edge_jaccard
+# 0.8538 and division_jaccard 0.1615, and the first configuration whose
+# division term has been above 0.15.
+#
+# Five knobs moved from the 09-11 block above:
+#
+#   recover_max_residual   4.0  -> 5.0
+#   recover_min_dup        5.0  -> 3.0
+#   div_min_prob           0.30 -> 0.25
+#   div_max_parent_um      9.0  -> 11.0
+#   div_diverge_um         3.0  -> 4.0
+#
+# Note the direction of the last three: every one of them *loosens* a division
+# gate. That is the whole story of this retune -- the division term went 0.117
+# -> 0.1615 while adj_edge_jaccard barely moved (0.8520 -> 0.8538), so what
+# changed between checkpoints is how well the edge model's probabilities
+# separate a fork, not how it links. `recover_min_dup` going back down to 3.0
+# reverses the 09-11 move for the same reason it was made: this detector
+# over-detects less, so a node `recover` would skip as a duplicate is more
+# often a real miss.
 DEFAULTS = dict(
     threshold=0.4,
     recover=1,
@@ -105,7 +129,7 @@ DEFAULTS = dict(
     # beats gap 5 (+0.0037) but loses on 44b6 (-0.0051), so the stage earns its
     # place -- at a shorter reach.
     recover_max_gap=3,
-    recover_max_residual=4.0,
+    recover_max_residual=5.0,
     # 5.0 on the 09-11 checkpoint, having been 3.0 then 4.0 before it: the same
     # reasoning each time, run against however much this detector over-detects.
     # A node `recover` would skip as "too close to an existing one" is, on this
@@ -113,7 +137,7 @@ DEFAULTS = dict(
     # from further out. +0.0005 on its own and positive on both embryos, which
     # is small; 6.0 is -0.0010, so this is the top of the curve, not a plateau
     # that happens to include it.
-    recover_min_dup=5.0,
+    recover_min_dup=3.0,
     through=0.0,          # measured, finds nothing -- see the README
     through_max_gap=2,
     # 5, back down from 7 -- the first retune to reverse this knob's direction.
@@ -148,7 +172,98 @@ DEFAULTS = dict(
     # and sells division_jaccard (0.114 against 0.136): it drops spurious
     # detections and dividing nodes alike. Re-measure -- both sides -- before
     # trusting this on a checkpoint that over-detects again.
+    # RETUNED 2026-09-16 on `logs/edge_run/2026-09-15/0/preds_0.45` (199 stacks,
+    # both embryos). The filter is worth turning on again on this checkpoint,
+    # and two of its own knobs were wrong:
+    #
+    #   ilp_disappearance  1.5  -> 0.75
+    #   ilp_threshold      0.50 -> 0.40
+    #   div_max_sister_um  14.0 -> 12.0   } refitted to the ILP graph,
+    #   div_diverge_um      4.0 -> 4.5    } as the block below insists
+    #
+    #                         cv      adj      div   recall
+    #   ilp off           0.8622   0.8500   0.1223   0.9538
+    #   ilp on            0.8668   0.8548   0.1201   0.9525
+    #   + div refit       0.8676   0.8549   0.1271   0.9525
+    #
+    # +0.0054 cv, and it is real: paired per stack, 44b6 +0.0038 (t=3.2, 83% of
+    # stacks) and 6bba +0.0064 (t=9.2, 84%). The `+ div refit` row is the small,
+    # soft part -- tuned and scored on the same stacks -- and it is almost
+    # entirely the division term, which is what the filter costs and the refit
+    # buys back (against ilp-on: 44b6 div 0.0811 -> 0.0938, 6bba 0.1591 ->
+    # 0.1605). `recover_*` and `min_track` were swept too and did not move.
+    #
+    # `ilp_disappearance` is worth a paragraph, because the obvious reading of
+    # it is backwards. It is the cost of a track ending, so a tracker that
+    # believes cells do not vanish wants it *high*; raising it is a disaster.
+    # 3.0 is -0.0047 and 6.0 is -0.0293, and the node-recall column says why:
+    # 0.9525 -> 0.9276 -> 0.8825. Appearance and disappearance are paid by
+    # *selected* nodes and a node the solver declines pays nothing, so when
+    # ending a track gets expensive the cheap move is to delete the node, not to
+    # extend it. The stage keeps only nodes with degree > 0, so deleting is
+    # exactly what the score then sees. A per-node price would change that, so
+    # `ilp_node_weight` was added to find out. It does not help.
+    #
+    # `ilp_node_weight`, measured over the same 199 stacks, from the config above:
+    #
+    #     weight   0.0      0.5      1.0      2.0      4.0
+    #     cv       0.8676   0.8669   0.8668   0.8179   0.4670
+    #     recall   0.9525   0.9504   0.9461   0.8806   0.4851
+    #
+    # Zero wins. The point of a node price was that it is what would let the
+    # solver be handed *more* nodes without keeping all of them, so it was also
+    # tested against a looser `ilp_threshold`, which is the cheap way to admit
+    # more of them:
+    #
+    #     thr 0.4, w 0.0   0.8676      thr 0.3, w 0.0   0.8672
+    #     thr 0.3, w 0.5   0.8672      thr 0.3, w 1.0   0.8641
+    #     thr 0.2, w 0.5   0.8661      thr 0.2, w 1.0   0.8631
+    #
+    # At thr 0.3 a price of 0.5 scores exactly what no price does -- it trades a
+    # little node recall for a little division jaccard and nets to nothing. So
+    # the knob works and is not wanted. At w 0 the filter already keeps 97.3% of
+    # what it is given and that is about right; a selection cost can only remove
+    # nodes and there are few wrong ones left to remove. Whether it would earn
+    # its place on a *genuinely* larger node set -- a lower detection threshold,
+    # or pooled detectors -- is untested, and costs an embedding and edge
+    # inference pass to find out, not a post-processing sweep.
+    #
+    # Two things about the implementation are worth keeping regardless. The
+    # weight is graded by `1 - candidate confidence` rather than flat: a flat
+    # price is a cliff, not a dial, since a chain of n nodes earns about (n-1) x
+    # mean probability and pays n x w, so every track in the video crosses
+    # break-even at the same w -- on a 6-node chain of 0.95 links, unchanged to
+    # 0.5 and entirely gone by 0.75. And an empty solution used to return the
+    # graph *unfiltered* and silently, so a collapsed arm read back as the
+    # baseline rather than as broken; it now says so.
+    #
+    # `ilp_threshold` is not a threshold on the solution: it filters which
+    # candidates enter the graph at all, so a node whose every candidate is
+    # below it has no edges, cannot be selected, and is dropped. That makes it a
+    # node-survival knob. 0.6 is -0.0133; 0.4 is the peak; 0.3 and 0.2 are
+    # +0.0043 and +0.0034, slower, and add only edges the solver is rewarded for
+    # taking -- `edge_weight` is -1 x probability, so no edge is ever a cost.
+    #
+    # Left off here because it is still 9-16 s a stack. For a final run:
+    #   --ilp --ilp_disappearance 0.75 --ilp_threshold 0.4 \
+    #   --div_max_sister_um 12 --div_diverge_um 4.5
+    # `postprocessing/ilp_cache.py` freezes the solve so the rest of the chain
+    # can be swept over it at 1 s a stack.
     ilp=0,
+    # Keep the solver's lineage instead of re-linking with `assign`. See
+    # ilp_filter_nodes; measured worse at the old settings, untested at the new.
+    keep_ilp_edges=0,
+    # Take the ILP's forks -- and nothing else from its lineage -- as division
+    # proposals for `fork_filter`. Needs `ilp_division` < 1.0 to fire at all.
+    # Measured negative on full fold 0 -- see `fork_filter`. The solver's forks
+    # find 10 of 26 GT divisions against `propose_divisions`' 4, and bring 106
+    # false ones against its 6; `division_jaccard` falls 0.1250 -> 0.0758 and cv
+    # -0.0061. Kept off, and kept around only so the result stays attached to
+    # the code that produced it.
+    ilp_div_forks=0,
+    # Division weight for the fork-harvesting solve only. Must be < 1.0 or the
+    # solver never forks; 0.3 is where fork recall saturates.
+    ilp_fork_division=0.3,
     ilp_threshold=0.50,
     ilp_edge_weight=-1.0,
     ilp_appearance=0.0,
@@ -159,6 +274,21 @@ DEFAULTS = dict(
     # matters little here -- the ILP's edges are discarded and only its node set
     # is kept -- but it still moves which nodes end up linked.
     ilp_division=1.0,
+    # Keep the ILP's *edges* as well as its nodes. Off by default because the
+    # measurement in `ilp_filter_nodes` says its node set is worth more than its
+    # edge set -- but that was measured at one disappearance weight, and the
+    # weight is exactly what decides whether the solver is willing to end a
+    # track. Pair with `--no_assign`, or `assign` re-links and discards them.
+    ilp_keep_edges=0,
+    # A price on *selecting a node at all*, which the solver otherwise never
+    # pays: `edge_weight` is -1 x probability so every edge is a reward, and
+    # appearance and disappearance are charged only at a track's ends, so a
+    # node that splices into the middle of a chain is free. That is why the
+    # filter keeps almost everything it is given, and why feeding it more nodes
+    # would mostly mean keeping more of them. With a positive weight a node has
+    # to earn its place out of the edges it carries. Ultrack's node term; the
+    # knob `multi_hypothesis.py` drives from detector confidence.
+    ilp_node_weight=0.0,
     # Divisions. The score is `adj_edge_jaccard + 0.1 * division_jaccard` and
     # this chain scored a flat 0 on the second term -- `division_fp` was 0 too,
     # so it was not proposing them and getting them wrong, it was not proposing
@@ -174,8 +304,8 @@ DEFAULTS = dict(
     # 0.40 -> 0.30 is +0.0017 with the whole gain in `division_jaccard`
     # (0.083 -> 0.101). 0.25 matches it to 0.0001 and 0.20 gives half back, so
     # 0.25-0.30 is the floor; 0.45 is -0.0046 and falls off a cliff.
-    div_min_prob=0.30,
-    div_max_parent_um=9.0,
+    div_min_prob=0.25,
+    div_max_parent_um=11.0,
     div_max_existing_child_um=10.0,
     div_max_sister_um=14.0,
     # 0 -- off -- retuned on the 199 out-of-fold stacks of
@@ -195,7 +325,7 @@ DEFAULTS = dict(
     # and both beat 3.5 (+0.0022 and +0.0023 over it), while 4.5 is -0.0008.
     # 3.0 is preferred over 2.5 on the per-embryo split -- 2.5 takes another
     # 0.0003 on 44b6 and gives 0.0015 back on 6bba.
-    div_diverge_um=3.0,
+    div_diverge_um=4.0,
     div_require_divergence=1,
     div_require_mutual_nn=1,
     div_frame_frac_cap=0.0076,
@@ -275,6 +405,14 @@ def parse_args():
     p.add_argument("--ilp_disappearance", type=float,
                    default=DEFAULTS["ilp_disappearance"],
                    help="ILP cost of a track ending (default %(default)s)")
+    p.add_argument("--ilp_node_weight", type=float,
+                   default=DEFAULTS["ilp_node_weight"],
+                   help="ILP cost of selecting a node at all; 0 (default) means "
+                        "a mid-chain node is free, which is why the filter "
+                        "keeps nearly everything")
+    p.add_argument("--ilp_keep_edges", action="store_true",
+                   help="keep the ILP's links too, not only its node set; pair "
+                        "with --no_assign, which is what reads them")
     p.add_argument("--ilp_division", type=float, default=DEFAULTS["ilp_division"],
                    help="ILP cost of a fork; must be below a second child's "
                         "probability or none is ever taken (default %(default)s)")
@@ -432,7 +570,16 @@ def ilp_filter_nodes(coords, edges, cand, cfg):
     `motion_relink` discards the ILP edge set and re-solves from geometry,
     inheriting only `nodes_by_id`.
 
-    Returns `(coords, edges, cand)` renumbered onto the surviving nodes.
+    That comparison used `ilp_disappearance=1.5, ilp_threshold=0.50`, which is
+    not what the solver is run at any more -- 0.75 / 0.40 is worth +0.0031
+    across six runs. The disappearance cost is precisely what decides how
+    willing the solver is to leave a track open rather than commit a link, so
+    `keep_ilp_edges` re-exposes the discarded arm for re-measurement rather
+    than leaving a two-setting-old result standing.
+
+    Returns `(coords, edges, cand)` renumbered onto the surviving nodes. With
+    `keep_ilp_edges` the returned edges are the solver's own solution instead
+    of the input's; pair it with `assign=0` or `assign` will overwrite them.
     """
     import contextlib
     import io
@@ -454,31 +601,84 @@ def ilp_filter_nodes(coords, edges, cand, cfg):
     if graph.num_edges() == 0:
         return coords, edges, cand
 
-    solver = td.solvers.ILPSolver(
-        edge_weight=cfg["ilp_edge_weight"] * td.EdgeAttr("edge_prob"),
-        appearance_weight=cfg["ilp_appearance"],
-        disappearance_weight=cfg["ilp_disappearance"],
-        division_weight=cfg["ilp_division"],
-    )
-    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-        solved = solver.solve(graph)
+    node_weight = 0.0
+    if cfg.get("ilp_node_weight"):
+        # Graded, not flat. A constant price per node is a cliff, not a dial:
+        # a chain of n nodes earns about (n-1) * mean probability and pays n * w,
+        # so every track in the video crosses break-even at the same w -- below
+        # it nothing changes, above it the solution is empty. Measured on a
+        # 6-node chain of 0.95 links: unchanged to w = 0.5, everything gone by
+        # 0.75.
+        #
+        # Scaling by (1 - confidence) makes it a per-node judgement instead:
+        # a detection some candidate link is sure of pays nearly nothing, one
+        # nothing wants pays the full weight. Confidence is taken from the
+        # candidate graph rather than the detector, because that is what this
+        # function is given -- it is "does anything want to link to this", not
+        # "is this a cell", and the two agree less than they sound like they do.
+        import polars as pl
 
-    ea = solved.edge_attrs()
-    if "solution" in ea.columns:
-        ea = ea.filter(ea["solution"])
+        conf = np.zeros(len(coords))
+        np.maximum.at(conf, c[:, 0].astype(int), c[:, 2])
+        np.maximum.at(conf, c[:, 1].astype(int), c[:, 2])
+        graph.add_node_attr_key("node_w", pl.Float64, 0.0)
+        graph.update_node_attrs(
+            attrs={"node_w": (cfg["ilp_node_weight"] * (1.0 - conf)).tolist()})
+        node_weight = td.NodeAttr("node_w")
+
+    def _solve(division_weight):
+        solver = td.solvers.ILPSolver(
+            edge_weight=cfg["ilp_edge_weight"] * td.EdgeAttr("edge_prob"),
+            node_weight=node_weight,
+            appearance_weight=cfg["ilp_appearance"],
+            disappearance_weight=cfg["ilp_disappearance"],
+            division_weight=division_weight,
+        )
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            solved = solver.solve(graph)
+        out = solved.edge_attrs()
+        return out.filter(out["solution"]) if "solution" in out.columns else out
+
+    ea = _solve(cfg["ilp_division"])
     if not len(ea):
+        # The solver selected nothing -- every track priced itself out. Falling
+        # back to the unfiltered graph keeps the run alive, but it makes the
+        # stage a silent no-op, and a sweep then reads a collapsed arm as if it
+        # were the baseline. Say so.
+        print(f"[ilp] empty solution ({len(coords)} nodes): the node/appearance/"
+              "disappearance weights price out every track -- stage skipped",
+              flush=True)
         return coords, edges, cand
 
     # `build_graph` numbers nodes in coords order, so a solution node id is a
     # coords row. A node the solver linked to nothing is one it judged not to
     # belong to any track, which is exactly what this stage is here to drop.
     n = len(coords)
+    sol_src = ea["source_id"].to_numpy().astype(int)
+    sol_tgt = ea["target_id"].to_numpy().astype(int)
     deg = np.zeros(n, int)
-    np.add.at(deg, ea["source_id"].to_numpy().astype(int), 1)
-    np.add.at(deg, ea["target_id"].to_numpy().astype(int), 1)
+    np.add.at(deg, sol_src, 1)
+    np.add.at(deg, sol_tgt, 1)
     keep = np.flatnonzero(deg > 0)
     remap = -np.ones(n, int)
     remap[keep] = np.arange(len(keep))
+
+    if cfg.get("ilp_keep_edges"):
+        # The solver's own linking, rather than the committed edges it was
+        # handed. Only meaningful with `assign` off, which is what reads it.
+        prob = (ea["edge_prob"].to_numpy().astype(float)
+                if "edge_prob" in ea.columns else np.ones(len(sol_src)))
+        pos = np.asarray(coords, float)[:, 1:] * SCALE
+        dist = np.linalg.norm(pos[sol_tgt] - pos[sol_src], axis=1)
+        edges = np.stack([remap[sol_src].astype(float), remap[sol_tgt].astype(float),
+                          prob, dist], axis=1)
+        cand = cand.reshape(-1, 5)
+        if len(cand):
+            ok = (remap[cand[:, 0].astype(int)] >= 0) & (remap[cand[:, 1].astype(int)] >= 0)
+            cand = cand[ok].copy()
+            cand[:, 0] = remap[cand[:, 0].astype(int)]
+            cand[:, 1] = remap[cand[:, 1].astype(int)]
+        return coords[keep], edges, cand
 
     # Renumber the candidates with the coords, dropping any that touch a node
     # the ILP declined -- those are the links it ruled out, and `assign` should
@@ -489,6 +689,60 @@ def ilp_filter_nodes(coords, edges, cand, cfg):
         cand = cand[ok].copy()
         cand[:, 0] = remap[cand[:, 0].astype(int)]
         cand[:, 1] = remap[cand[:, 1].astype(int)]
+    if cfg.get("ilp_div_forks"):
+        # Harvest only the solver's *forks*, for `fork_filter.inject_forks` to
+        # graft onto the assign+recover backbone later in the chain. Measured on
+        # the 21 fold-0 stacks holding all 26 GT divisions, the ILP's lineage
+        # finds 11 of them against `propose_divisions`' 4 -- it decides the fork
+        # and the lineage together under flow conservation, where the proposer
+        # can only bolt a second child onto an assignment already fixed without
+        # it. Its edges are worse, so its edges are not what is taken.
+        #
+        # That extra recall does not survive contact with precision on the full
+        # fold -- `fork_filter`'s docstring has the table, and the reason the
+        # subset disagreed with it. This path stays off.
+        #
+        # Requires `ilp_division` below 1.0 to produce any fork at all: with
+        # `ilp_edge_weight=-1` a second child earns at most 1.0 against a cost
+        # of `ilp_division`, so at the default the solver provably never forks.
+        # A *second* solve, at a division weight low enough to make forks
+        # payable. The node set stays the one the first solve chose, because
+        # `ilp_division=0.3` is worth -0.0038 on the node filter and the forks
+        # are worth less than that -- the two questions want different weights,
+        # so they get different solves. The graph is already built; this is one
+        # extra `solver.solve` on it.
+        fea = (_solve(cfg["ilp_fork_division"])
+               if cfg["ilp_fork_division"] != cfg["ilp_division"] else ea)
+        kids: dict[int, list[tuple[float, int]]] = {}
+        pr = (fea["edge_prob"].to_numpy().astype(float)
+              if "edge_prob" in fea.columns else np.ones(len(fea)))
+        for s_, t_, p_ in zip(fea["source_id"].to_numpy().astype(int),
+                              fea["target_id"].to_numpy().astype(int), pr):
+            a, b = int(remap[s_]), int(remap[t_])
+            if a >= 0 and b >= 0:
+                kids.setdefault(a, []).append((float(p_), b))
+        forks = []
+        for a, ks in kids.items():
+            if len(ks) >= 2:
+                # Best child is the backbone's business; the rest are proposals.
+                forks += [(a, b) for _, b in sorted(ks, reverse=True)[1:]]
+        cfg["_ilp_forks"] = forks
+
+    if cfg.get("keep_ilp_edges"):
+        # The solver's own lineage, renumbered. Probabilities come back from
+        # the candidate array so downstream stages see the same scale they
+        # would have seen from `assign`.
+        prob = {(int(a), int(b)): float(p) for a, b, p, *_ in cand.reshape(-1, 5)}
+        sol = []
+        for s_, t_ in zip(ea["source_id"].to_numpy().astype(int),
+                          ea["target_id"].to_numpy().astype(int)):
+            a, b = int(remap[s_]), int(remap[t_])
+            if a >= 0 and b >= 0:
+                d = float(np.linalg.norm(
+                    (coords[keep][a, 1:] - coords[keep][b, 1:]) * np.asarray(SCALE)))
+                sol.append([a, b, prob.get((a, b), 0.5), d])
+        return coords[keep], np.asarray(sol, float).reshape(-1, 4), cand
+
     edges = np.asarray(edges, float).reshape(-1, 4)
     if len(edges):
         ok = (remap[edges[:, 0].astype(int)] >= 0) & (remap[edges[:, 1].astype(int)] >= 0)
@@ -529,6 +783,27 @@ def postprocess(coords, edges, cand, cfg):
         # one-node "tracks" pruning is about to delete.
         edges = edge_pp.link_through_isolated(
             coords, edges, max_gap=cfg["through_max_gap"], max_um=cfg["through"])
+    if cfg.get("ilp_div_forks") and cfg.get("_ilp_forks"):
+        # The ILP's forks, grafted onto the tuned backbone and then put through
+        # the same gate stack `propose_divisions` applies to its own proposals.
+        # The solver proposes with far better recall and no notion of what a
+        # division looks like; the gates supply the precision.
+        from postprocessing import fork_filter
+        edges = fork_filter.inject_forks(coords, edges, cfg["_ilp_forks"], cand)
+        edges, fstats = fork_filter.filter_forks(coords, edges, dict(
+            min_prob=cfg["div_min_prob"],
+            max_parent_um=cfg["div_max_parent_um"],
+            max_existing_child_um=cfg["div_max_existing_child_um"],
+            max_sister_um=cfg["div_max_sister_um"],
+            symmetry_tau=cfg["div_symmetry_tau"],
+            diverge_um=cfg["div_diverge_um"],
+            require_divergence=cfg["div_require_divergence"],
+            require_mutual_nn=cfg["div_require_mutual_nn"],
+            frame_frac_cap=cfg["div_frame_frac_cap"],
+            global_frac_cap=cfg["div_global_frac_cap"],
+        ), return_stats=True)
+        cfg["_fork_stats"] = fstats
+
     if cfg.get("divisions"):
         # Before pruning: attaching a free detection to a parent puts it in that
         # parent's component, so a second daughter that would have been pruned
@@ -662,6 +937,8 @@ def main():
         ilp_appearance=args.ilp_appearance,
         ilp_disappearance=args.ilp_disappearance,
         ilp_division=args.ilp_division,
+        ilp_keep_edges=1 if args.ilp_keep_edges else 0,
+        ilp_node_weight=args.ilp_node_weight,
         assign=0 if args.no_assign else 1,
         divisions=0 if args.no_divisions else 1,
         div_min_prob=args.div_min_prob,

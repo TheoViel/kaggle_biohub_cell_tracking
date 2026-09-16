@@ -135,6 +135,22 @@ PP_PUBLIC_ENV = {
     "relink_tight_um": "BIOHUB_MOTION_RELINK_TIGHT_UM",
     "relink_relaxed_um": "BIOHUB_MOTION_RELINK_RELAXED_UM",
     "relink_learned_bonus": "BIOHUB_MOTION_RELINK_LEARNED_BONUS",
+    # Wired in so the 946 post-process sweep is reachable. `PP_SWEEP_KEYS` in
+    # that notebook sweeps ten knobs; six of them are implemented in
+    # tracking/pp_public.py but had no entry here, so three of its seven named
+    # candidates -- gap45 (GAP_CLOSE_UM 4.5), gap2step40 (GAP2_MAX_STEP_UM 4.0)
+    # and reuse28 (GAP_CLOSE_REUSE_UM 2.8) -- were live code that could not be
+    # set. The values below restate pp_public's own defaults, so adding them
+    # changes nothing until one is passed.
+    "gap_close_um": "BIOHUB_GAP_CLOSE_UM",
+    "gap_close_reuse_um": "BIOHUB_GAP_CLOSE_REUSE_UM",
+    "gap_close_max_gap": "BIOHUB_GAP_CLOSE_MAX_GAP",
+    "gap2_max_step_um": "BIOHUB_GAP2_MAX_STEP_UM",
+    "gap2_max_total_um": "BIOHUB_GAP2_MAX_TOTAL_UM",
+    "gap2_require_context": "BIOHUB_GAP2_REQUIRE_CONTEXT",
+    "relink_velocity_weight": "BIOHUB_MOTION_RELINK_VELOCITY_WEIGHT",
+    "keep_division_components": "BIOHUB_OUTPUT_KEEP_DIVISION_COMPONENTS",
+    "enforce_next_frame": "BIOHUB_OUTPUT_ENFORCE_NEXT_FRAME",
 }
 
 
@@ -148,6 +164,10 @@ PP_PUBLIC_DEFAULTS = {
     "linefit": 1, "linefit_weight": 0.74, "edge_max_um": 14.2,
     "gap_refine": 0, "prune_isolated": 1,
     "relink_tight_um": 5.95, "relink_relaxed_um": 10.0, "relink_learned_bonus": 0.76,
+    "gap_close_um": 5.9, "gap_close_reuse_um": 3.1, "gap_close_max_gap": 1,
+    "gap2_max_step_um": 4.0, "gap2_max_total_um": 9.5, "gap2_require_context": 1,
+    "relink_velocity_weight": 0.50, "keep_division_components": 1,
+    "enforce_next_frame": 1,
 }
 
 

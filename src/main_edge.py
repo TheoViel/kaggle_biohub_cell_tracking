@@ -47,21 +47,11 @@ from utils.logger import create_logger, prepare_log_folder
 
 DEFAULTS = {
     # Global
-    # "nodes_folder": "../logs/2026-09-07/4/preds_r6_0.50/",  # best
-    # "nodes_folder": "../logs/2026-09-07/4/preds_r6_0.40/",
-    # "nodes_folder": "../logs/2026-09-09/4/preds_r6_0.40/",
-    # "nodes_folder": "../logs/2026-09-09/4/preds_r6_0.50/",
-    # "nodes_folder": "../logs/2026-09-10/0/preds_r6_0.40/",
-    # "nodes_folder": "../logs/2026-09-10/0/preds_r6_0.50/",
-    # "nodes_folder": "../logs/2026-09-10/0/preds_r7_0.40/",
-    # "nodes_folder": "../logs/2026-09-11/1/preds_r7_0.40/",  <- 0.8568
-    # "nodes_folder": "../logs/2026-09-11/1/preds_r7_0.50/",
-    # "nodes_folder": "../logs/2026-09-11/1/preds_r6_0.40/",  <- 0.8605
-    "nodes_folder": "../logs/2026-09-11/1/preds_r6_0.50/",
+    # "nodes_folder": "../logs/2026-09-13/1/preds_r6_0.40/",   # <- 0.8699
+    "nodes_folder": "../logs/2026-09-14/4/preds_r6_0.40/",   # TO RUN - bigger crops
 
-    # "embeddings_key": "embeddings_contrastive_2026-09-07_3",  # 0.8623 - vit_base_patch16_224
-    # "embeddings_key": "embeddings_contrastive_2026-09-08_0",  # 0.8623 - vit_small_patch8_224
     "embeddings_key": "embeddings_contrastive_2026-09-09_1",
+    # "embeddings_key": "embeddings_contrastive_2026-09-14_0",  # 3 frames, 2026-09-13/1/preds_r6_0.40
     
     "data_dir": TRAIN_DIR,
     "selected_folds": [0, 1] , # [0, 1],

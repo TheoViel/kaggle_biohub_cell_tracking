@@ -40,6 +40,14 @@ def parse_args():
     p.add_argument("--run_dir", required=True,
                    help="a division_cls run holding fold_<n>/ckpt_final.pt")
     p.add_argument("--out_dir", default=None, help="default <preds_dir>_divprob")
+    p.add_argument("--graph_dir", default=None,
+                   help="take coords/edges from this folder instead of --preds_dir. "
+                        "Point it at exp_divisions' --cache_dir: the candidate "
+                        "parents must come from the graph `propose_divisions` "
+                        "will actually see, which is the one after assign and "
+                        "recover, not the raw npz. Selecting them from the raw "
+                        "edges leaves ~89% of the real candidates unscored, and "
+                        "a gate that examines a tenth of its inputs is not a gate")
     p.add_argument("--data_dir", default=TRAIN_DIR)
     p.add_argument("--max_parent_um", type=float, default=9.0,
                    help="a parent with no unclaimed node this close is never a "
@@ -72,7 +80,11 @@ def main():
             continue
         model, cfg = models[embryo]
 
-        with np.load(path) as d:
+        graph_path = (Path(args.graph_dir) / path.name) if args.graph_dir else path
+        if not graph_path.exists():
+            print(f"[{i + 1:>3d}/{len(paths)}] {stem}  SKIPPED: no graph at {graph_path}")
+            continue
+        with np.load(graph_path) as d:
             coords = d["coords"].astype(np.float64)
             edges = d["edges"].astype(np.float64).reshape(-1, 4)
         rows = candidate_parents(coords, edges, max_parent_um=args.max_parent_um)

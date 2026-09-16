@@ -2,8 +2,8 @@
 """Copy a full pipeline (tracking, contrastive, edge) to dataset/ for Kaggle upload.
 
 Given an edge run id, read its args.json to find the linked tracking and
-contrastive runs, then copy each run's config and fold_*/ckpt_final.pt
-weights into dataset/ using the naming convention:
+contrastive runs, then copy each run's JSON files, logs.txt, and
+fold_*/ckpt_final.pt weights into dataset/ using the naming convention:
 
     tracking_<date>_<exp>/
     contrastive_<date>_<exp>/
@@ -90,7 +90,7 @@ def fold_dirs(run_dir: Path) -> list[Path]:
 
 
 def copy_run(src: Path, dst_name: str, dest_root: Path, dry_run: bool) -> Path:
-    """Copy args.json and all fold_*/ checkpoints from a training run."""
+    """Copy root JSON/log files and all fold_*/ checkpoints from a training run."""
     dst = dest_root / dst_name
     if not src.is_dir():
         raise FileNotFoundError(f"Source run not found: {src}")
@@ -102,7 +102,12 @@ def copy_run(src: Path, dst_name: str, dest_root: Path, dry_run: bool) -> Path:
         raise FileNotFoundError(f"No fold_* directories in {src}")
 
     print(f"  {src.relative_to(ROOT)} -> {dst.relative_to(ROOT)}")
+    metadata_files = sorted(src.glob("*.json"))
+    log_file = src / "logs.txt"
     if dry_run:
+        for path in metadata_files:
+            print(f"    {path.name}")
+        print(f"    logs.txt" if log_file.is_file() else "    missing logs.txt")
         for fold in folds:
             ckpt = fold / "ckpt_final.pt"
             status = "ckpt_final.pt" if ckpt.is_file() else "missing ckpt_final.pt"
@@ -110,7 +115,14 @@ def copy_run(src: Path, dst_name: str, dest_root: Path, dry_run: bool) -> Path:
         return dst
 
     dst.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src / "args.json", dst / "args.json")
+    for path in metadata_files:
+        shutil.copy2(path, dst / path.name)
+        print(f"    copied {path.name}")
+    if log_file.is_file():
+        shutil.copy2(log_file, dst / log_file.name)
+        print("    copied logs.txt")
+    else:
+        print("    ! no logs.txt, skipping")
 
     for fold in folds:
         ckpt = fold / "ckpt_final.pt"

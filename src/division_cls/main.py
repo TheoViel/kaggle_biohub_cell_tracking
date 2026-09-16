@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 from division_cls.dataset import DivisionDataset
 from division_cls.model import DivisionNet
+from division_cls.synthetic import MixedDivisionDataset, SyntheticClipDataset
 from division_cls.train import fit
 from params import EMBRYOS
 from training.distributed import worker_init_fn
@@ -44,7 +45,21 @@ def build_loader(args, embryos, augment: bool, ctx=None, shuffle=None):
         aug_cfg=getattr(args, "augmentations", None),
         max_stacks=_opt_int(getattr(args, "max_stacks", None)),
         seed=int(getattr(args, "seed", 0)),
+        candidates=getattr(args, "candidates", None) or None,
     )
+    # Synthetic crops, training split only. Validation must stay a clean read
+    # of the annotation -- mixing generated positives into it would measure
+    # agreement with the generator, not with the data.
+    if augment and getattr(args, "synthetic_cache", None) and \
+            float(getattr(args, "synthetic_proportion", 0.0) or 0.0) > 0:
+        synth = SyntheticClipDataset(
+            args.synthetic_cache, augment=True,
+            positive_multiplier=int(args.positive_multiplier),
+            seed=int(getattr(args, "seed", 0)))
+        dataset = MixedDivisionDataset(
+            dataset, synth, float(args.synthetic_proportion),
+            seed=int(getattr(args, "seed", 0)))
+
     if shuffle is None:
         shuffle = augment
 

@@ -9,12 +9,24 @@ import torch.nn.functional as F
 from model_zoo.simple_node_transformer import SimpleNodeTransformer
 from model_zoo.temporal_resenc_unet import TemporalResEncUNet3D
 from model_zoo.temporal_unet import TemporalUNet3D
+from model_zoo.temporal_unet_v2 import TemporalUNet3Dv2
+from model_zoo.temporal_unet_v3 import TemporalUNet3Dv3
+from model_zoo.temporal_unet_v4 import TemporalUNet3Dv4
 
 
 # Backbones the tracking model can be built on, by name. "temporal" is the plain two-conv
 # U-Net; "resenc" is the nnU-Net residual encoder at the same geometry, which is deeper at
-# equal widths. Both take the same geometry arguments and return (B, T, C, Z', Y', X').
-UNET_BACKBONES = {"temporal": TemporalUNet3D, "resenc": TemporalResEncUNet3D}
+# equal widths. "temporal_v2" keeps "temporal"'s geometry but moves the temporal interaction
+# out of the encoder and into the decoder, where it is a motion-compensated local
+# corroboration rather than a same-voxel attention -- see temporal_unet_v2. All take the
+# same geometry arguments and return (B, T, C, Z', Y', X').
+UNET_BACKBONES = {
+    "temporal": TemporalUNet3D,
+    "temporal_v2": TemporalUNet3Dv2,
+    "temporal_v3": TemporalUNet3Dv3,
+    "temporal_v4": TemporalUNet3Dv4,
+    "resenc": TemporalResEncUNet3D,
+}
 
 
 class UNetNodeTransformer(nn.Module):
@@ -230,6 +242,32 @@ class UNetNodeTransformer(nn.Module):
 
         window = imgs.unsqueeze(2)          # (B, W, 1, *spatial)
         out = self.unet(window)             # (B, W, C_feat, *spatial)
+        return self._apply_detection_heads(out)
+
+    def prepare_backbone_frames(self, imgs: torch.Tensor):
+        """Prepare frame-independent v4 features for an inference cache.
+
+        ``imgs`` is a flat ``(N, Z, Y, X)`` batch. Keeping this wrapper on the
+        full model lets inference avoid reaching through model internals.
+        """
+        prepare = getattr(self.unet, "prepare_frames", None)
+        if prepare is None:
+            raise RuntimeError("this backbone does not support prepared frames")
+        return prepare(imgs.unsqueeze(1))
+
+    def encode_prepared_window(self, prepared):
+        """Fuse cached v4 frame features and run the normal detection heads."""
+        fuse = getattr(self.unet, "fuse_window", None)
+        if fuse is None:
+            raise RuntimeError("this backbone does not support prepared windows")
+        return self._apply_detection_heads(fuse(prepared))
+
+    def _apply_detection_heads(
+        self,
+        out: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor] | None,
+               list[torch.Tensor] | None]:
+        """Apply coarse/fine detection heads to a backbone output."""
         unet_out, fine_out = out if self.deep_supervision else (out, None)
 
         if self.verbose >= 1:
@@ -369,6 +407,20 @@ def define_track_model(
     unet_n_anisotropic: int = 2,
     unet_blocks_per_stage: list[int] | None = None,
     unet_temporal_attention: bool = True,
+    # "temporal_v2" only -- see temporal_unet_v2.TemporalUNet3Dv2.
+    unet_temporal_fusion_at: tuple[str, ...] = ("head",),
+    unet_temporal_match_channels: int = 32,
+    unet_temporal_taps: tuple[int, int, int] = (5, 3, 3),
+    unet_temporal_dilation: tuple[int, int, int] | str = "auto",
+    unet_temporal_agree: str = "mean",
+    unet_temporal_max_neighbours: int | None = None,
+    # "temporal_v3" only.
+    unet_temporal_motion_prior: float = 1.0,
+    unet_temporal_flow_smooth_iters: int = 3,
+    # "temporal_v4" only.
+    unet_temporal_flow_channels: int = 8,
+    unet_temporal_flow_hidden_channels: int = 32,
+    unet_temporal_value_channels: int = 8,
     unet_spatial_attention: str = "none",
     unet_spatial_attention_stages: int = 1,
     unet_spatial_attention_heads: int = 4,
@@ -482,6 +534,33 @@ def define_track_model(
     extra["spatial_attention_reduction"] = unet_spatial_attention_reduction
     extra["spatial_attention_window"] = tuple(unet_spatial_attention_window)
 
+    # v2 has no encoder temporal attention at all -- that absence is the point,
+    # since it is what makes its per-frame features cacheable across overlapping
+    # windows -- and it raises rather than ignore the flag. So the two are
+    # mutually exclusive: pass the fusion configuration instead.
+    if unet_arch in ("temporal_v2", "temporal_v3", "temporal_v4"):
+        extra["temporal_fusion_at"] = tuple(unet_temporal_fusion_at)
+        extra["temporal_match_channels"] = int(unet_temporal_match_channels)
+        extra["temporal_taps"] = tuple(unet_temporal_taps)
+        extra["temporal_dilation"] = (
+            unet_temporal_dilation
+            if isinstance(unet_temporal_dilation, str)
+            else tuple(unet_temporal_dilation)
+        )
+        extra["temporal_agree"] = unet_temporal_agree
+        extra["temporal_max_neighbours"] = unet_temporal_max_neighbours
+        if unet_arch == "temporal_v3":
+            extra["temporal_motion_prior"] = float(unet_temporal_motion_prior)
+            extra["temporal_flow_smooth_iters"] = int(unet_temporal_flow_smooth_iters)
+        elif unet_arch == "temporal_v4":
+            extra["temporal_flow_channels"] = int(unet_temporal_flow_channels)
+            extra["temporal_flow_hidden_channels"] = int(
+                unet_temporal_flow_hidden_channels
+            )
+            extra["temporal_value_channels"] = int(unet_temporal_value_channels)
+    else:
+        extra["temporal_attention"] = unet_temporal_attention
+
     unet = backbone(
         in_channels=1,
         out_channels=unet_out_channels,
@@ -492,7 +571,6 @@ def define_track_model(
         n_anisotropic=unet_n_anisotropic,
         n_decode_steps=unet_n_decode_steps,
         n_extra_decode_steps=unet_n_extra_decode_steps,
-        temporal_attention=unet_temporal_attention,
         verbose=verbose,
         **extra,
     )
@@ -521,7 +599,6 @@ def define_track_model(
             pool_stride=unet_pool_stride,
             n_anisotropic=unet_n_anisotropic,
             n_decode_steps=unet_n_decode_steps,
-            temporal_attention=unet_temporal_attention,
             verbose=verbose,
             **extra,
         )

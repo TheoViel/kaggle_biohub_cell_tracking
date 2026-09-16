@@ -36,7 +36,8 @@ import torch
 import zarr
 from torch.utils.data import Dataset
 
-from embeddings.augment import apply_photometric, resolve_aug_cfg, sample_geometry
+from embeddings.augment import apply_photometric, sample_geometry
+from division_cls.augment import apply_clip_aug, resolve_div_aug, sample_clip_aug
 from embeddings.patches import extract_patches
 from params import SCALE
 from tracking_cellmot.io import list_datasets
@@ -127,18 +128,26 @@ class DivisionDataset(Dataset):
         aug_cfg: dict | None = None,
         max_stacks: int | None = None,
         seed: int = 0,
+        candidates: str | None = None,
+        candidates_labelled_only: bool = True,
     ):
         if n_frames % 2 == 0:
             raise ValueError(f"n_frames must be odd to centre on the division, got {n_frames}")
         if negatives not in ("track", "stack", "all"):
             raise ValueError(f"unknown negatives {negatives!r}")
+        if candidates:
+            # A different question, same crops: see `_load_candidates`.
+            self._init_candidates(candidates, data_dir, embryos, patch_yx, patch_z,
+                                  n_frames, positive_multiplier, augment, aug_cfg,
+                                  max_stacks, seed, candidates_labelled_only)
+            return
 
         self.data_dir = Path(data_dir)
         self.patch_yx = int(patch_yx)
         self.patch_z = int(patch_z)
         self.n_frames = int(n_frames)
         self.augment = bool(augment)
-        self.aug_cfg = resolve_aug_cfg(aug_cfg)
+        self.aug_cfg, self.div_aug = resolve_div_aug(aug_cfg)
         self.seed = int(seed)
         self._vol = {}
 
@@ -196,6 +205,61 @@ class DivisionDataset(Dataset):
             self.index = np.concatenate([self.index, extra])
         self.positive_multiplier = mult
 
+    def _init_candidates(self, path, data_dir, embryos, patch_yx, patch_z, n_frames,
+                         positive_multiplier, augment, aug_cfg, max_stacks, seed,
+                         labelled_only=True):
+        """Use the pipeline's own fork proposals as the samples.
+
+        Written by `division_cls/gen_fork_candidates.py`. The default dataset
+        asks "does this annotated cell divide here?", mining negatives from the
+        dividing cells' lineages; this asks "is this fork the tracking chain
+        just proposed a real division?", and the negatives are the chain's own
+        false forks. That is the distribution the model actually meets, and the
+        one where the pipeline is losing: on fold 0 the chain proposes 18 true
+        divisions against 442 false ones, so recall is already there and every
+        available point is in rejecting the 442.
+
+        Rows labelled -1 are dropped. They are the forks with no annotated GT
+        node within 7 um -- the overwhelming majority, since the annotation is
+        roughly one lineage per stack against ~40 000 detections -- and they are
+        unlabelled rather than negative. Inference still scores them; only
+        training and validation exclude them.
+        """
+        self.data_dir = Path(data_dir)
+        self.patch_yx, self.patch_z, self.n_frames = int(patch_yx), int(patch_z), int(n_frames)
+        self.augment = bool(augment)
+        self.aug_cfg, self.div_aug = resolve_div_aug(aug_cfg)
+        self.seed = int(seed)
+        self._vol = {}
+
+        blob = np.load(path, allow_pickle=True)
+        stems, table = blob["stem"], blob["table"]
+        keep = (table[:, 4] >= 0) if labelled_only else np.ones(len(table), bool)
+        if embryos is not None:
+            keep &= np.array([any(str(s).startswith(e) for e in embryos) for s in stems])
+        stems, table = stems[keep], table[keep]
+
+        if max_stacks:
+            allowed = set(dict.fromkeys(str(s) for s in stems).keys())
+            allowed = set(list(allowed)[:max_stacks])
+            m = np.array([str(s) in allowed for s in stems], bool)
+            stems, table = stems[m], table[m]
+
+        self.samples = [(str(s), float(r[0]), float(r[1]), float(r[2]), float(r[3]),
+                         int(r[4])) for s, r in zip(stems, table)]
+        # The geometry and edge probabilities the fork was proposed with, kept
+        # alongside so a features-only baseline can be scored on exactly the
+        # same rows the CNN sees.
+        self.features = table[:, 5:].astype(np.float32)
+        self.stacks = sorted({str(s) for s in stems})
+        self.labels = np.array([s[-1] for s in self.samples], np.int8)
+        self.index = np.arange(len(self.samples))
+        mult = max(1, int(positive_multiplier))
+        if mult > 1 and augment:
+            extra = np.repeat(np.flatnonzero(self.labels == 1), mult - 1)
+            self.index = np.concatenate([self.index, extra])
+        self.positive_multiplier = mult
+
     def __len__(self):
         return len(self.index)
 
@@ -238,6 +302,7 @@ class DivisionDataset(Dataset):
         geom = {"angle": 0.0, "scale": 1.0, "elastic": None,
                 "photo": {"brightness": 0.0, "contrast": 1.0, "gamma": 1.0, "noise": 0.0}}
         cy, cx = float(y), float(x)
+        zc, draw = float(z), None
         if self.augment:
             # One draw for the whole clip, not one per frame: the frames are the
             # same scene a moment apart, and re-rolling per frame would destroy
@@ -248,6 +313,11 @@ class DivisionDataset(Dataset):
             if jit:
                 cy += float(rng.normal(0, jit / SCALE[1]))
                 cx += float(rng.normal(0, jit / SCALE[2]))
+            # The clip-level draw: what has to be decided before the pixels are
+            # read (which z, which per-frame offset) and what is applied to the
+            # assembled clip afterwards.
+            draw = sample_clip_aug(self.div_aug, rng, self.n_frames, SCALE[1:])
+            zc += draw["z"]
 
         half = self.n_frames // 2
         clip = np.zeros((self.n_frames, self.patch_z, self.patch_yx, self.patch_yx),
@@ -256,15 +326,19 @@ class DivisionDataset(Dataset):
             tt = t + dt
             if tt < 0 or tt >= n_t:
                 continue            # off the ends of the video: genuinely nothing
-            slab = self._slab(vol, tt, z)
+            slab = self._slab(vol, tt, zc)
             # Percentiles over the slab, following the paper's per-frame rule;
             # a per-crop range would erase how bright this cell is next to its
             # neighbours, which is part of what marks a mitotic one.
             lo, hi = np.percentile(slab, [1.0, 99.99])
             slab = np.clip((slab - lo) / (hi - lo + 1e-6), 0.0, 1.0)
 
+            # The per-frame residual shift is registration error, so it moves
+            # the crop centre rather than the image: same thing, one fewer
+            # resampling pass.
+            dy, dx = (draw["shift"][k] if draw is not None else (0.0, 0.0))
             patch = extract_patches(
-                slab, np.array([[self.patch_z // 2, cy, cx]], np.float32),
+                slab, np.array([[self.patch_z // 2, cy + dy, cx + dx]], np.float32),
                 patch_zyx=(self.patch_z, self.patch_yx, self.patch_yx),
                 angle_deg=geom["angle"], scale=geom["scale"],
                 elastic=geom["elastic"], n_frames=1,
@@ -272,6 +346,10 @@ class DivisionDataset(Dataset):
             if self.augment:
                 patch = apply_photometric(patch, geom["photo"], rng)
             clip[k] = patch
+
+        label = float(label)
+        if draw is not None:
+            clip, label = apply_clip_aug(clip, draw, self.div_aug, rng, label)
 
         return {
             "clip": torch.from_numpy(clip),                       # (T, pz, H, W)
