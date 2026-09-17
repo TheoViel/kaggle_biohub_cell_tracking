@@ -77,6 +77,13 @@ DEFAULTS = {
     # `neg_per_pos` and `exclude_window` are unused, because the negatives are
     # the chain's false forks rather than mined ones. See `dataset.py`.
     "candidates": None,
+    # Fuse the fork's own geometry (parent/sister distance, the two edge
+    # probabilities, split size) into the head. Only read in candidate mode.
+    "fuse_features": True,
+    # Centre and/or orient the crop on the proposed daughter pair instead of the
+    # parent: "" (off), "centre", "rotate", "both". Needs a candidates file with
+    # child coordinates -- regenerate with gen_fork_candidates.py.
+    "fork_align": "",
 
     # Generated divisions. Fold 1 trains on 44b6's 26 and reaches AP 0.449 where
     # fold 0, with 125, reaches 0.705 -- the gap is labels, and the generator

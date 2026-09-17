@@ -130,11 +130,13 @@ class DivisionDataset(Dataset):
         seed: int = 0,
         candidates: str | None = None,
         candidates_labelled_only: bool = True,
+        fork_align: str = "",
     ):
         if n_frames % 2 == 0:
             raise ValueError(f"n_frames must be odd to centre on the division, got {n_frames}")
         if negatives not in ("track", "stack", "all"):
             raise ValueError(f"unknown negatives {negatives!r}")
+        self.fork_align = str(fork_align or "")
         if candidates:
             # A different question, same crops: see `_load_candidates`.
             self._init_candidates(candidates, data_dir, embryos, patch_yx, patch_z,
@@ -250,7 +252,31 @@ class DivisionDataset(Dataset):
         # The geometry and edge probabilities the fork was proposed with, kept
         # alongside so a features-only baseline can be scored on exactly the
         # same rows the CNN sees.
-        self.features = table[:, 5:].astype(np.float32)
+        #
+        # Selected by column *name*, not by a slice: the generator later grew
+        # six child-coordinate columns, and `table[:, 5:]` would have silently
+        # started feeding them to the model's feature branch as if they were
+        # scalars on the same footing as a distance.
+        from division_cls.gen_fork_candidates import FEATURES
+        cols = [str(c) for c in blob["columns"]] if "columns" in blob else []
+        if cols:
+            idx = [cols.index(f) for f in FEATURES]
+            self.child_cols = ([cols.index(c) for c in
+                                ("c1_z", "c1_y", "c1_x", "c2_z", "c2_y", "c2_x")]
+                               if "c2_x" in cols else None)
+        else:                                   # a file written before columns
+            idx, self.child_cols = list(range(5, 10)), None
+        self.features = table[:, idx].astype(np.float32)
+        self.children = (table[:, self.child_cols].astype(np.float32)
+                         if self.child_cols else None)
+        if self.fork_align and self.children is None:
+            # Refuse rather than quietly fall back to parent-centred crops: the
+            # run would train, converge and report a number that looks like a
+            # test of the alignment and is not one.
+            raise ValueError(
+                f"fork_align={self.fork_align!r} needs child coordinates, and "
+                f"{path} has columns {cols or 'none recorded'}. Regenerate it "
+                "with division_cls/gen_fork_candidates.py.")
         self.stacks = sorted({str(s) for s in stems})
         self.labels = np.array([s[-1] for s in self.samples], np.int8)
         self.index = np.arange(len(self.samples))
@@ -303,6 +329,34 @@ class DivisionDataset(Dataset):
                 "photo": {"brightness": 0.0, "contrast": 1.0, "gamma": 1.0, "noise": 0.0}}
         cy, cx = float(y), float(x)
         zc, draw = float(z), None
+
+        # Centre and orient the crop on the *proposal* rather than the parent.
+        #
+        # A division is judged by how the two daughters part, but the crop is
+        # centred on the parent with a 6.5 um half-width at patch_yx=32, while
+        # the p90 parent-daughter distance on 6bba positives is 9.3 um -- so the
+        # daughter the model is being asked about is often outside the crop, and
+        # the discriminating signal (positives separate to 10.2 um, negatives to
+        # 7.2) is exactly what falls off the edge. Centring on the midpoint of
+        # the pair keeps both in frame at the same crop size.
+        #
+        # Rotating so the sister axis is horizontal removes a nuisance degree of
+        # freedom: every real division then looks like "one blob becomes two,
+        # left and right", instead of that same event at an arbitrary angle,
+        # which is a lot to ask 13 training positives to average over.
+        fork_angle = 0.0
+        if self.fork_align and getattr(self, "children", None) is not None:
+            c = self.children[int(self.index[i])]        # c1 zyx, c2 zyx
+            (c1z, c1y, c1x), (c2z, c2y, c2x) = c[:3], c[3:]
+            if self.fork_align in ("centre", "both"):
+                cy, cx = (float(c1y) + float(c2y)) / 2.0, (float(c1x) + float(c2x)) / 2.0
+                zc = (float(c1z) + float(c2z)) / 2.0
+            if self.fork_align in ("rotate", "both"):
+                # Physical, not voxel: y and x share a pitch here, but stating it
+                # keeps the angle right if that ever stops being true.
+                dy = (float(c2y) - float(c1y)) * SCALE[1]
+                dx = (float(c2x) - float(c1x)) * SCALE[2]
+                fork_angle = -float(np.degrees(np.arctan2(dy, dx)))
         if self.augment:
             # One draw for the whole clip, not one per frame: the frames are the
             # same scene a moment apart, and re-rolling per frame would destroy
@@ -340,7 +394,7 @@ class DivisionDataset(Dataset):
             patch = extract_patches(
                 slab, np.array([[self.patch_z // 2, cy + dy, cx + dx]], np.float32),
                 patch_zyx=(self.patch_z, self.patch_yx, self.patch_yx),
-                angle_deg=geom["angle"], scale=geom["scale"],
+                angle_deg=geom["angle"] + fork_angle, scale=geom["scale"],
                 elastic=geom["elastic"], n_frames=1,
             )[0, 0]
             if self.augment:
@@ -351,8 +405,21 @@ class DivisionDataset(Dataset):
         if draw is not None:
             clip, label = apply_clip_aug(clip, draw, self.div_aug, rng, label)
 
+        # The geometry the fork was *proposed* with. The clip is centred on the
+        # parent and cannot see which pair is on trial -- two rows of a
+        # three-way split give byte-identical clips -- so without this the model
+        # is answering "is this cell mitotic" when the question is "is this
+        # proposal right". Measured: the image and geometry scores are almost
+        # uncorrelated on the positives (rank corr -0.02 on fold 1), and fusing
+        # their ranks takes AP 0.408 -> 0.513. Zeros when not in candidate mode,
+        # where the question really is about the cell alone.
+        feat = (torch.from_numpy(self.features[int(self.index[i])])
+                if getattr(self, "features", None) is not None
+                else torch.zeros(0, dtype=torch.float32))
+
         return {
             "clip": torch.from_numpy(clip),                       # (T, pz, H, W)
+            "feat": feat,
             "label": torch.tensor(float(label)),
             "sample": stem,
             "t": t,

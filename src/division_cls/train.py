@@ -24,8 +24,10 @@ def evaluate(model, loader, device, use_fp16=True):
     scores, labels = [], []
     for batch in loader:
         clip = batch["clip"].to(device, non_blocking=True)
+        feat = batch.get("feat")
+        feat = feat.to(device, non_blocking=True) if feat is not None and feat.numel() else None
         with torch.autocast("cuda", torch.float16, enabled=use_fp16 and device.type == "cuda"):
-            logits = model(clip)
+            logits = model(clip, feat)
         scores.append(logits.float().cpu())
         labels.append(batch["label"])
     if not scores:
@@ -96,10 +98,13 @@ def fit(model, train_loader, args, ctx, train_sampler=None, val_loader=None):
             if step >= total_steps:
                 break
             clip = batch["clip"].to(device, non_blocking=True)
+            feat = batch.get("feat")
+            feat = (feat.to(device, non_blocking=True)
+                    if feat is not None and feat.numel() else None)
             target = batch["label"].to(device, non_blocking=True)
 
             with torch.autocast("cuda", torch.float16, enabled=use_fp16):
-                loss = criterion(model(clip), target)
+                loss = criterion(model(clip, feat), target)
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()

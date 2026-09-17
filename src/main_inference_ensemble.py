@@ -98,6 +98,11 @@ def parse_args():
     p.add_argument("--max_frames", type=int, default=None)
     p.add_argument("--n_videos", type=int, default=None)
     p.add_argument("--pl", action="store_true")
+    p.add_argument("--annot_head", action="store_true",
+                   help="also sweep and write the annotation head's node sets. "
+                        "Off by default: it doubles every radius x threshold "
+                        "combination, and inference consumes the detection "
+                        "head. Only useful when comparing the two heads.")
     p.add_argument("--no_window_merge", action="store_true")
     p.add_argument("--n_tta", type=int, choices=(1, 4, 8), default=PredictConfig.n_tta)
     p.add_argument("--det_threshold", type=MP._floats,
@@ -292,7 +297,18 @@ def main():
                   "run's -- pass --det_threshold with a list.")
 
     cfg = cfgs[0]
-    heads = ("det", "annot") if bool(getattr(cfg, "annot_head", False)) else ("det",)
+    # The annotation head is swept only on request. A checkpoint that *has* the
+    # head is the common case now, and sweeping it doubles the whole
+    # radius x threshold grid -- every extraction, NMS and write -- for a node
+    # set inference does not consume: the edge model was fitted on "det", and
+    # `predict_video_thresholds` is asked for "det" downstream. It stays
+    # available for comparing the two heads, which is what it was added for.
+    want_annot = bool(getattr(args, "annot_head", False))
+    has_annot = bool(getattr(cfg, "annot_head", False))
+    heads = ("det", "annot") if (want_annot and has_annot) else ("det",)
+    if want_annot and not has_annot and ctx.is_main:
+        print("-> --annot_head requested but the checkpoint has no annotation "
+              "head; writing the detection head only")
     keys = [(h, r, th) for h in heads for r in radii for th in thresholds]
 
     base_dir = Path(args.out_dir or (runs[0] + ("preds_ens_pl" if args.pl

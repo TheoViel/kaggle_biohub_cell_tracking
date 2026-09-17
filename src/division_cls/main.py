@@ -46,6 +46,7 @@ def build_loader(args, embryos, augment: bool, ctx=None, shuffle=None):
         max_stacks=_opt_int(getattr(args, "max_stacks", None)),
         seed=int(getattr(args, "seed", 0)),
         candidates=getattr(args, "candidates", None) or None,
+        fork_align=getattr(args, "fork_align", "") or "",
     )
     # Synthetic crops, training split only. Validation must stay a clean read
     # of the annotation -- mixing generated positives into it would measure
@@ -96,6 +97,10 @@ def build_model(args, ctx):
         dropout=float(args.dropout),
         min_tokens=int(args.min_tokens),
         grad_checkpointing=bool(getattr(args, "grad_checkpointing", False)),
+        # Fusing the proposal's geometry only makes sense in candidate mode,
+        # where a "sample" is a proposed fork rather than a cell.
+        n_features=(5 if (getattr(args, "candidates", None)
+                          and bool(getattr(args, "fuse_features", True))) else 0),
         verbose=int(ctx.is_main) if ctx is not None else 1,
     )
     device = ctx.device if ctx is not None else "cpu"
@@ -158,6 +163,15 @@ def k_fold(args, ctx):
             print(f"- val   : {val_ds.summary}\n")
 
         model = build_model(args, ctx)
+        # Fix the feature standardisation from the training split's own rows,
+        # before any oversampling. `train_ds.features` is one row per distinct
+        # sample; `train_ds.index` is the oversampled epoch and must not be used.
+        target = model.module if hasattr(model, "module") else model
+        if getattr(target, "n_features", 0) and getattr(train_ds, "features", None) is not None:
+            target.set_feature_stats(train_ds.features)
+            if ctx.is_main:
+                print(f"- feat norm : mean {target.feat_mean.tolist()} "
+                      f"std {target.feat_std.tolist()}\n")
         results[run["name"]] = fit(model, train_loader, args, ctx,
                                    train_sampler=sampler, val_loader=val_loader)
         del model

@@ -32,6 +32,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "postprocessing"))
 
+import edge_pp  # noqa: E402
 import main_edge_postprocess as MEP  # noqa: E402
 import multi_hypothesis as M  # noqa: E402
 from division_cls.gen_fork_candidates import FORK_CFG  # noqa: E402
@@ -68,7 +69,7 @@ def load_lookups(score_path):
 
 
 def _job(arg):
-    stem, pred_dir, taus, lookup = arg
+    stem, pred_dir, taus, lookup, reprune = arg
     z = np.load(Path(pred_dir) / f"{stem}.npz")
     cfg = dict(MEP.DEFAULTS)
     cfg.update(out_dir="", geff_dir="", no_score=True, assign=1)
@@ -102,7 +103,15 @@ def _job(arg):
         else:
             drop = []
         e = edges[np.setdiff1d(np.arange(len(edges)), np.asarray(drop, int))] if drop else edges
-        row = M.score_one(stem, coords, e)
+        c = coords
+        if reprune:
+            # `prune_short` ran while every fork was still in the graph, so a
+            # fragment rescued by a fork the classifier then rejected is left
+            # stranded -- with its own edges, which are scored false positives.
+            # Re-running the filter after the gate is worth +0.0069 macro and
+            # is what makes 6bba positive at all; never sweep without it.
+            c, e = edge_pp.prune_short(coords, e, MEP.DEFAULTS["min_track"])
+        row = M.score_one(stem, c, e)
         row["_tau"] = tau
         row["_dropped"] = len(drop)
         row["_forks"] = len(scored)
@@ -118,6 +127,8 @@ def main():
     p.add_argument("--embryo", default=None)
     p.add_argument("--workers", type=int, default=28)
     p.add_argument("--taus", default="0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0")
+    p.add_argument("--reprune", action="store_true",
+                   help="re-run prune_short after gating; worth +0.0069 macro")
     args = p.parse_args()
 
     taus = [float(t) for t in args.taus.split(",")]
@@ -131,7 +142,7 @@ def main():
     if missing:
         print(f"WARNING: no scores for {len(missing)} stacks, e.g. {missing[:3]}",
               flush=True)
-    jobs = [(s, str(pred_dir), taus, lookups.get(s, {})) for s in stems]
+    jobs = [(s, str(pred_dir), taus, lookups.get(s, {}), args.reprune) for s in stems]
     per_tau: dict[float, list] = {t: [] for t in taus}
     with Pool(args.workers) as pool:
         for rows in pool.imap_unordered(_job, jobs):

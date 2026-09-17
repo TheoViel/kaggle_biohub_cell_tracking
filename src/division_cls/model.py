@@ -27,6 +27,7 @@ at `t+1` are the same place.
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -98,10 +99,12 @@ class DivisionNet(nn.Module):
         dropout: float = 0.1,
         min_tokens: int = 4,
         grad_checkpointing: bool = False,
+        n_features: int = 0,
         verbose: int = 0,
     ):
         super().__init__()
         self.n_frames = int(n_frames)
+        self.n_features = int(n_features)
         self.encoder = FrameEncoder(
             backbone, pretrained=pretrained, in_chans=patch_z,
             img_size=patch_yx, min_tokens=min_tokens, verbose=verbose,
@@ -123,8 +126,52 @@ class DivisionNet(nn.Module):
             activation="gelu",
         )
         self.transformer = nn.TransformerEncoder(layer, num_layers=n_layers)
+
+        # The proposal's own geometry, fused late. The clip is centred on the
+        # parent and is identical for every fork sharing it, so the image can
+        # only answer "is this cell mitotic"; sister distance answers "are these
+        # two plausibly siblings", and on fold 1 that is worth AUC 0.86 by
+        # itself while correlating ~0 with the image score on the positives.
+        # Late fusion rather than an extra token: with 13 training positives the
+        # transformer has no budget to learn what to do with 5 scalars, and a
+        # LayerNorm here spares the caller from having to standardise them
+        # against training statistics it would have to carry to inference.
+        d_feat = 0
+        if self.n_features:
+            d_feat = max(32, d_model // 8)
+            # Standardise each feature with statistics fixed at build time, from
+            # the *honest* training distribution. Two normalisers were tried
+            # first and both were wrong:
+            #
+            # * `LayerNorm(5)` normalises across the five features within one
+            #   sample, so a 10 um sister distance is rescaled by the mean of a
+            #   distance, two probabilities and a count -- destroying the
+            #   cross-sample scale that makes it discriminative. The fused model
+            #   scored *below* the image-only baseline (AP 0.272 vs 0.354).
+            # * `BatchNorm1d` normalises the right way but learns its running
+            #   statistics from the training stream, which `positive_multiplier`
+            #   has oversampled 8x. Positives are 17% of what it sees and 2.5% of
+            #   what inference sees, which moves sister_dist's mean/std from
+            #   7.558/1.415 to 7.889/1.656. A positive at 10.2 um then normalises
+            #   to 1.40 where the model learned 1.87 -- the discriminative tail
+            #   compressed ~25%, which costs precision at the top of the ranking
+            #   (AP) while barely moving the global order (AUC). That is exactly
+            #   the shape of the measured AP-down/AUC-up result.
+            #
+            # Fixed buffers remove the oversampling skew, the batch-size
+            # dependence and any train/eval mismatch at once. `set_feature_stats`
+            # fills them; the std floor neutralises a constant feature
+            # (`n_children` is 2 everywhere, std exactly 0) instead of letting
+            # `1/sqrt(eps)` turn it into a 316x amplifier.
+            self.register_buffer("feat_mean", torch.zeros(self.n_features))
+            self.register_buffer("feat_std", torch.ones(self.n_features))
+            self.feat_mlp = nn.Sequential(
+                nn.Linear(self.n_features, d_feat), nn.GELU(),
+                nn.Dropout(dropout), nn.Linear(d_feat, d_feat), nn.GELU(),
+            )
         self.head = nn.Sequential(
-            nn.LayerNorm(d_model), nn.Dropout(dropout), nn.Linear(d_model, 1),
+            nn.LayerNorm(d_model + d_feat), nn.Dropout(dropout),
+            nn.Linear(d_model + d_feat, 1),
         )
 
         if grad_checkpointing and hasattr(self.encoder.backbone, "set_grad_checkpointing"):
@@ -133,7 +180,7 @@ class DivisionNet(nn.Module):
             print(f"  - clip {n_frames}x{patch_z}x{patch_yx}x{patch_yx} -> "
                   f"{n_frames} x {self.n_tokens} tokens + CLS, d_model {d_model}")
 
-    def forward(self, clip: torch.Tensor) -> torch.Tensor:
+    def forward(self, clip: torch.Tensor, feat: torch.Tensor | None = None) -> torch.Tensor:
         b, t = clip.shape[:2]
         if t != self.n_frames:
             raise ValueError(f"model built for {self.n_frames} frames, got {t}")
@@ -146,7 +193,39 @@ class DivisionNet(nn.Module):
         tokens = tokens.reshape(b, t * self.n_tokens, -1)
 
         x = torch.cat([self.cls.expand(b, -1, -1), tokens], dim=1)
-        return self.head(self.transformer(x)[:, 0]).squeeze(-1)
+        pooled = self.transformer(x)[:, 0]
+        if self.n_features:
+            if feat is None or feat.shape[-1] != self.n_features:
+                raise ValueError(
+                    f"model built with n_features={self.n_features}; got "
+                    f"{None if feat is None else feat.shape[-1]}. Silently "
+                    "zero-filling would train the fusion branch on nothing and "
+                    "read as a mysteriously weak run.")
+            f = (feat.to(pooled.dtype) - self.feat_mean) / self.feat_std
+            pooled = torch.cat([pooled, self.feat_mlp(f)], dim=-1)
+        return self.head(pooled).squeeze(-1)
+
+    @torch.no_grad()
+    def set_feature_stats(self, features, std_floor: float = 1e-3):
+        """Fix the feature standardisation from the training set, once.
+
+        `features` must be the *unoversampled* training rows -- one entry per
+        distinct sample. Passing the oversampled epoch would reintroduce exactly
+        the skew this replaces.
+        """
+        x = torch.as_tensor(np.asarray(features, dtype="float32"))
+        if x.ndim != 2 or x.shape[1] != self.n_features:
+            raise ValueError(f"expected (N, {self.n_features}), got {tuple(x.shape)}")
+        self.feat_mean.copy_(x.mean(0))
+        # A column with no variance in training gets std 1, not a small floor.
+        # Flooring at 1e-3 would turn an unseen value into a 1000x activation --
+        # worse than the 316x the BatchNorm this replaces would have produced.
+        # `n_children` is exactly 2 on all 107k forks, so it contributes a
+        # constant 0 either way; the point is that it stays harmless if a
+        # three-way split ever shows up at inference.
+        std = x.std(0)
+        self.feat_std.copy_(torch.where(std < std_floor, torch.ones_like(std), std))
+        return self
 
     def count_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)

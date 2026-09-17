@@ -10,8 +10,9 @@ fold `i` trained without `EMBRYOS[i]`, so a stack is scored by the model that
 held its embryo out, and a stack with no such model is skipped rather than
 scored by a model that has seen it.
 
-Parents are deduplicated before scoring -- a three-way split contributes two
-rows with the same parent -- and the scores are scattered back over the rows.
+Crops come from `DivisionDataset` in candidate mode, which is the same code the
+model trained against -- so a fused model gets its feature vector, and there is
+no second copy of the cropping to drift out of step with training.
 """
 
 from __future__ import annotations
@@ -25,7 +26,10 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from division_cls.infer import load_fold_models, score_stack  # noqa: E402
+from torch.utils.data import DataLoader  # noqa: E402
+
+from division_cls.dataset import DivisionDataset  # noqa: E402
+from division_cls.infer import load_fold_models  # noqa: E402
 from params import TRAIN_DIR  # noqa: E402
 
 
@@ -37,7 +41,8 @@ def main():
     p.add_argument("--data_dir", default=TRAIN_DIR)
     p.add_argument("--out", required=True)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--batch_size", type=int, default=512)
+    p.add_argument("--batch_size", type=int, default=256)
+    p.add_argument("--num_workers", type=int, default=8)
     args = p.parse_args()
 
     blob = np.load(args.candidates, allow_pickle=True)
@@ -46,23 +51,46 @@ def main():
     models = load_fold_models(args.run_dir, args.device)
     print(f"{len(table)} forks, models for {sorted(models)}", flush=True)
 
+    # Score through `DivisionDataset` itself rather than re-deriving the crops.
+    # Two reasons, both learned the hard way: a fused model needs the proposal's
+    # feature vector, which a coords-only scorer has no way to supply; and any
+    # second implementation of the cropping is a chance for inference to
+    # normalise or centre differently from training, which would show up as a
+    # mysteriously weak model rather than as an error.
     scores = np.full(len(table), np.nan, np.float32)
-    order = sorted(set(stems.tolist()))
-    for i, stem in enumerate(order, 1):
-        embryo = stem[:4]
+    for embryo, (model, cfg) in sorted(models.items()):
+        ds = DivisionDataset(
+            args.data_dir, embryos=[embryo], candidates=args.candidates,
+            candidates_labelled_only=False, augment=False,
+            patch_yx=cfg["patch_yx"], patch_z=cfg["patch_z"],
+            n_frames=cfg["n_frames"],
+        )
+        rows = np.flatnonzero(np.asarray([s.startswith(embryo) for s in stems]))
+        if len(ds.samples) != len(rows):
+            raise RuntimeError(
+                f"{embryo}: dataset has {len(ds.samples)} rows, candidates table "
+                f"{len(rows)} -- they must be the same rows in the same order for "
+                "the scores to align")
+        loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False,
+                            num_workers=args.num_workers, pin_memory=True)
+        got, done = [], 0
+        with torch.no_grad():
+            for batch in loader:
+                clip = batch["clip"].to(args.device, non_blocking=True)
+                feat = batch.get("feat")
+                feat = (feat.to(args.device, non_blocking=True)
+                        if feat is not None and feat.numel() else None)
+                with torch.autocast("cuda", torch.float16,
+                                    enabled=args.device.startswith("cuda")):
+                    got.append(torch.sigmoid(model(clip, feat)).float().cpu())
+                done += len(clip)
+                if done % (args.batch_size * 40) == 0:
+                    print(f"  {embryo}: {done}/{len(ds.samples)}", flush=True)
+        scores[rows] = torch.cat(got).numpy().astype(np.float32)
+        print(f"  {embryo}: {len(rows)} forks scored", flush=True)
+    for embryo in ("44b6", "6bba"):
         if embryo not in models:
-            print(f"  skip {stem}: no out-of-fold model for {embryo}", flush=True)
-            continue
-        model, cfg = models[embryo]
-        rows = np.flatnonzero(stems == stem)
-        coords = table[rows, :4].astype(np.float64)
-        uniq, inv = np.unique(coords, axis=0, return_inverse=True)
-        s = score_stack(uniq, Path(args.data_dir) / f"{stem}.zarr", model, cfg,
-                        device=args.device, batch_size=args.batch_size)
-        scores[rows] = np.asarray(s, np.float32)[inv]
-        if i % 20 == 0 or i == len(order):
-            done = int(np.isfinite(scores).sum())
-            print(f"  {i}/{len(order)} stacks, {done} forks scored", flush=True)
+            print(f"  skip {embryo}: no out-of-fold model", flush=True)
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

@@ -35,14 +35,33 @@ def load_model(ckpt_path, device="cuda"):
     cfg = dict(state.get("model_config") or {})
     if not cfg:
         raise ValueError(f"{ckpt_path} carries no model_config")
+    sd = state["model_state_dict"]
+    # `n_features` post-dates the checkpoints that are already on disk, so it is
+    # recovered from the weights rather than required in the config: the fusion
+    # branch exists iff `feat_mlp` does, and its width is the BatchNorm's. A
+    # config key alone would have made every checkpoint written before it
+    # unloadable, which is how this was first noticed.
+    # `feat_mean` is the unambiguous witness: it is (n_features,) whatever the
+    # branch looks like. `feat_mlp.0.weight` is not -- it was (n_features,) when
+    # the first layer was a BatchNorm and is (d_feat, n_features) now that it is
+    # a Linear, so reading shape[0] silently returned 32 instead of 5 and every
+    # fused checkpoint failed to load.
+    if "feat_mean" in sd:
+        n_features = int(sd["feat_mean"].shape[0])
+    elif "feat_mlp.0.weight" in sd:
+        w = sd["feat_mlp.0.weight"]
+        n_features = int(w.shape[1] if w.ndim == 2 else w.shape[0])
+    else:
+        n_features = int(cfg.get("n_features", 0) or 0)
     model = DivisionNet(
         backbone=cfg["backbone"], pretrained=False,
         patch_yx=cfg["patch_yx"], patch_z=cfg["patch_z"], n_frames=cfg["n_frames"],
         d_model=cfg["d_model"], n_layers=cfg["n_layers"], n_heads=cfg["n_heads"],
         dim_feedforward=cfg["dim_feedforward"], dropout=cfg["dropout"],
-        min_tokens=cfg["min_tokens"],
+        min_tokens=cfg["min_tokens"], n_features=n_features,
     )
-    model.load_state_dict(state["model_state_dict"])
+    model.load_state_dict(sd)
+    cfg["n_features"] = n_features
     return model.eval().to(device), cfg
 
 

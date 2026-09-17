@@ -67,7 +67,17 @@ FORK_CFG = dict(
 )
 
 COLUMNS = ("t", "z", "y", "x", "label", "parent_dist_um", "sister_dist_um",
-           "child_prob", "sister_prob", "n_children")
+           "child_prob", "sister_prob", "n_children",
+           # The two daughters' positions, in the same voxel frame as the
+           # parent. The scalars above summarise the proposal; these let a
+           # dataset *look* at it -- centre the crop on the pair, or rotate so
+           # the sister axis is canonical. Both children are at t+1.
+           "c1_z", "c1_y", "c1_x", "c2_z", "c2_y", "c2_x")
+# Columns 5:10 are the model's scalar features. Named rather than implied,
+# because appending to COLUMNS silently changed `table[:, 5:]` for every
+# consumer the first time it was done.
+FEATURES = ("parent_dist_um", "sister_dist_um", "child_prob", "sister_prob",
+            "n_children")
 
 
 def gt_division_flags(geff_path):
@@ -150,6 +160,7 @@ def _one(stem_pred):
                 float(np.linalg.norm((coords[parent, 1:] - coords[q, 1:]) * scale)),
                 float(np.linalg.norm((coords[first, 1:] - coords[q, 1:]) * scale)),
                 float(edges[k, 2]), float(edges[ks[0], 2]), float(len(ks)),
+                *coords[first, 1:], *coords[q, 1:],                # c1 zyx, c2 zyx
             ))
     if not rows:
         return stem, np.zeros((0, len(COLUMNS)), np.float32)
