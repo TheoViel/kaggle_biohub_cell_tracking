@@ -63,8 +63,15 @@ def fuse_directions(
     and simply not be proposed. Scoring the missing view as zero would delete
     links over a rounding difference in the drift estimate.
     """
-    f = float(np.mean(forward)) if forward else None
-    r = float(np.mean(reverse)) if reverse else None
+    # The one-reading case by hand rather than through `np.mean`. At the default
+    # window of 2 and without `--tta` every pair is seen exactly once, so this is
+    # *every* edge: 151 974 calls on a one-element list cost 0.84 s of a 3.07 s
+    # `score_video`, more than a quarter of the stage, all of it numpy's
+    # dispatch and shape handling around a float that is already the answer.
+    f = (forward[0] if len(forward) == 1
+         else float(np.mean(forward)) if forward else None)
+    r = (reverse[0] if len(reverse) == 1
+         else float(np.mean(reverse)) if reverse else None)
     if f is None or r is None:
         return f if f is not None else (r if r is not None else 0.0)
 

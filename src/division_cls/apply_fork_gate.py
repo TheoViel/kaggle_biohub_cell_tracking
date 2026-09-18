@@ -101,34 +101,52 @@ def score_candidates(cand_path, data_dir, run_dir, device, batch_size, workers,
     if not n:
         return np.zeros(0, np.float32)
 
+    loaded = [load_model(c, device) for c in ckpts]
+    # One crop pass for every model, not one per model. The network forward on 81
+    # forks a stack is nothing; the cost is opening the zarr and cutting the
+    # crops, so reading them once and handing each batch to both models is
+    # most of the fold-averaging price -- measured 8.4 s a stack against 5.2 s
+    # for a single fold, of which this recovers ~3 s.
+    #
+    # Every fold of a run shares its crop geometry (same `patch_yx`, `patch_z`,
+    # `n_frames`), so one dataset serves them all. Refuse rather than silently
+    # score one model on another's crops.
+    geom = {(c["patch_yx"], c["patch_z"], c["n_frames"]) for _, c in loaded}
+    if len(geom) > 1:
+        raise RuntimeError(
+            f"fold models disagree on crop geometry {sorted(geom)}; they cannot "
+            "share one pass. Score them separately with --fold <n>.")
+    cfg = loaded[0][1]
+
+    ds = DivisionDataset(
+        data_dir, embryos=None, candidates=str(cand_path),
+        candidates_labelled_only=False, augment=False,
+        patch_yx=cfg["patch_yx"], patch_z=cfg["patch_z"],
+        n_frames=cfg["n_frames"],
+    )
+    if len(ds.samples) != n:
+        raise RuntimeError(
+            f"dataset has {len(ds.samples)} rows against {n} candidates; "
+            "they must be the same rows in the same order")
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
+                        num_workers=workers, pin_memory=True)
+
+    got = [[] for _ in loaded]
+    with torch.no_grad():
+        for batch in loader:
+            clip = batch["clip"].to(device, non_blocking=True)
+            feat = batch.get("feat")
+            feat = (feat.to(device, non_blocking=True)
+                    if feat is not None and feat.numel() else None)
+            with torch.autocast("cuda", torch.float16,
+                                enabled=str(device).startswith("cuda")):
+                for i, (model, _) in enumerate(loaded):
+                    got[i].append(torch.sigmoid(model(clip, feat)).float().cpu())
     acc = np.zeros(n, np.float64)
-    for ckpt in ckpts:
-        model, cfg = load_model(ckpt, device)
-        ds = DivisionDataset(
-            data_dir, embryos=None, candidates=str(cand_path),
-            candidates_labelled_only=False, augment=False,
-            patch_yx=cfg["patch_yx"], patch_z=cfg["patch_z"],
-            n_frames=cfg["n_frames"],
-        )
-        if len(ds.samples) != n:
-            raise RuntimeError(
-                f"dataset has {len(ds.samples)} rows against {n} candidates; "
-                "they must be the same rows in the same order")
-        loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
-                            num_workers=workers, pin_memory=True)
-        got = []
-        with torch.no_grad():
-            for batch in loader:
-                clip = batch["clip"].to(device, non_blocking=True)
-                feat = batch.get("feat")
-                feat = (feat.to(device, non_blocking=True)
-                        if feat is not None and feat.numel() else None)
-                with torch.autocast("cuda", torch.float16,
-                                    enabled=str(device).startswith("cuda")):
-                    got.append(torch.sigmoid(model(clip, feat)).float().cpu())
-        acc += torch.cat(got).numpy().astype(np.float64)
+    for i, ckpt in enumerate(ckpts):
+        acc += torch.cat(got[i]).numpy().astype(np.float64)
         print(f"  scored with {ckpt.parent.name}", flush=True)
-    return (acc / len(ckpts)).astype(np.float32)
+    return (acc / len(loaded)).astype(np.float32)
 
 
 def gate_stack(coords, edges, lookup, tau, min_track=None):

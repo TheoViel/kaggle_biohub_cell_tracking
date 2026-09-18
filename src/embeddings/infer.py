@@ -21,7 +21,12 @@ import numpy as np
 import torch
 
 from embeddings.model import NETr
-from embeddings.patches import extract_patches, normalise_coords, normalise_frame
+from embeddings.patches import (
+    extract_patches,
+    normalise_and_extract_torch,
+    normalise_coords,
+    normalise_frame,
+)
 
 
 def _opt_int(value):
@@ -106,16 +111,25 @@ def embed_frame(
     if len(coords) == 0:
         return np.zeros((0, 0), np.float32)
 
-    patches = extract_patches(
-        normalise_frame(volume), coords, patch_zyx, n_frames=n_frames
-    )
+    dev = torch.device(device)
+    if dev.type == "cuda":
+        # Normalisation and the patch gather on the device: 204 ms of CPU a
+        # frame against an 11 ms forward, on data that was going there anyway.
+        # See `normalise_and_extract_torch`.
+        patch_t = normalise_and_extract_torch(
+            volume, coords, patch_zyx, n_frames=n_frames, device=dev
+        )
+    else:
+        patch_t = torch.from_numpy(extract_patches(
+            normalise_frame(volume), coords, patch_zyx, n_frames=n_frames
+        )).to(dev)
     norm = normalise_coords(coords, volume.shape)
-    use_fp16 = bool(fp16) and torch.device(device).type == "cuda"
+    use_fp16 = bool(fp16) and dev.type == "cuda"
     with torch.amp.autocast(
-        device_type=torch.device(device).type, dtype=torch.float16, enabled=use_fp16
+        device_type=dev.type, dtype=torch.float16, enabled=use_fp16
     ):
         z = model(
-            torch.from_numpy(patches)[None].to(device),
+            patch_t[None],
             torch.from_numpy(norm)[None].to(device),
             torch.ones(1, len(coords), dtype=torch.bool, device=device),
         )

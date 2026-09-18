@@ -188,10 +188,19 @@ def _select_edges(
     return edges
 
 
+def _load_frame_np(zarr_arr, t: int) -> np.ndarray:
+    """One full-resolution frame from zarr as float32 (no normalisation).
+
+    The cast stays on the host: the array is uint16 on disk and torch does not
+    take uint16 through `from_numpy` usefully, and at 3 ms against the 24 ms
+    read it is not what costs anything here.
+    """
+    return zarr_arr[t].astype(np.float32)
+
+
 def _load_frame(zarr_arr, t: int) -> torch.Tensor:
     """Load one full-resolution frame from zarr (no normalisation)."""
-    raw = zarr_arr[t].astype(np.float32)
-    return torch.from_numpy(raw)
+    return torch.from_numpy(_load_frame_np(zarr_arr, t))
 
 
 def _split_prepared_frames(prepared, keys: Sequence[int]) -> dict[int, tuple]:
@@ -745,22 +754,47 @@ def predict_video_thresholds(
     )
     prepared_cache: dict[int, tuple] = {}
 
+    # Frames prepared once and reused by both windows that contain them.
+    #
+    # Windows overlap by a frame -- (t-1,t) then (t,t+1) -- so the previous
+    # version read, cast, normalised and transferred every interior frame
+    # twice: 58 `_load_frame` calls for 30 frames. `prepared_cache` below
+    # already avoids repeating the *backbone* on those frames; this avoids
+    # repeating everything before it. Measured per frame: 24 ms of zarr read,
+    # 3 ms of cast, 18 ms of CPU normalisation.
+    #
+    # Normalisation moved after the transfer while it was being touched. It is
+    # three elementwise passes over a full-resolution volume, which is host
+    # memory bandwidth on the CPU and nothing on the GPU, and the operands are
+    # the same float32 either way.
+    frame_cache: dict[int, torch.Tensor] = {}
+
+    def _prepared_frame(t: int) -> torch.Tensor:
+        got = frame_cache.get(t)
+        if got is None:
+            got = torch.from_numpy(_load_frame_np(zarr_arr, t)).to(device)
+            # Quantile normalisation, matching tracking/dataset.py.
+            got = ((got - q_low) / (q_high - q_low + 1e-6)).clamp(0.0, clamp_max)
+            if downscale_factor > 1:
+                got = got[::downscale_factor, ::downscale_factor, ::downscale_factor]
+            frame_cache[t] = got
+        return got
+
     window_iter = tqdm(window_starts, desc="windows", leave=False, disable=not progress)
     for window_i, ws in enumerate(window_iter):
         frame_indices = list(range(ws, ws + W))
 
         # --- UNet encode (single window, batch_size=1), full resolution ---
         imgs = torch.stack(
-            [_load_frame(zarr_arr, t) for t in frame_indices]
-        )  # (W, Z, Y, X)
-        # Quantile normalisation, matching tracking/dataset.py.
-        imgs = ((imgs - q_low) / (q_high - q_low + 1e-6)).clamp(0.0, clamp_max)
+            [_prepared_frame(t) for t in frame_indices]
+        ).unsqueeze(0)  # (1, W, Z, Y, X), on device, normalised
+
+        # Windows only ever move forward, so anything before this one is done.
+        for stale in [t for t in frame_cache if t < ws]:
+            del frame_cache[stale]
 
         if downscale_factor > 1:
-            imgs = imgs[:, ::downscale_factor, ::downscale_factor, ::downscale_factor]
-            image_shape = (T,) + tuple(imgs.shape[1:])
-
-        imgs = imgs.unsqueeze(0).to(device)  # (1, W, Z, Y, X)
+            image_shape = (T,) + tuple(imgs.shape[2:])
 
         if can_prepare:
             missing_positions = [

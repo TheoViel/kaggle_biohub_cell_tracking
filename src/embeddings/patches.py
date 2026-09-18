@@ -119,6 +119,89 @@ def extract_patches(
     return out.reshape(n, n_frames, pz, py, px)
 
 
+def normalise_and_extract_torch(
+    volume,                      # (Z, Y, X) raw frame, any array torch can take
+    centres: np.ndarray,         # (N, 3) z/y/x in image voxels, may be fractional
+    patch_zyx=PATCH_ZYX,
+    n_frames: int = 1,
+    device="cuda",
+    chunk: int = 256,
+) -> "torch.Tensor":
+    """`normalise_frame` + `extract_patches` on the device. (N, F, pz, py, px).
+
+    The inference-time fast path, and only that: no rotation, scale or elastic,
+    which are view augmentations and never set when embedding. Anything else
+    should keep using the numpy pair.
+
+    Why it exists. Measured on one frame of 990 cells, this stage was 204 ms of
+    CPU against 11 ms of model forward -- `np.percentile` sorts 4.2 M voxels for
+    two numbers (55 ms) and the patch gather builds ~6.8 M index entries in
+    numpy (149 ms). Both are elementwise or reduction work on data that is about
+    to go to the GPU anyway, so the transfer is the same and the arithmetic is
+    free there. The forward was never the cost.
+
+    Sampling stays nearest-neighbour and out-of-volume stays zero, matching
+    `extract_patches` exactly: `torch.round` and `np.rint` are both
+    round-half-to-even, so the sampled voxel is the same one.
+
+    `chunk` bounds the index tensors, which are the memory here: a full frame of
+    990 cells at 3x48x48 is 6.8 M entries per coordinate, and three int64
+    copies of that is 164 MB. Chunked it is ~40 MB regardless of cell count.
+    """
+    import torch
+
+    pz, py, px = patch_zyx
+    n_frames = int(n_frames)
+    depth = pz * n_frames
+    n = len(centres)
+    dev = torch.device(device)
+    if n == 0:
+        return torch.zeros((0, n_frames, pz, py, px), dtype=torch.float32, device=dev)
+
+    v = torch.as_tensor(np.asarray(volume), device=dev).float()
+    Z, Y, X = v.shape
+    # Frame percentile normalisation, as `normalise_frame`. torch.quantile takes
+    # fractions where np.percentile takes percentages, and the interpolation is
+    # done in float64 because that is what numpy does with a float32 input --
+    # in float32 the two ends land a few ulp apart and every voxel in the frame
+    # inherits the difference, 3e-5 on a [0, 1] scale. Cheap at this size and it
+    # makes the fast path bit-exact against the numpy one.
+    q = torch.quantile(v.flatten().double(),
+                       torch.tensor([0.01, 0.9999], device=dev,
+                                    dtype=torch.float64))
+    lo, hi = float(q[0]), float(q[1])
+    # In float64 for the same reason: `normalise_frame` divides a float32 array
+    # by float64 scalars, and numpy promotes the whole expression, narrowing
+    # only when the patches are written into a float32 buffer. Doing it in
+    # float32 here leaves a 1-ulp difference on every voxel.
+    v = ((v.double() - lo) / (hi - lo + 1e-6)).clamp_(0.0, 1.0)
+    flat = v.reshape(-1)
+
+    c = torch.as_tensor(np.asarray(centres, np.float32), device=dev)
+    oz = torch.arange(depth, device=dev, dtype=torch.float32) - (depth - 1) / 2.0
+    oy = torch.arange(py, device=dev, dtype=torch.float32) - (py - 1) / 2.0
+    ox = torch.arange(px, device=dev, dtype=torch.float32) - (px - 1) / 2.0
+    gy, gx = torch.meshgrid(oy, ox, indexing="ij")
+
+    out = torch.empty((n, depth, py, px), dtype=torch.float32, device=dev)
+    for s in range(0, n, chunk):
+        cc = c[s:s + chunk]
+        m = cc.shape[0]
+        iz = torch.round(cc[:, 0][:, None, None, None] + oz[None, :, None, None]
+                         ).to(torch.int64).expand(m, depth, py, px)
+        iy = torch.round(cc[:, 1][:, None, None, None] + gy[None, None]
+                         ).to(torch.int64).expand(m, depth, py, px)
+        ix = torch.round(cc[:, 2][:, None, None, None] + gx[None, None]
+                         ).to(torch.int64).expand(m, depth, py, px)
+        inside = ((iz >= 0) & (iz < Z) & (iy >= 0) & (iy < Y)
+                  & (ix >= 0) & (ix < X))
+        idx = ((iz.clamp(0, Z - 1) * Y + iy.clamp(0, Y - 1)) * X
+               + ix.clamp(0, X - 1))
+        out[s:s + m] = torch.where(inside, flat[idx],
+                                   torch.zeros((), device=dev))
+    return out.reshape(n, n_frames, pz, py, px)
+
+
 def normalise_coords(coords: np.ndarray, shape_zyx) -> np.ndarray:
     """Voxel coordinates -> [-1, 1] per axis, for the positional MLP.
 

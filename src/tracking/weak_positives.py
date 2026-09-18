@@ -70,15 +70,52 @@ def greedy_nms(
             keep &= (d2 >= r2).all(dim=1)
         idx = idx[keep]
 
+    # Every survivor with no higher-scoring survivor inside the radius wins
+    # *this* round, not just the brightest one. That is the same answer the
+    # one-at-a-time loop gives -- a point the loop would emit later is exactly
+    # one that nothing above it suppresses, and a point it would suppress has,
+    # by definition, a higher survivor within r -- and it converges in rounds
+    # proportional to the longest suppression chain rather than to the number
+    # of peaks. On this data that is 2-4 rounds against ~930.
+    #
+    # Round count is what matters because each one costs a device-to-host sync
+    # (`.numel()` on a CUDA tensor), and at ~20 us a sync the old loop spent
+    # more time waiting than computing: 23 ms a frame for work the GPU does in
+    # a fraction of that.
+    #
+    # The n x n neighbour test is chunked over rows so the temporary stays
+    # bounded; `CHUNK` rows against every survivor is the whole cost.
+    CHUNK = 4096
     out: list[torch.Tensor] = []
     while idx.numel():
-        i0 = idx[0]                      # brightest survivor: P is score-sorted
-        out.append(i0)
-        d2 = ((P[idx] - P[i0]) ** 2).sum(dim=1)
-        idx = idx[d2 >= r2]
+        Pi = P[idx]
+        dominated = torch.zeros(idx.numel(), dtype=torch.bool, device=dev)
+        for s in range(0, idx.numel(), CHUNK):
+            block = Pi[s:s + CHUNK]
+            d2 = torch.cdist(block, Pi) ** 2
+            # Strictly higher score = strictly earlier in the score-sorted
+            # order, so "is there a better one within r" is a lower column
+            # index. The diagonal is distance 0 but never strictly earlier, so
+            # a point cannot dominate itself.
+            better = torch.arange(idx.numel(), device=dev)[None, :] < \
+                torch.arange(s, s + block.shape[0], device=dev)[:, None]
+            dominated[s:s + block.shape[0]] = ((d2 < r2) & better).any(dim=1)
+        winners = idx[~dominated]
+        out.append(winners)
+        if not winners.numel():
+            break                        # cannot happen: the top point always wins
+        # Everything inside r of a winner is now suppressed.
+        keep = torch.ones(idx.numel(), dtype=torch.bool, device=dev)
+        Pw = P[winners]
+        for s in range(0, idx.numel(), CHUNK):
+            d2 = torch.cdist(Pi[s:s + CHUNK], Pw) ** 2
+            keep[s:s + d2.shape[0]] = (d2 >= r2).all(dim=1)
+        idx = idx[keep]
     if not out:
         return torch.zeros(0, dtype=torch.long, device=dev)
-    return order[torch.stack(out)]
+    kept = torch.cat(out)
+    # Score order, so the result is the sequence the one-at-a-time loop emits.
+    return order[kept.sort().values]
 
 
 def _is_local_max_at(
