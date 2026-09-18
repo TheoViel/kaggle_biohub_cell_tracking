@@ -253,6 +253,7 @@ def evaluate(
     gt_graph: td.graph.BaseGraph,
     scale: tuple[float, ...] | None = None,
     max_distance: float = 7.0,
+    mark_gt: bool = True,
 ) -> EvaluationResult:
     """
     Evaluate a predicted graph against a ground-truth graph using
@@ -277,6 +278,15 @@ def evaluate(
         account for anisotropy. If None, assumes isotropic data.
     max_distance : float, optional
         Maximum distance between centroids to be considered as a match.
+    mark_gt : bool, optional
+        Write the per-edge false-negative mask onto *gt_graph* (the side effect
+        described above). None of the counts returned here read it -- they come
+        from the predicted graph's own mask and the GT edge count -- so a caller
+        that only wants the numbers can turn it off. It is not free: it maps a
+        Python dict over every GT edge and rewrites the attribute, which on a
+        parameter sweep is the bulk of this function for a result nothing looks
+        at. Leave it on for a viewer or an error breakdown (`diagnose.py`,
+        `analysis_flow.py`, `explore.py`).
 
     Returns
     -------
@@ -286,7 +296,8 @@ def evaluate(
 
     # Match graph against gt_graph (in place); discard the returned score.
     _evaluate(graph, gt_graph, "jaccard", scale, max_distance)
-    _mark_gt_matched_edges(graph, gt_graph)
+    if mark_gt:
+        _mark_gt_matched_edges(graph, gt_graph)
 
     if graph.num_edges() == 0:
         edge_tp = 0

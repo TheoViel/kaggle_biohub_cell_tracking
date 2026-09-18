@@ -47,8 +47,12 @@ from utils.logger import create_logger, prepare_log_folder
 
 DEFAULTS = {
     # Global
-    # "nodes_folder": "../logs/2026-09-13/1/preds_r6_0.40/",   # <- 0.8699
-    "nodes_folder": "../logs/2026-09-14/4/preds_r6_0.40/",   # TO RUN - bigger crops
+    # The best chain to date: this node set + the 2026-09-09_1 embeddings is
+    # `edge_run/2026-09-13/0`, cv 0.8719 at `preds_0.45_pp_ilp` -- the top row
+    # of Experiments.md. Its detector is `logs/2026-09-13/1`, whose own defaults
+    # main_track.py now carries.
+    "nodes_folder": "../logs/2026-09-13/1/preds_r6_0.40/",   # <- cv 0.8719
+    # "nodes_folder": "../logs/2026-09-14/4/preds_r6_0.40/",   # bigger crops
 
     "embeddings_key": "embeddings_contrastive_2026-09-09_1",
     # "embeddings_key": "embeddings_contrastive_2026-09-14_0",  # 3 frames, 2026-09-13/1/preds_r6_0.40

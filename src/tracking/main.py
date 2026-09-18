@@ -382,6 +382,26 @@ def _apply_stage(args, name: str):
         if isinstance(value, dict) and isinstance(base, dict):
             value = {**base, **value}
         setattr(stage_args, key, value)
+
+    # Optimiser keys named directly in a stage block override `optimizer_config`
+    # for that stage alone. They need naming here because the dict-merge above
+    # cannot reach them: `lr` is a flat key in a stage block and a nested one in
+    # `optimizer_config`, so setting it in a stage would otherwise land on
+    # `stage_args.lr`, which nothing reads.
+    #
+    # This is the difference between "finetune the backbone gently" and "train
+    # everything gently". A pretraining stage resuming from someone else's
+    # checkpoint wants a low rate and a long warmup; stage 3, whose transformer
+    # is at init because `load_weights` drops `transformer.`, emphatically does
+    # not -- at 1e-4 with half the budget as warmup it reaches edge_jac 0.35
+    # where 1e-3 reaches 0.75. Moving the global config to suit the first stage
+    # is what broke the second in 2026-09-17/4 and /6.
+    block = _stage(args, name)
+    tuned = {k: block[k] for k in ("lr", "warmup_prop", "weight_decay")
+             if block.get(k) is not None}
+    if tuned:
+        stage_args.optimizer_config = {**args.optimizer_config, **tuned}
+
     stage_args.stage = name
     return stage_args
 
@@ -645,10 +665,12 @@ def _train_one(
             : int(synth_cfg.get("n_val_videos") or 1)
         ]
         synth_args.eval_edge_mode = "nearest"
+        # From the stage's config, not the global one: `_apply_stage` may have
+        # replaced `lr` with this stage's, and both groups follow that rate.
         synth_args.optimizer_config = {
-            **args.optimizer_config,
-            "lr_unet": args.optimizer_config["lr"],
-            "lr_transformer": args.optimizer_config["lr"],
+            **synth_args.optimizer_config,
+            "lr_unet": synth_args.optimizer_config["lr"],
+            "lr_transformer": synth_args.optimizer_config["lr"],
         }
 
         uses_weak = bool(synth_args.loss_config.get("det_use_weak_positives"))
@@ -748,10 +770,12 @@ def _train_one(
         ]
 
         seg_args.eval_edge_mode = "nearest"
+        # See stage 1: the stage's own `lr` if it named one, and both param
+        # groups follow it.
         seg_args.optimizer_config = {
-            **args.optimizer_config,
-            "lr_unet": args.optimizer_config["lr"],
-            "lr_transformer": args.optimizer_config["lr"],
+            **seg_args.optimizer_config,
+            "lr_unet": seg_args.optimizer_config["lr"],
+            "lr_transformer": seg_args.optimizer_config["lr"],
         }
 
         if ctx.is_main:

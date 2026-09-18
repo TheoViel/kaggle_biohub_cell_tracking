@@ -112,9 +112,9 @@ DEFAULTS = {
 
     # Model
     # "temporal" (two-conv), "resenc" (nnU-Net ResEnc), or a temporal_v* model.
-    "unet_arch": "temporal_v4",
+    "unet_arch": "temporal_v2",  # "temporal"
     "unet_out_channels": 32,
-    "unet_layers": (32, 64, 128),  # (64, 128, 256),
+    "unet_layers": (32, 64, 128),  # (32, 64, 128),
     "unet_pool_stride": (1, 2, 2),    # pool Y/X only; full-scale Z preserved
     "unet_n_anisotropic": 2,          # downsampling steps using unet_pool_stride
     # Decoder
@@ -150,7 +150,7 @@ DEFAULTS = {
     "unet_spatial_attention_reduction": 4,      # "pooled": K/V conv stride
     "unet_spatial_attention_window": (4, 8, 8),  # "window": the attended window
     # Encoder
-    "unet_blocks_per_stage": (2, 2, 3),    # (1, 3, 4) residual depth per stage;  None = two-conv blocks
+    "unet_blocks_per_stage": (3, 3, 3),    # residual depth per stage;  None = two-conv blocks
     "unet_stem": "unshuffle",         # "unshuffle" keeps every voxel, "stride" drops 3 in 4
     "unet_norm": "batch",             # "batch" / "instance" / "group"
     "unet_hires_fusion": True,       # feed the skips finer than the head's grid into the head
@@ -259,16 +259,17 @@ DEFAULTS = {
     # Stage 1.5 - Pretraining
     "pretraining": {
         "enabled": True,
-        # "weights": "../logs/2026-09-13/1/fold_0/ckpt_synthetic.pt",  # "../logs/2026-09-09/4/fold_0/ckpt_synthetic.pt",
-        # "weights": "../logs/2026-09-10/0/fold_0/ckpt_synthetic.pt",
-        "weights": None,  # "../logs/2026-09-11/3/fold_*/ckpt_pretrain.pt",
+        # "weights": "../logs/2026-09-13/1/fold_0/ckpt_synthetic.pt",  # temporal wide
+        "weights": "../logs/2026-09-15/0/fold_0/ckpt_synthetic.pt",  # temporal_v2
+        # "weights": "../logs/2026-09-13/1/fold_*/ckpt_pretrain.pt",  # "../logs/2026-09-11/3/fold_*/ckpt_pretrain.pt",
+        # "weights": None,
         # Data
-        "crop_size": (32, 128, 128),
+        "crop_size": (32, 128, 128),  # (48, 192, 192)
         "aug_strength": 3,
         "synthetic_dir": "../input/synthetic/v4/",
         "synthetic_proportion": 0.5,
         # Training
-        "iterations": 5000,
+        "iterations": 10000,
         "epochs": None,
         "batch_size": 16,
         "loss_config": {
@@ -281,6 +282,9 @@ DEFAULTS = {
         # Eval
         "n_val_videos": 5,
         "eval_every": 500,
+        # # lr
+        # "lr": 1e-4,
+        # "warmup_prop": 0.5,
     },
 
     # Stage 2 - Contrastive - Built and trained only when "contrastive" is in unet_features.

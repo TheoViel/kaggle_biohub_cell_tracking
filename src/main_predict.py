@@ -90,7 +90,18 @@ def parse_args():
     p.add_argument("--max_frames", type=int, default=None)
     p.add_argument("--n_videos", type=int, default=None,
                    help="cap the number of stacks (debugging)")
+    p.add_argument("--skip_existing", "--skip-existing", action="store_true",
+                   help="do not re-run the model on a stack whose npz is "
+                        "already written for every point of the sweep grid. The "
+                        "saved predictions are re-scored, so the metrics and "
+                        "the sweep summary still cover every stack -- what is "
+                        "skipped is the forward pass, not the stack")
 
+    p.add_argument("--annot_head", action="store_true",
+                   help="also sweep and write the annotation head's node sets "
+                        "(`_annot_head` folders). Off by default: it doubles "
+                        "every radius x threshold point, and the edge model is "
+                        "fitted on the detection head. Turn on to compare them.")
     p.add_argument("--pl", action="store_true",
                    help="pseudo-labelling: predict on the fold's TRAIN embryos "
                         "instead of its val one, writing to <log_folder>/preds_pl")
@@ -426,23 +437,46 @@ def _predict_fold(
 
     for i, path in enumerate(mine):
         name = path.name
-        # One UNet pass over the video answers the whole threshold x radius
-        # grid. The raw detection logits are not needed here, and keeping them
-        # would hold a full-resolution volume per window in memory.
-        per_key, _ = predict_video_thresholds(
-            model,
-            path,
-            thresholds,
-            device=device,
-            cfg=pred_cfg,
-            window_size=window_size,
-            downscale_factor=downscale_factor,
-            max_frames=args.max_frames,
-            progress=False,
-            return_det_logits=False,
-            nms_radii=radii,
-            heads=heads,
-        )
+        # Only when every point of the grid is on disk: one forward answers the
+        # whole grid, so a stack missing any one of them has to be run anyway
+        # and the rest are rewritten as a side effect.
+        cached = args.skip_existing and all(
+            (out_dirs[key] / f"{name}.npz").exists() for key in keys)
+
+        if cached:
+            per_key = {}
+            for key in keys:
+                with np.load(out_dirs[key] / f"{name}.npz") as npz:
+                    # Only the two the scoring below reads. The probability
+                    # columns are the file's own output, not an input to it, so
+                    # re-reading them to hand them straight back would just be
+                    # ceremony.
+                    #
+                    # Back to tuples, because `build_graph` indexes its node
+                    # list with `src` and a numpy float is not a list index --
+                    # the saved column is float64, holding two ids and two
+                    # scores in one array.
+                    edges = [(int(s), int(t), float(p), float(d))
+                             for s, t, p, d in npz["edges"].reshape(-1, 4)]
+                    per_key[key] = (npz["coords"], edges, None, None, None)
+        else:
+            # One UNet pass over the video answers the whole threshold x radius
+            # grid. The raw detection logits are not needed here, and keeping them
+            # would hold a full-resolution volume per window in memory.
+            per_key, _ = predict_video_thresholds(
+                model,
+                path,
+                thresholds,
+                device=device,
+                cfg=pred_cfg,
+                window_size=window_size,
+                downscale_factor=downscale_factor,
+                max_frames=args.max_frames,
+                progress=False,
+                return_det_logits=False,
+                nms_radii=radii,
+                heads=heads,
+            )
 
         gt = td.graph.IndexedRXGraph.from_geff(train_dir / f"{name}.geff")
         gt_graph = gt[0] if isinstance(gt, tuple) else gt
@@ -458,23 +492,24 @@ def _predict_fold(
             head, radius, th = key
             coords, edges, node_probs, annot_probs, coords_f = per_key[key]
 
-            np.savez_compressed(
-                out_dirs[key] / f"{name}.npz",
-                coords=coords,
-                edges=np.asarray(edges, dtype=np.float64).reshape(-1, 4),
-                # Row-aligned with coords: the detection head's probability at
-                # each peak. The threshold above only says a node cleared it,
-                # and by how much is exactly what a consumer wanting to
-                # discount a shaky detection needs.
-                node_probs=np.asarray(node_probs, dtype=np.float32).reshape(-1),
-                # All-NaN on a model with no annotation head; the column is
-                # always written so a consumer can test for it once.
-                annot_probs=np.asarray(annot_probs, dtype=np.float32).reshape(-1),
-                # Pre-round positions, row-aligned with `coords`. Fusing two
-                # heads or two offset votes has to happen in float; see
-                # _rescale_coords.
-                coords_f=np.asarray(coords_f, dtype=np.float32).reshape(-1, 4),
-            )
+            if not cached:
+                np.savez_compressed(
+                    out_dirs[key] / f"{name}.npz",
+                    coords=coords,
+                    edges=np.asarray(edges, dtype=np.float64).reshape(-1, 4),
+                    # Row-aligned with coords: the detection head's probability
+                    # at each peak. The threshold above only says a node cleared
+                    # it, and by how much is exactly what a consumer wanting to
+                    # discount a shaky detection needs.
+                    node_probs=np.asarray(node_probs, dtype=np.float32).reshape(-1),
+                    # All-NaN on a model with no annotation head; the column is
+                    # always written so a consumer can test for it once.
+                    annot_probs=np.asarray(annot_probs, dtype=np.float32).reshape(-1),
+                    # Pre-round positions, row-aligned with `coords`. Fusing two
+                    # heads or two offset votes has to happen in float; see
+                    # _rescale_coords.
+                    coords_f=np.asarray(coords_f, dtype=np.float32).reshape(-1, 4),
+                )
 
             # build_graph is chatty on some builds; keep the log readable.
             with contextlib.redirect_stdout(io.StringIO()):
@@ -510,7 +545,8 @@ def _predict_fold(
             )
 
         print(
-            f"[rank {ctx.rank}] {i + 1:02d}/{len(mine):02d}  -  {name}  -  " + "  ".join(reported),
+            f"[rank {ctx.rank}] {i + 1:02d}/{len(mine):02d}  -  {name}  -  "
+            + ("[cached]  " if cached else "") + "  ".join(reported),
             flush=True,
         )
 
@@ -532,11 +568,20 @@ def main():
     # Read before the grid is built: whether the run has an annotation head
     # decides how many points there are.
     cfg = Config(json.load(open(log_folder + "args.json")))
-    # A model with one is swept on both heads: the two heatmaps come out of a
-    # single forward, so the second costs only its NMS and edge passes, and
-    # running them side by side is what makes "is this a cell" and "would an
-    # annotator have labelled it" comparable as detectors.
-    heads = ("det", "annot") if bool(getattr(cfg, "annot_head", False)) else ("det",)
+    # Both heads only on request. The two heatmaps do come out of one forward,
+    # but the second head still pays a full NMS, edge and write pass at every
+    # radius x threshold point, which doubles the grid -- and `annot_head` has
+    # been on in every run since 2026-09-11, so that was the default cost of a
+    # sweep. Nothing downstream consumes the `_annot_head` node sets: the edge
+    # model is fitted on "det" and `predict_video_thresholds` is asked for
+    # "det". Turn it on to compare the two as detectors, which is the question
+    # it was added for.
+    want_annot = bool(getattr(args, "annot_head", False))
+    has_annot = bool(getattr(cfg, "annot_head", False))
+    if want_annot and not has_annot and ctx.is_main:
+        print("-> --annot_head requested but this run has no annotation head; "
+              "writing the detection head only")
+    heads = ("det", "annot") if (want_annot and has_annot) else ("det",)
     # The grid, in the order everything downstream iterates it.
     keys = [(h, r, th) for h in heads for r in radii for th in thresholds]
 
@@ -607,6 +652,9 @@ def main():
         print(f"-> nms radii (um) : {', '.join(f'{r:g}' for r in radii)}"
               f"{'  (one forward pass for the whole grid)' if sweeping else ''}")
         print(f"-> writing to      : {', '.join(str(d) for d in out_dirs.values())}")
+        if args.skip_existing:
+            print("-> skip_existing  : stacks already written for every grid "
+                  "point are re-scored, not re-predicted")
         if ctx.distributed:
             print(f"-> distributed    : {ctx.world_size} processes\n")
 

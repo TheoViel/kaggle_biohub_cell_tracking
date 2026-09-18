@@ -59,6 +59,13 @@ def main():
     # mysteriously weak model rather than as an error.
     scores = np.full(len(table), np.nan, np.float32)
     for embryo, (model, cfg) in sorted(models.items()):
+        # A candidates file restricted to one fold -- which is how a sweep on
+        # fold 0 is generated -- has nothing for the other embryo's model. The
+        # length check below passes (0 == 0) and the empty loader then reaches
+        # `torch.cat([])`, so say so here instead.
+        if not any(s.startswith(embryo) for s in stems):
+            print(f"  skip {embryo}: no rows in this candidates file", flush=True)
+            continue
         ds = DivisionDataset(
             args.data_dir, embryos=[embryo], candidates=args.candidates,
             candidates_labelled_only=False, augment=False,

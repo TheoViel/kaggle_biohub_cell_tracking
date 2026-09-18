@@ -476,6 +476,7 @@ def propose_divisions(
     div_prob=None,
     div_prob_min=0.0,
     div_prob_rank=True,
+    steal_margin=None,
     return_stats=False,
 ):
     """Give a parent a second child where the geometry says a cell divided.
@@ -490,9 +491,10 @@ def propose_divisions(
     of the family. A parent already holding exactly one committed child may take
     a second one when every one of these holds:
 
-    * the second child is **free** -- nothing has claimed it as a child. This is
-      not a tunable: a node with two parents is an invalid lineage, and it is
-      also what keeps the stage from stealing a link the assignment made.
+    * the second child is **free** -- nothing has claimed it as a child. A node
+      with two parents is an invalid lineage, so a claimed node can only be
+      taken by *moving* the link, never by adding a second one: that is
+      ``steal_margin``, off by default and described below.
     * ``min_prob`` -- the model's own probability for the parent/second-child
       pair. **This gate is ours, not the notebook's**: 946 proposes on geometry
       alone (it has no scored candidate graph), while here every pair carries a
@@ -538,6 +540,51 @@ def propose_divisions(
     for 44b6, 125 in 128 for 6bba -- so an uncapped stage that fires on 1% of
     parents is wrong whatever its gates say.
 
+    ``steal_margin`` lifts the free-child restriction, at a price. With it set,
+    a node the assignment already gave to another parent may be taken as the
+    second daughter, and the edge that held it is **deleted** -- the lineage
+    stays valid because the link moves rather than duplicates. The price is
+    that probability difference: a steal is proposed only when
+
+        p(new parent -> q)  -  p(old parent -> q)  >=  steal_margin
+
+    so 0.0 takes any pair the model likes at least as much as the assignment
+    did, and a positive value demands the model actively prefer the fork. The
+    old parent is left a track end, which is the cost the caps and the gates
+    then have to justify.
+
+    **MEASURED NEGATIVE on fold 0 -- off, and kept for the result.** It was
+    built to lift a ceiling it does not lift, and the measurement says why.
+
+    All 26 annotated divisions are reachable after `recover`: every one has a
+    parent holding exactly one committed child, and that child is a true
+    daughter. In 12 of them the *other* daughter is already claimed, which is
+    exactly this knob's case -- and taking it moves nothing:
+
+        arm                                    forks    divisions in pool
+        production gates                        6 481          6
+        steal 0.0 / 0.1 / -0.1              6.5k-6.9k          6
+        ungated gates, no steal                52 537         11
+        ungated + steal 0.0                    52 710         11
+        steal -1.0 + min_prob 0.02 + ungated  454 012          8
+
+    Two gates bind independently on those 12, and opening one alone reaches
+    none of them: the model scores the true second daughter a median **0.139**
+    against `min_prob` 0.3 (9 of 12 rejected), while scoring the assignment's
+    competing edge for the same node 0.713, so the price rejects 9 of 12 too.
+
+    Opening both is worse than not stealing, and the mechanism is intrinsic:
+    this stage only considers a parent holding exactly one child, and every
+    steal *deletes* some other parent's link. At a permissive price thousands
+    of tracks lose their only child and stop being eligible to propose at all,
+    taking true divisions with them -- 11 down to 8. Stealing for one division
+    costs the eligibility of others. (`min_prob` 0.02 without stealing also
+    scores 11, so the floor is not what loses them; the steal is.)
+
+    The binding constraint is upstream of every knob here: the edge model does
+    not believe these links. Nothing in post-processing can rank what it scores
+    at 0.139 against a 0.713 alternative.
+
     Runs *before* ``prune_short``: attaching a free detection to a parent puts
     it in that parent's component, so a second daughter that would have been
     pruned as a fragment survives on the strength of the link.
@@ -552,6 +599,10 @@ def propose_divisions(
         # no committed child at t+2 to measure the separation with at all.
         "divergence_no_grandchild", "divergence_too_close",
         "prob_cls_rejected", "proposals", "capped", "added",
+        # `steal_margin` only. `steal_candidates` counts claimed nodes that
+        # reached the margin test at all, so a zero there means the stage never
+        # saw a claimed node worth trying rather than that the price was wrong.
+        "steal_candidates", "steal_margin_rejected", "stolen",
     )}
     cls = None if div_prob is None else np.asarray(div_prob, float).ravel()
     if cls is not None and len(cls) != len(coords):
@@ -574,6 +625,11 @@ def propose_divisions(
     only_child[src[n_children[src] == 1]] = tgt[n_children[src] == 1]
     has_parent = np.zeros(len(coords), bool)
     has_parent[tgt] = True
+    # Which edge row holds each claimed node, so a steal can delete exactly the
+    # link it replaces. Last writer wins, which matches `has_parent`: a node
+    # claimed twice is already malformed and either row is as wrong as the other.
+    parent_row = np.full(len(coords), -1, np.int64)
+    parent_row[tgt] = np.arange(len(edges))
 
     # The model's opinion on every pair it scored, for the min_prob gate.
     cand = np.asarray(cand, float).reshape(-1, 5)
@@ -588,6 +644,7 @@ def propose_divisions(
 
     added = []
     used_parents, used_children = set(), set()
+    stolen_rows: set[int] = set()
     for t in sorted(by_frame):
         if len(added) >= global_cap:
             break
@@ -596,11 +653,16 @@ def propose_divisions(
             continue
         parents = [int(r) for r in by_frame[t]
                    if only_child[r] >= 0 and frame_of[only_child[r]] == t + 1]
-        free = [int(r) for r in rows_next if not has_parent[r]]
+        # With a steal price, a claimed node is a candidate too -- and it has to
+        # be in the KD-tree as well, or `require_mutual_nn` would keep answering
+        # with the nearest *free* node and the steal would never be reachable
+        # through the gate that matters most.
+        free = [int(r) for r in rows_next
+                if not has_parent[r] or steal_margin is not None]
         if not parents or not free:
             continue
         stats["eligible_parents"] += len(parents)
-        stats["free_children"] += len(free)
+        stats["free_children"] += sum(1 for r in free if not has_parent[r])
 
         free_pos = p_um[free]
         tree = cKDTree(free_pos)
@@ -615,8 +677,33 @@ def propose_divisions(
             # 946 queries with the *first child's* position, not the parent's:
             # the second daughter is the free node nearest its sister.
             if require_mutual_nn:
-                _, idx = tree.query(p_um[child])
-                queries = [free[int(idx)]]
+                # The node nearest the first child -- one free, and with
+                # `steal_margin` also one claimed, as *separate* candidates.
+                #
+                # Both halves of that are load-bearing. The first child is itself
+                # a claimed node at distance zero from the query point, so a
+                # plain nearest query answers "the child", the `q == child` guard
+                # drops it and the stage proposes nothing. And taking simply the
+                # nearest non-child node lets a claimed one occupy the single
+                # slot this gate allows, so enabling steals *removes* free-node
+                # proposals that would have passed -- measured as forks going
+                # 1257 -> 913 with the price attached. A steal has to be an extra
+                # option, never a substitute.
+                k = min(8, len(free))
+                _, idx = tree.query(p_um[child], k=k)
+                queries, want_free, want_claimed = [], True, steal_margin is not None
+                for i in np.atleast_1d(idx):
+                    q_i = free[int(i)]
+                    if q_i == child:
+                        continue
+                    if not has_parent[q_i] and want_free:
+                        queries.append(q_i)
+                        want_free = False
+                    elif has_parent[q_i] and want_claimed:
+                        queries.append(q_i)
+                        want_claimed = False
+                    if not want_free and not want_claimed:
+                        break
             else:
                 queries = [free[i] for i in tree.query_ball_point(p_um[parent], max_parent_um)]
 
@@ -627,6 +714,21 @@ def propose_divisions(
                 if prob < min_prob:
                     stats["prob_rejected"] += 1
                     continue
+                # A claimed node costs the link that holds it. Priced here,
+                # before the geometry gates, so `steal_margin_rejected` counts
+                # pairs the price turned down rather than ones the geometry
+                # would have refused anyway.
+                steal_from = -1
+                if has_parent[q]:
+                    row = int(parent_row[q])
+                    old_parent = int(edges[row, 0]) if row >= 0 else -1
+                    if row < 0 or old_parent == parent:
+                        continue
+                    stats["steal_candidates"] += 1
+                    if prob - float(edges[row, 2]) < steal_margin:
+                        stats["steal_margin_rejected"] += 1
+                        continue
+                    steal_from = row
                 # The classifier's view of the parent. `nan` means unscored --
                 # not "not dividing" -- so it passes the gate and falls back to
                 # the geometric ranking below.
@@ -659,17 +761,28 @@ def propose_divisions(
                 # division outranks a merely tight pair.
                 order_key = (-p_cls if (div_prob_rank and p_cls == p_cls)
                              else parent_dist + 0.15 * sister_dist)
-                proposals.append((order_key, parent, q, prob, parent_dist))
+                proposals.append((order_key, parent, q, prob, parent_dist,
+                                  steal_from))
 
         stats["proposals"] += len(proposals)
         proposals.sort(key=lambda item: item[0])
         added_here = 0
-        for _, parent, q, prob, parent_dist in proposals:
+        for _, parent, q, prob, parent_dist, steal_from in proposals:
             if len(added) >= global_cap or added_here >= frame_cap:
                 stats["capped"] += 1
                 break
-            if q in used_children or has_parent[q] or parent in used_parents:
+            # `has_parent[q]` is not a refusal for a steal -- being claimed is
+            # the case it exists for -- but `used_children` still is: two
+            # parents cannot both take the same node in one pass.
+            if q in used_children or parent in used_parents:
                 continue
+            if has_parent[q] and steal_from < 0:
+                continue
+            if steal_from >= 0:
+                if steal_from in stolen_rows:
+                    continue        # already moved this frame; do not double-spend
+                stolen_rows.add(steal_from)
+                stats["stolen"] += 1
             added.append((parent, q, prob, parent_dist))
             used_children.add(q)
             used_parents.add(parent)
@@ -677,6 +790,12 @@ def propose_divisions(
             added_here += 1
 
     stats["added"] = len(added)
+    if stolen_rows:
+        # Delete before appending: the rows the steals replaced are indices into
+        # the array as it was, and appending first would shift nothing but makes
+        # the intent harder to read.
+        edges = edges[np.setdiff1d(np.arange(len(edges)),
+                                   np.fromiter(stolen_rows, np.int64))]
     if added:
         edges = np.vstack([edges, np.asarray(added, float)])
     return (edges, stats) if return_stats else edges

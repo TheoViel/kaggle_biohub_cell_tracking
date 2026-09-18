@@ -59,7 +59,8 @@ import main_edge_postprocess as MEP  # noqa: E402
 warnings.filterwarnings("ignore")
 
 ILP_KEYS = ("ilp_threshold", "ilp_edge_weight", "ilp_appearance",
-            "ilp_disappearance", "ilp_division", "ilp_keep_edges")
+            "ilp_disappearance", "ilp_division", "ilp_keep_edges",
+            "ilp_node_weight")
 
 
 def _job(task):

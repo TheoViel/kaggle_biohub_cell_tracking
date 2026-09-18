@@ -129,6 +129,18 @@ that mattered for a classifier reading appearance.
 | `main.py` | loaders, model build, per-embryo cross-validation |
 | `../main_division.py` | entrypoint and defaults |
 
+The fork-candidate pipeline — the arm that pays, see "In post-processing,
+part 2":
+
+| file | what it is |
+|---|---|
+| `gen_fork_candidates.py` | every fork the chain proposes, labelled against the annotation; `FORK_CFG` is the chain config they are generated under |
+| `score_forks.py` | score them with the out-of-fold model |
+| `merge_fork_scores.py` | combine several models' scores into one table |
+| `tune_fork_threshold.py` | drop forks below tau, reprune, evaluate — this is where the gate is applied |
+| `compare_division_arms.py` | the arm-by-arm table in `logs/fork_cls/` |
+| `eval_fork_model.sh` | the four steps end to end |
+
 ---
 
 ## Measured
@@ -325,6 +337,57 @@ so about **+0.004 cv** -- the whole return is conditional on that one model.
 Ranking by the classifier instead of by `parent_dist + 0.15 * sister_dist`
 changes nothing (0.8436 vs 0.8437), because the caps are not binding: 3 113 of
 3 136 proposals are accepted, so the order barely decides anything.
+
+### In post-processing, part 2: gating the chain's own forks
+
+This is the arm that pays, and it supersedes the per-node gate above. Rather
+than scoring annotated cells and gating `propose_divisions`, it scores **the
+forks the chain actually proposes** — the ILP's, harvested with
+`ilp_div_forks` — and deletes the ones it disbelieves. Full numbers, all
+arms and every threshold, in **`logs/fork_cls/division_comparison_reprune.md`**
+(and `division_comparison.md` for the same sweep before repruning), written by
+`compare_division_arms.py` over 199 stacks.
+
+Macro, both embryos:
+
+| arm | cv | adj | div_J | tp | fp | fn |
+|---|---|---|---|---|---|---|
+| no divisions | 0.8574 | 0.8574 | 0.0000 | 0 | 0 | 151 |
+| production | 0.8719 | 0.8575 | 0.1449 | 32 | 51 | 119 |
+| gated forks tau=0.5 | 0.8750 | 0.8526 | 0.2239 | 52 | 76 | 99 |
+| **gated tau=0.5 + reprune** | **0.8788** | **0.8564** | 0.2233 | 52 | 77 | 99 |
+| ungated forks | 0.8487 | 0.8451 | 0.0353 | 82 | 2309 | 69 |
+
+**+0.0069 macro over production**, and positive on both embryos — 44b6
+0.9010 → 0.9094, 6bba 0.8429 → 0.8481. The division term nearly doubles
+(0.1449 → 0.2233) and `adj` gives back only 0.0011.
+
+**Reprune is not optional; it is most of the gain.** `prune_short` runs while
+every fork is still in the graph, so a fragment rescued by a fork the
+classifier then rejects is left stranded — with its own edges, which are scored
+false positives. The node columns show it: gating alone leaves +63 803 nodes
+and +644 scored edge FPs against the no-divisions reference, and re-running the
+filter afterwards cuts those to +2 217 and +214. That is worth +0.0038 macro
+(0.8750 → 0.8788) and is what makes 6bba positive at all: without it that
+embryo reads −0.0005 and the whole result is one embryo's.
+
+**The threshold is inert.** tau 0.1 through 0.7 give the same macro cv to four
+decimals, because the CNN saturates — positives median 1.000, negatives 0.000.
+A gain that survives a 7x range of its own threshold is not a fitted one. Only
+tau=0.9 moves, and it moves down.
+
+**The `ungated forks` row is the argument for the classifier in one line.** The
+ILP's raw proposals score 0.8487, *below* the no-divisions reference: 107 613
+forks find 82 of 151 divisions and bring 2 309 false ones. Recall was never
+the constraint.
+
+Caveats. One seed, and the noise floor above applies. The reprune arm is
+measured at a single tau. `Summary.md`'s division section still reports the
+pre-reprune +0.0030 with 6bba flat, so it contradicts this table and is the
+stale copy. And no end-to-end CLI run has written a `scores_pp.json` for this
+variant — the gate lives in `tune_fork_threshold.py`, not in
+`main_edge_postprocess.py`, so it is not yet reachable from the production
+chain.
 
 ### Synthetic divisions hurt
 

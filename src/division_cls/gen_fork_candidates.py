@@ -126,19 +126,18 @@ def _label_forks(parents_zyx, gt_nodes, gt_divides, gt_has_child, max_distance=7
     return labels
 
 
-def _one(stem_pred):
-    stem, pred_dir, data_dir = stem_pred
-    z = np.load(Path(pred_dir) / f"{stem}.npz")
-    cfg = dict(MEP.DEFAULTS)
-    cfg.update(out_dir="", geff_dir="", no_score=True, assign=1)
-    cfg.update(FORK_CFG)
-    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-        coords, edges = MEP.postprocess(
-            z["coords"].astype(np.float64), np.empty((0, 4)),
-            np.asarray(z["candidates"], float).reshape(-1, 5), cfg)
+def forks_table(coords, edges):
+    """`(coords, edges)` -> one row per (parent, non-top child), label column 0.
+
+    Split out of `_one` so that anything re-deriving the pool under a different
+    chain config -- `sweep_candidates.py` -- enumerates forks the same way this
+    does. Two implementations of "what counts as a fork" would be two different
+    datasets wearing one name, and the classifier's scores are keyed on the
+    rows this produces.
+    """
     edges = np.asarray(edges, float).reshape(-1, 4)
     if not len(edges):
-        return stem, np.zeros((0, len(COLUMNS)), np.float32)
+        return np.zeros((0, len(COLUMNS)), np.float32)
 
     src = edges[:, 0].astype(int)
     order = np.argsort(-edges[:, 2], kind="stable")
@@ -163,16 +162,35 @@ def _one(stem_pred):
                 *coords[first, 1:], *coords[q, 1:],                # c1 zyx, c2 zyx
             ))
     if not rows:
-        return stem, np.zeros((0, len(COLUMNS)), np.float32)
-    table = np.asarray(rows, np.float32)
+        return np.zeros((0, len(COLUMNS)), np.float32)
+    return np.asarray(rows, np.float32)
 
+
+def label_table(table, stem, data_dir=TRAIN_DIR):
+    """The label column for a fork table: 1 divides, 0 does not, -1 unannotated."""
+    if not len(table):
+        return np.zeros(0, np.float32)
     geff = Path(data_dir) / f"{stem}.geff"
-    if geff.exists():
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            gt_nodes, gt_divides, gt_has_child = gt_division_flags(geff)
-        table[:, 4] = _label_forks(table[:, :4], gt_nodes, gt_divides, gt_has_child)
-    else:
-        table[:, 4] = -1
+    if not geff.exists():
+        return np.full(len(table), -1, np.float32)
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        gt_nodes, gt_divides, gt_has_child = gt_division_flags(geff)
+    return _label_forks(table[:, :4], gt_nodes, gt_divides, gt_has_child)
+
+
+def _one(stem_pred):
+    stem, pred_dir, data_dir = stem_pred
+    z = np.load(Path(pred_dir) / f"{stem}.npz")
+    cfg = dict(MEP.DEFAULTS)
+    cfg.update(out_dir="", geff_dir="", no_score=True, assign=1)
+    cfg.update(FORK_CFG)
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        coords, edges = MEP.postprocess(
+            z["coords"].astype(np.float64), np.empty((0, 4)),
+            np.asarray(z["candidates"], float).reshape(-1, 5), cfg)
+    table = forks_table(coords, edges)
+    if len(table):
+        table[:, 4] = label_table(table, stem, data_dir)
     return stem, table
 
 

@@ -150,9 +150,16 @@ DEFAULTS = dict(
     linefit_window=3,
     vel_weight=0.02,
     vel_momentum=0.7,
-    # The ILP node filter -- see `ilp_filter_nodes`. Off: one solve is ~9-16 s a
-    # stack against ~1 s for the rest of the chain, so it is a final-run switch
-    # rather than something to sweep behind.
+    # The ILP node filter -- see `ilp_filter_nodes`. **On** as of the nine-config
+    # survey: every one of the five best CV-ranked runs and all four fold-0-tuned
+    # ones sets it, at the same 0.75 / 0.40. It costs ~9-16 s a stack against ~1 s
+    # for the rest of the chain, so `postprocessing/ilp_cache.py` exists to freeze
+    # the solve when sweeping the cheap knobs behind it.
+    #
+    # The history below is kept because it is the reasoning, and because it
+    # records the one thing that has to be re-checked on a new checkpoint: the
+    # filter and a tight `recover`/`min_track` are substitutes, so a checkpoint
+    # that over-detects less can make the expensive one redundant again.
     #
     # As of the 2026-09-09/0 retune it is not worth turning on. That has to be
     # measured with the divisions refitted *to the ILP graph*, because the
@@ -249,7 +256,10 @@ DEFAULTS = dict(
     #   --div_max_sister_um 12 --div_diverge_um 4.5
     # `postprocessing/ilp_cache.py` freezes the solve so the rest of the chain
     # can be swept over it at 1 s a stack.
-    ilp=0,
+    # Fixed by the nine-config survey in Experiments.md: this value is
+    # identical in every one of the five best CV-ranked runs and all four
+    # fold-0-tuned ones, so it is a default rather than a knob.
+    ilp=1,
     # Keep the solver's lineage instead of re-linking with `assign`. See
     # ilp_filter_nodes; measured worse at the old settings, untested at the new.
     keep_ilp_edges=0,
@@ -264,10 +274,16 @@ DEFAULTS = dict(
     # Division weight for the fork-harvesting solve only. Must be < 1.0 or the
     # solver never forks; 0.3 is where fork recall saturates.
     ilp_fork_division=0.3,
-    ilp_threshold=0.50,
+    # Fixed by the nine-config survey in Experiments.md: this value is
+    # identical in every one of the five best CV-ranked runs and all four
+    # fold-0-tuned ones, so it is a default rather than a knob.
+    ilp_threshold=0.40,
     ilp_edge_weight=-1.0,
     ilp_appearance=0.0,
-    ilp_disappearance=1.5,
+    # Fixed by the nine-config survey in Experiments.md: this value is
+    # identical in every one of the five best CV-ranked runs and all four
+    # fold-0-tuned ones, so it is a default rather than a knob.
+    ilp_disappearance=0.75,
     # Must sit below the probability of a second child or a fork can never pay
     # for itself: with edge_weight -1 an extra edge is worth at most -1 against
     # a cost of +ilp_division, so anything >= 1.0 provably never divides. It
@@ -304,7 +320,11 @@ DEFAULTS = dict(
     # 0.40 -> 0.30 is +0.0017 with the whole gain in `division_jaccard`
     # (0.083 -> 0.101). 0.25 matches it to 0.0001 and 0.20 gives half back, so
     # 0.25-0.30 is the floor; 0.45 is -0.0046 and falls off a cliff.
-    div_min_prob=0.25,
+    # Still swept. 0.30 is the midpoint of the nine configs, which split by
+    # protocol: 0.20-0.35 when tuned on both embryos, 0.30-0.375 when tuned on
+    # fold 0 and measured on the held-out one. The stricter end is the one that
+    # generalised, so the default sits there rather than at the CV-tuned 0.25.
+    div_min_prob=0.30,
     div_max_parent_um=11.0,
     div_max_existing_child_um=10.0,
     div_max_sister_um=14.0,
@@ -325,11 +345,21 @@ DEFAULTS = dict(
     # and both beat 3.5 (+0.0022 and +0.0023 over it), while 4.5 is -0.0008.
     # 3.0 is preferred over 2.5 on the per-embryo split -- 2.5 takes another
     # 0.0003 on 44b6 and gives 0.0015 back on 6bba.
-    div_diverge_um=4.0,
+    # Still swept; 2.5 is the modal value across the nine configs.
+    div_diverge_um=2.5,
     div_require_divergence=1,
     div_require_mutual_nn=1,
     div_frame_frac_cap=0.0076,
     div_global_frac_cap=0.00375,
+    # Let `propose_divisions` take a second daughter that the assignment already
+    # gave to another track, deleting the link it replaces, when the model
+    # prefers the new pair by at least this much. None = off, which is the
+    # behaviour every result on record was measured under. See
+    # `propose_divisions`: 25 of 26 fold-0 divisions are reachable and no gate
+    # setting proposes more than 11, because the stage cannot touch a claimed
+    # node -- this is the knob that tests whether that restriction is what is
+    # holding the division term down.
+    div_steal_margin=None,
 )
 
 # torch is only here for `recover`'s drift estimate, and its intra-op pool
@@ -390,7 +420,8 @@ def parse_args():
                         "it off (default %(default)s)")
     p.add_argument("--vel_momentum", type=float, default=DEFAULTS["vel_momentum"],
                    help="EMA on that velocity (default %(default)s)")
-    p.add_argument("--ilp", action="store_true",
+    p.add_argument("--ilp", action=argparse.BooleanOptionalAction,
+                   default=bool(DEFAULTS["ilp"]),
                    help="filter the nodes with a global ILP before linking: "
                         "keep only the detections it places in a track, then "
                         "run the usual chain over what is left. Worth +0.0087 "
@@ -754,6 +785,24 @@ def ilp_filter_nodes(coords, edges, cand, cfg):
 
 def postprocess(coords, edges, cand, cfg):
     """The chain. `(coords, edges, candidates)` -> `(coords, edges)`."""
+    coords, edges, cand = postprocess_prefix(coords, edges, cand, cfg)
+    return postprocess_suffix(coords, edges, cand, cfg)
+
+
+# The chain splits in two at `divisions`, and the split is not arbitrary: every
+# stage above it reads only `threshold`, `vel_*`, `recover_*` and `through*`,
+# and every stage below reads only `div_*`, `min_track` and `linefit*`. So for
+# any two configs that agree on the first group, the first half produces the
+# same graph twice -- which is exactly what a sweep of the division gates or of
+# `min_track` does, and they are the majority of the arms. `tune_edge_pp.py`
+# caches the halfway point on that basis; the split lives here so there is one
+# chain rather than the tuner's copy of it drifting from this one.
+def postprocess_prefix(coords, edges, cand, cfg):
+    """ilp -> assign -> recover -> through. `-> (coords, edges, cand)`.
+
+    `cand` is returned because the ILP renumbers it; the later stages do not
+    touch it.
+    """
     if cfg.get("ilp"):
         # Before everything: it removes nodes, so every later stage should see
         # the reduced graph rather than re-deriving it.
@@ -783,6 +832,11 @@ def postprocess(coords, edges, cand, cfg):
         # one-node "tracks" pruning is about to delete.
         edges = edge_pp.link_through_isolated(
             coords, edges, max_gap=cfg["through_max_gap"], max_um=cfg["through"])
+    return coords, edges, cand
+
+
+def postprocess_suffix(coords, edges, cand, cfg):
+    """divisions -> prune -> linefit. `-> (coords, edges)`."""
     if cfg.get("ilp_div_forks") and cfg.get("_ilp_forks"):
         # The ILP's forks, grafted onto the tuned backbone and then put through
         # the same gate stack `propose_divisions` applies to its own proposals.
@@ -820,6 +874,7 @@ def postprocess(coords, edges, cand, cfg):
             require_mutual_nn=bool(cfg["div_require_mutual_nn"]),
             frame_frac_cap=cfg["div_frame_frac_cap"],
             global_frac_cap=cfg["div_global_frac_cap"],
+            steal_margin=cfg.get("div_steal_margin"),
         )
     if cfg["min_track"]:
         coords, edges = edge_pp.prune_short(coords, edges, cfg["min_track"])
