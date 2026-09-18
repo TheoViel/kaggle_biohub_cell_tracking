@@ -84,32 +84,64 @@ def greedy_nms(
     # a fraction of that.
     #
     # The n x n neighbour test is chunked over rows so the temporary stays
-    # bounded; `CHUNK` rows against every survivor is the whole cost.
-    CHUNK = 4096
+    # bounded. `CHUNK` is a memory budget, not a speed knob: at `max_candidates`
+    # = 50 000 survivors a chunk holds CHUNK x 50 000 floats plus the same again
+    # as a bool, so 4096 rows peaks at 2.6 GiB -- fine on a development card and
+    # not on a 16 GB T4 that also holds the detector. 512 rows is ~130 MiB and
+    # costs a few more iterations of a kernel that was never the bottleneck.
+    CHUNK = 512
+
+    def _sq_dist(a, b):
+        """(c, m) squared distances, per axis, no `cdist`.
+
+        Neither `cdist` mode is usable here. The default expands ||a-b||^2 as
+        |a|^2 + |b|^2 - 2a.b, which cancels: coordinates reach ~10^2 um so the
+        squares reach ~10^4 and float32 leaves ~1e-3 of slop on a test whose
+        threshold is 36. That is not a rounding curiosity -- on a lattice spaced
+        at exactly the radius, which a voxel grid produces constantly, it
+        suppressed 469 of 6 069 peaks that the one-at-a-time loop keeps.
+        `donot_use_mm_for_euclid_dist` is exact but 64x slower, worse than the
+        loop it replaces.
+
+        Subtract, square, sum, one axis at a time: the same arithmetic the
+        original `((P[idx] - P[i0]) ** 2).sum(dim=1)` did, so it agrees to the
+        bit, and only (c, m) temporaries rather than the (c, m, 3) a broadcast
+        difference would materialise.
+        """
+        d = a[:, 0, None] - b[None, :, 0]
+        out = d * d
+        for k in (1, 2):
+            d = a[:, k, None] - b[None, :, k]
+            out += d * d
+        return out
+
     out: list[torch.Tensor] = []
     while idx.numel():
         Pi = P[idx]
-        dominated = torch.zeros(idx.numel(), dtype=torch.bool, device=dev)
-        for s in range(0, idx.numel(), CHUNK):
-            block = Pi[s:s + CHUNK]
-            d2 = torch.cdist(block, Pi) ** 2
+        m = int(idx.numel())
+        dominated = torch.zeros(m, dtype=torch.bool, device=dev)
+        for s in range(0, m, CHUNK):
+            c = min(CHUNK, m - s)
+            near = _sq_dist(Pi[s:s + c], Pi) < r2
             # Strictly higher score = strictly earlier in the score-sorted
             # order, so "is there a better one within r" is a lower column
-            # index. The diagonal is distance 0 but never strictly earlier, so
-            # a point cannot dominate itself.
-            better = torch.arange(idx.numel(), device=dev)[None, :] < \
-                torch.arange(s, s + block.shape[0], device=dev)[:, None]
-            dominated[s:s + block.shape[0]] = ((d2 < r2) & better).any(dim=1)
+            # index. Columns before this chunk are all earlier; inside it the
+            # strict lower triangle is (which also excludes the diagonal, so a
+            # point cannot dominate itself); after it, none are.
+            near[:, s:s + c] &= torch.ones(c, c, dtype=torch.bool,
+                                           device=dev).tril(-1)
+            near[:, s + c:] = False
+            dominated[s:s + c] = near.any(dim=1)
         winners = idx[~dominated]
         out.append(winners)
         if not winners.numel():
             break                        # cannot happen: the top point always wins
         # Everything inside r of a winner is now suppressed.
-        keep = torch.ones(idx.numel(), dtype=torch.bool, device=dev)
+        keep = torch.ones(m, dtype=torch.bool, device=dev)
         Pw = P[winners]
-        for s in range(0, idx.numel(), CHUNK):
-            d2 = torch.cdist(Pi[s:s + CHUNK], Pw) ** 2
-            keep[s:s + d2.shape[0]] = (d2 >= r2).all(dim=1)
+        for s in range(0, m, CHUNK):
+            c = min(CHUNK, m - s)
+            keep[s:s + c] = (_sq_dist(Pi[s:s + c], Pw) >= r2).all(dim=1)
         idx = idx[keep]
     if not out:
         return torch.zeros(0, dtype=torch.long, device=dev)
