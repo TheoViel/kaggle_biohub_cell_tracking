@@ -59,7 +59,7 @@ DEFAULTS = {
     
     "data_dir": TRAIN_DIR,
     "selected_folds": [0, 1] , # [0, 1],
-    "fullfit": False,
+    "fullfit": True,
 
     # Data
     "window_size": 2,               # frames per sample; 2 = one scored frame pair

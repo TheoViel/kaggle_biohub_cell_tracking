@@ -10,7 +10,7 @@ from tqdm import tqdm
 from model_zoo.models_track import UNetNodeTransformer, define_track_model
 from tracking.post_process import detect_cells_multi_threshold, pool_kernel_from_um
 from tracking.targets import pos_embed_numpy
-from tracking.data import resolve_normalization
+from tracking.data import frame_anchors, resolve_normalization
 from tracking_cellmot.io import open_dataset
 
 
@@ -687,15 +687,20 @@ def predict_video_thresholds(
     # Must match what training normalised with, or every intensity the detector
     # learned a threshold against is shifted underneath it.
     norm = resolve_normalization(getattr(cfg, "normalization", None))
-    missing = [q for q in (norm["low_q"], norm["high_q"]) if q not in ds.quantiles]
+    per_frame = norm["scope"] == "frame"
+    missing = [
+        q for q in (norm["low_q"], norm["high_q"])
+        if not per_frame and q not in ds.quantiles
+    ]
     if missing:
         raise ValueError(
             f"Zarr attrs missing image_statistics.quantiles {missing} for {ds_path}"
         )
     zarr_arr = zarr.open_group(str(ds.zarr_path), mode="r")["0"]
-    q_low = float(ds.quantiles[norm["low_q"]])
-    q_high = float(ds.quantiles[norm["high_q"]])
+    q_low = float(ds.quantiles[norm["low_q"]]) if not per_frame else float("nan")
+    q_high = float(ds.quantiles[norm["high_q"]]) if not per_frame else float("nan")
     clamp_max = float(norm["clamp_max"])
+    clamp_min = float(norm["clamp_min"])
 
     T = ds.image_shape[0] if max_frames is None else min(ds.image_shape[0], max_frames)
     image_shape = (T,) + ds.image_shape[1:]
@@ -772,9 +777,13 @@ def predict_video_thresholds(
     def _prepared_frame(t: int) -> torch.Tensor:
         got = frame_cache.get(t)
         if got is None:
-            got = torch.from_numpy(_load_frame_np(zarr_arr, t)).to(device)
-            # Quantile normalisation, matching tracking/dataset.py.
-            got = ((got - q_low) / (q_high - q_low + 1e-6)).clamp(0.0, clamp_max)
+            raw = _load_frame_np(zarr_arr, t)
+            # Quantile normalisation, matching tracking/dataset.py. Under
+            # scope="frame" the anchors come from this frame; the subsample in
+            # frame_anchors keeps it cheap and must stay identical to training.
+            lo, hi = frame_anchors(raw, norm) if per_frame else (q_low, q_high)
+            got = torch.from_numpy(raw).to(device)
+            got = ((got - lo) / (hi - lo + 1e-6)).clamp(clamp_min, clamp_max)
             if downscale_factor > 1:
                 got = got[::downscale_factor, ::downscale_factor, ::downscale_factor]
             frame_cache[t] = got

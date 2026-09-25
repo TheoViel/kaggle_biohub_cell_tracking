@@ -64,7 +64,7 @@ DEFAULTS = {
     "max_frames_per_video": None,   # cap for debugging
     "patch_zyx": (3, 48, 48),  # (channels, height, width)
     "n_frames": 1,
-    "real_prop": 0.5,  # Share of samples served as a *real* (t, t+1)
+    "real_prop": 0.,  # 0.5   # Share of samples served as a *real* (t, t+1)
 
     # Augmentations
     "augmentations": {

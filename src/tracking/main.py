@@ -16,7 +16,12 @@ from model_zoo.models_track import define_track_model
 from params import EMBRYOS
 from tracking.data import resolve_normalization
 from tracking.dataset import TrackDataset, load_dataset_windows
-from tracking.synthetic import MixedDataset, SyntheticDataset, find_sequences
+from tracking.synthetic import (
+    MixedDataset,
+    SyntheticDataset,
+    find_embryo_sequences,
+    find_sequences,
+)
 from tracking.contrastive import fit_contrastive
 from tracking.fit_utils import resolve_run_path
 from tracking.train import fit
@@ -119,9 +124,41 @@ def build_loader(
             load_edges=load_edges,
         )
 
+    # Zebrahub crops: real images from the public release, tiled into the
+    # synthetic set's format (see data.zebrahub), so the same loader reads them.
+    # They are annotated densely, which is what the real half is short of, but
+    # they are real tissue rather than rendered -- hence their own proportion
+    # rather than being thrown in with the synthetic files. No mosaic: stitching
+    # four unrelated pieces of an embryo together is a tell on real images.
+    zeb_cfg_embryos = synth_cfg.get("zebrahub_embryos") or ()
+    zeb = None
+    if (
+        synth_cfg.get("zebrahub_dir")
+        and zeb_cfg_embryos
+        and synth_cfg.get("zebrahub_proportion", 0.0) > 0
+    ):
+        zeb_max_nodes = int(synth_cfg.get("max_nodes", 768))
+        zeb_files = find_embryo_sequences(
+            synth_cfg["zebrahub_dir"], zeb_cfg_embryos, max_nodes=zeb_max_nodes
+        )
+        zeb = SyntheticDataset(
+            zeb_files,
+            window_size=window_size,
+            max_nodes=zeb_max_nodes,
+            crop_size=crop_size,
+            augment=augment,
+            aug_cfg=aug_cfg,
+            normalization=normalization,
+            load_edges=load_edges,
+        )
+
     dataset = TrackDataset(
         video_data,
-        max_nodes=int(synth_cfg.get("max_nodes", 768)) if synth is not None else None,
+        max_nodes=(
+            int(synth_cfg.get("max_nodes", 768))
+            if synth is not None or zeb is not None
+            else None
+        ),
         downscale_factor=downscale_factor,
         augment=augment,
         crop_size=crop_size,
@@ -131,13 +168,23 @@ def build_loader(
         nodes_cfg=nodes_cfg,
         load_edges=load_edges,
     )
+    sources = []
     if synth is not None:
+        sources.append((synth, float(synth_cfg["synthetic_proportion"])))
         if ctx is None or ctx.is_main:
             print(
                 f"- Synthetic: {len(files)} sequences from {synth_cfg['synthetic_dir']}, "
                 f"{synth_cfg['synthetic_proportion']:.0%} of training samples"
             )
-        dataset = MixedDataset(dataset, synth, float(synth_cfg["synthetic_proportion"]))
+    if zeb is not None:
+        sources.append((zeb, float(synth_cfg["zebrahub_proportion"])))
+        if ctx is None or ctx.is_main:
+            print(
+                f"- Zebrahub: {len(zeb_files)} crops from {list(zeb_cfg_embryos)}, "
+                f"{synth_cfg['zebrahub_proportion']:.0%} of training samples"
+            )
+    if sources:
+        dataset = MixedDataset(dataset, sources)
 
     if distributed is None:
         distributed = ctx is not None and ctx.distributed
@@ -224,6 +271,14 @@ def build_model(args, ctx):
         unet_stem=getattr(args, "unet_stem", "stride"),
         unet_norm=getattr(args, "unet_norm", "batch"),
         unet_hires_fusion=bool(getattr(args, "unet_hires_fusion", False)),
+        # "timm25d" only; ignored by the other backbones.
+        unet_timm_backbone=getattr(
+            args, "unet_timm_backbone", "convnext_nano.in12k_ft_in1k"
+        ),
+        unet_timm_slice_size=int(getattr(args, "unet_timm_slice_size", 5)),
+        unet_timm_pretrained=bool(getattr(args, "unet_timm_pretrained", True)),
+        unet_timm_drop_path_rate=float(getattr(args, "unet_timm_drop_path_rate", 0.0)),
+        unet_timm_max_levels=getattr(args, "unet_timm_max_levels", None),
         transformer_hidden=args.transformer_hidden,
         transformer_heads=args.transformer_heads,
         transformer_blocks=args.transformer_blocks,
@@ -521,6 +576,69 @@ def k_fold(args, ctx) -> None:
         print("\nDone!")
 
 
+# What stage 3 inherits from the pretraining blocks when it asks for mixed-in
+# samples. The proportions are deliberately not here: each stage says how much
+# it wants, the source is configured once.
+_EDGE_INHERITED = (
+    "synthetic_dir", "max_sequences", "max_nodes", "mosaic_p", "mosaic_jitter",
+    "zebrahub_dir", "zebrahub_embryos",
+)
+
+
+def _resolve_edge_sources(args, edge_cfg: dict, nodes_cfg: dict | None) -> dict:
+    """The synthetic/zebrahub config for stage 3, resolved against the earlier stages.
+
+    Only the proportions have to be set on the edge block; the directories, the
+    embryo list, the mosaic and the caps fall back to ``synthetic_pretraining``
+    and then ``pretraining``, so a source is configured in one place and each
+    stage just says how much of it to mix in.
+
+    The point in stage 3 is edges, not detections: these crops carry their own
+    lineage, so they supervise the transformer on divisions and crossings at a
+    density the competition annotation never reaches (a handful of annotated
+    cells a frame against ~285 synthetic or up to 786 real zebrahub ones).
+    """
+    synthetic_proportion = float(edge_cfg.get("synthetic_proportion", 0.0) or 0.0)
+    zebrahub_proportion = float(edge_cfg.get("zebrahub_proportion", 0.0) or 0.0)
+    if synthetic_proportion <= 0 and zebrahub_proportion <= 0:
+        return {}
+
+    base = dict(getattr(args, "synthetic_pretraining", {}) or {})
+    if not base.get("synthetic_dir") and not base.get("zebrahub_dir"):
+        base.update(getattr(args, "pretraining", {}) or {})
+    resolved = {k: v for k, v in base.items() if k in _EDGE_INHERITED}
+    # `is not None` matters: the edge block declares `synthetic_dir: None` as
+    # its default, and a plain update would overwrite the value inherited from
+    # `synthetic_pretraining` with it -- leaving the run with a proportion and
+    # nowhere to draw from.
+    resolved.update(
+        {k: v for k, v in edge_cfg.items() if v is not None and k in _EDGE_INHERITED}
+    )
+    resolved["synthetic_proportion"] = synthetic_proportion
+    resolved["zebrahub_proportion"] = zebrahub_proportion
+
+    if synthetic_proportion > 0 and not resolved.get("synthetic_dir"):
+        raise ValueError(
+            "edge.synthetic_proportion is set but no synthetic_dir was found "
+            "in the edge block, synthetic_pretraining or pretraining")
+    if zebrahub_proportion > 0 and not (
+        resolved.get("zebrahub_dir") and resolved.get("zebrahub_embryos")
+    ):
+        raise ValueError(
+            "edge.zebrahub_proportion is set but no zebrahub_dir/zebrahub_embryos "
+            "were found in the edge block, synthetic_pretraining or pretraining")
+    if nodes_cfg:
+        # Real samples would take their nodes -- and their contrastive
+        # embeddings -- off disk while the mixed-in ones carry their own, so the
+        # two halves of the batch would carry different node features. Fail here
+        # rather than at the first collate.
+        raise ValueError(
+            "edge.synthetic_proportion/zebrahub_proportion cannot be combined with "
+            f"{'/'.join(sorted(nodes_cfg))}: those read nodes off disk for "
+            "the real videos and the mixed-in crops have none")
+    return resolved
+
+
 def _train_one(
     args, ctx, run: dict, base_output_dir: str, shared: dict | None = None
 ) -> None:
@@ -564,6 +682,8 @@ def _train_one(
     # loader trains on, instead of running the U-Net's detection.
     args._nodes_cfg = nodes_cfg
 
+    edge_synth = _resolve_edge_sources(args, edge_cfg, nodes_cfg)
+
     train_video_data, train_loader, train_sampler = build_loader(
         args.data_dir,
         embryos=train_embryos,
@@ -578,9 +698,15 @@ def _train_one(
         # so the detection loss never runs and these points are never read.
         # Deriving them is ~20 ms/frame of pure dataloader cost. The
         # pretraining loader below does train detection and still needs them.
+        # Pseudo-labelled detections, for the part of this stage that trains
+        # the detector. `transformer_only` freezes it for the whole stage and
+        # the loss never runs, so deriving them (~20 ms/frame) would be waste;
+        # `det_warmup_prop` only *delays* the unfreeze, so they are still
+        # needed -- the detection loss runs for the rest of the stage.
         weak_positives_cfg=(
             {} if transformer_only else getattr(args, "weak_positives", {})
         ),
+        synthetic_cfg=edge_synth,
         aug_cfg=_stage_aug(args, "edge"),
         normalization=getattr(args, "normalization", None),
         crop_size=crop_size,
@@ -665,13 +791,10 @@ def _train_one(
             : int(synth_cfg.get("n_val_videos") or 1)
         ]
         synth_args.eval_edge_mode = "nearest"
-        # From the stage's config, not the global one: `_apply_stage` may have
-        # replaced `lr` with this stage's, and both groups follow that rate.
-        synth_args.optimizer_config = {
-            **synth_args.optimizer_config,
-            "lr_unet": synth_args.optimizer_config["lr"],
-            "lr_transformer": synth_args.optimizer_config["lr"],
-        }
+        # optimizer_config passes through as resolved: stage block over global.
+        # `lr_unet` is not overridden here -- stage 3 freezes the UNet, so
+        # pretraining is the only stage where it does anything, and forcing it
+        # to `lr` made the setting unreachable.
 
         uses_weak = bool(synth_args.loss_config.get("det_use_weak_positives"))
         _, synth_loader, synth_sampler = build_loader(
@@ -770,13 +893,7 @@ def _train_one(
         ]
 
         seg_args.eval_edge_mode = "nearest"
-        # See stage 1: the stage's own `lr` if it named one, and both param
-        # groups follow it.
-        seg_args.optimizer_config = {
-            **seg_args.optimizer_config,
-            "lr_unet": seg_args.optimizer_config["lr"],
-            "lr_transformer": seg_args.optimizer_config["lr"],
-        }
+        # See stage 1: optimizer_config passes through as resolved.
 
         if ctx.is_main:
             synth_prop = float(pretraining.get("synthetic_proportion", 0.0) or 0.0)
@@ -892,7 +1009,23 @@ def _train_one(
         )
 
     if edge_weights:
-        load_weights(model, edge_weights, fold, ctx, run_name=run["name"])
+        # `transformer.` is in the prefixes here and nowhere else. The default
+        # drops it because the checkpoints the other stages resume from come
+        # from detection-only training, where the transformer never left init
+        # and copying it would only pin the edge architecture to that run's.
+        # `edge.weights` is the opposite case: it names a previous *edge* stage,
+        # whose transformer is the thing worth having, and dropping it silently
+        # restarted the edge head from scratch while the log said the load was
+        # clean -- the "Skipped modules" line was the only hint.
+        #
+        # A shape mismatch is still skipped and reported, so pointing this at a
+        # run with a different `transformer_blocks`/`transformer_hidden`
+        # degrades to a backbone-only load rather than raising.
+        load_weights(
+            model, edge_weights, fold, ctx, run_name=run["name"],
+            prefixes=("unet.", "detect_head.", "detect_head_fine.",
+                      "offset_head.", "annot_head.", "transformer."),
+        )
 
     edge_args = _apply_stage(args, "edge")
     edge_args.eval_video_paths = _paths_for_embryos(args.data_dir, val_embryos)[

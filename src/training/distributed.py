@@ -44,7 +44,15 @@ def init_distributed(backend=None):
             backend = (
                 "nccl" if device.type == "cuda" and dist.is_nccl_available() else "gloo"
             )
-        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
+        # Bind the PG to this rank's device. Without it, object collectives
+        # (all_gather_object in eval) have no tensor to infer a device from and
+        # NCCL guesses `global_rank % device_count` -- right here, but a hang
+        # as soon as the rank->GPU mapping is not round-robin. CUDA only; the
+        # gloo path has no device to bind.
+        kwargs = {"device_id": device} if device.type == "cuda" else {}
+        dist.init_process_group(
+            backend=backend, rank=rank, world_size=world_size, **kwargs
+        )
 
     return DistContext(
         rank=rank,

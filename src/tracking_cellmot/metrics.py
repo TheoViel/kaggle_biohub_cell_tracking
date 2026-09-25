@@ -33,6 +33,10 @@ ADJUSTMENT_ALPHA: float = 0.1
 #   score = adj_edge_jaccard + SCORE_DIVISION_WEIGHT · division_jaccard
 SCORE_DIVISION_WEIGHT: float = 0.1
 
+# Set the first time `summarise` meets a split with no annotated division, so
+# the warning below fires once per process instead of once per eval.
+_WARNED_NO_DIVISIONS = False
+
 COUNT_COLUMNS: tuple[str, ...] = (
     "edge_tp", "edge_fp", "edge_fn",
     "division_tp", "division_fp", "division_fn",
@@ -378,7 +382,19 @@ def evaluate_datasets(
 
 
 def _matched_node_ids(graph: td.graph.BaseGraph) -> pl.DataFrame:
-    """Return a DataFrame with NODE_ID and MATCHED_NODE_ID (as Int64) for *graph*."""
+    """Return a DataFrame with NODE_ID and MATCHED_NODE_ID (as Int64) for *graph*.
+
+    Returns an empty frame when the graph was never matched. `evaluate` bails
+    out early on an empty prediction and so never writes MATCHED_NODE_ID;
+    asking for it then is a KeyError rather than an empty answer.
+    """
+    if td.DEFAULT_ATTR_KEYS.MATCHED_NODE_ID not in graph.node_attr_keys():
+        return pl.DataFrame(
+            schema={
+                td.DEFAULT_ATTR_KEYS.NODE_ID: pl.Int64,
+                td.DEFAULT_ATTR_KEYS.MATCHED_NODE_ID: pl.Int64,
+            }
+        )
     node_attrs = graph.node_attrs(
         attr_keys=[td.DEFAULT_ATTR_KEYS.NODE_ID, td.DEFAULT_ATTR_KEYS.MATCHED_NODE_ID]
     )
@@ -575,10 +591,20 @@ def summarise(rows: list[dict]) -> dict:
         totals["division_tp"] + totals["division_fp"] + totals["division_fn"]
     )
     if division_total == 0:
-        warnings.warn(
-            "No divisions present across any sample in this split; "
-            "dropping division term from the combined score."
-        )
+        # Once per process, not once per call. Validation calls `summarise` for
+        # every eval of every stage, and a split with no annotated division --
+        # the common case on the 5-video eval subset -- turned one true fact
+        # into four identical lines between every logged step, burying the
+        # metrics they sit next to. The condition is a property of the split,
+        # so repeating it says nothing new.
+        global _WARNED_NO_DIVISIONS
+        if not _WARNED_NO_DIVISIONS:
+            _WARNED_NO_DIVISIONS = True
+            warnings.warn(
+                "No divisions present across any sample in this split; "
+                "dropping division term from the combined score. "
+                "(reported once per process)"
+            )
         division_jaccard = float("nan")
         score = adj_edge_jaccard
     else:

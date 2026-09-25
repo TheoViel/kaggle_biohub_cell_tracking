@@ -34,10 +34,23 @@ AUG_STRENGTHS = (0, 1, 2, 3)
 def get_augs_config(strength):
     """The augmentation block for one rung of the strength ladder.
 
-    0 leaves the image alone, 1 adds brightness, 2 adds the affine, 3 adds the
-    photometric corruptions. Stages pick a rung by ``aug_strength`` instead of
-    carrying their own copy of the block, which is what kept the copies
-    drifting apart.
+    0 leaves the image alone, 1 adds brightness and background levelling, 2
+    adds the affine, 3 adds the photometric corruptions. Stages pick a rung by
+    ``aug_strength`` instead of carrying their own copy of the block, which is
+    what kept the copies drifting apart.
+
+    ``bg_level_p`` is deliberately *higher* at rungs 1-2 (0.5) than at rung 3
+    (0.25), which is not a typo. It is not a corruption but a domain knob: the
+    zebrahub crops sit on a near-black background where the competition frames
+    sit on a scattered-light pedestal, and a model that keys on that tells the
+    two sets apart instead of learning cells. At rung 3 ``dim_p`` and a 0.9
+    ``brightness_p`` perturb the pedestal as well, so levelling carries less of
+    the load alone; at rung 1 it is the only thing doing it. Measured on the
+    tensors the model receives (2026-09-22), zebrahub cell-to-background
+    contrast against the competition's 3.0:
+
+        rung 1, bg_level_p 0     26.0      rung 1, bg_level_p 0.5   10.7
+        rung 1, bg_level_p 0.25  17.2      rung 1, bg_level_p 0.75  10.1
     """
     if strength not in AUG_STRENGTHS:
         raise ValueError(
@@ -46,7 +59,15 @@ def get_augs_config(strength):
     augs = {
         # Crop
         "crop_margin": 1.5,
-        "crop_anchor_p": 0.9,
+        "crop_anchor_p": 0.9,  # 0.9
+        # A crop that cuts a cell leaves its centre outside it. Keep the cell
+        # when the centre is within this fraction of a nucleus radius of the
+        # face -- it is then clamped onto that face, wrong by at most 2.1 um at
+        # 0.5, under the 3 um the metric matches on -- and drop it beyond,
+        # where too little is left to place a peak on. 0 restores the previous
+        # behaviour of dropping every cut cell, which left their visible halves
+        # supervised as background.
+        "border_keep": 0.5,
         # Frame gap inside a window
         "time_stride_max": 1,
         # Flips
@@ -87,9 +108,11 @@ def get_augs_config(strength):
     }
     if strength == 1:
         augs['brightness_p'] = 0.5
+        augs['bg_level_p'] = 0.5
     elif strength == 2:
         augs['affine_p'] = 0.5
         augs['brightness_p'] = 0.5
+        augs['bg_level_p'] = 0.5
     elif strength == 3:
         augs['affine_p'] = 0.5
         augs['brightness_p'] = 0.9
@@ -107,14 +130,14 @@ DEFAULTS = {
     "window_size": 2,
     "crop_size": None,  # (16, 64, 64),  # None,  # (16, 64, 64),     # Crop
     "selected_folds": [0, 1],
-    "fullfit": False,
+    "fullfit": True,
     "fullfit_n_val_videos": 1,     # leaky either way, so keep the eval cheap
 
     # Model
-    # "temporal" (two-conv), "resenc" (nnU-Net ResEnc), or a temporal_v* model.
-    "unet_arch": "temporal_v2",  # "temporal"
+    # "temporal" (two-conv), "resenc" (nnU-Net ResEnc), "timm25d", or a temporal_v* model.
+    "unet_arch": "temporal",  # "temporal"
     "unet_out_channels": 32,
-    "unet_layers": (32, 64, 128),  # (32, 64, 128),
+    "unet_layers": (64, 128, 256),  # (32, 64, 128),
     "unet_pool_stride": (1, 2, 2),    # pool Y/X only; full-scale Z preserved
     "unet_n_anisotropic": 2,          # downsampling steps using unet_pool_stride
     # Decoder
@@ -143,6 +166,12 @@ DEFAULTS = {
     "unet_temporal_flow_channels": 8,
     "unet_temporal_flow_hidden_channels": 32,
     "unet_temporal_value_channels": 8,
+    # "timm25d" for CZII 4th
+    "unet_timm_backbone": "convnext_nano.in12k_ft_in1k",
+    "unet_timm_slice_size": 5,  # how many neighbouring slices are stacked into its channel axis. The Y/X
+    "unet_timm_pretrained": True,
+    "unet_timm_drop_path_rate": 0.0,
+    "unet_timm_max_levels": None,   # cap the encoder pyramid, deepest dropped first
     # Attention
     "unet_spatial_attention": "none",   # "none" / "pooled" / "window" / "cbam"
     "unet_spatial_attention_stages": 1,   # deepest N encoder stages, 0 = off
@@ -172,6 +201,7 @@ DEFAULTS = {
 
     # Normalisation. (x - q[low_q]) / (q[high_q] - q[low_q]), clamped
     "normalization": {"low_q": "0.001", "high_q": "0.999", "clamp_max": 4.0},
+    # "normalization": {"scope": "frame", "low_q": "0.1", "high_q": "0.99", "clamp_max": 4.0},
 
     # Augmentations fallback
     "aug_strength": 1,
@@ -184,33 +214,26 @@ DEFAULTS = {
     "nms_radius_um": 7.0,   # for greedy NMS
     "max_dets_per_sample": 768,   # cap nodes per sample (bounds the N^2 edge matrix)
     "top_k_nodes": None,  # 64,            # min nodes/sample: below this, ignore the threshold & take the top-k peaks
-    # The centroid vote: every grid voxel near a cell predicts the vector to its
-    # centre, and a detection is reported at (g + o) * stride instead of at its
-    # own voxel. Worth having for y/x -- RMS 1.105 -> 1.070 and 1.095 -> 1.052
-    # on 2026-09-10/7 against the same config without it.
-    #
-    # It does *not* move z, and that is structural rather than a tuning problem:
-    # the node grid's z stride is one image voxel, so `round(g + o_z)` returns g
-    # unless the vote exceeds half a voxel, and the annotation is itself
-    # integer-valued on that grid (verified: 100% of GT coordinates are exact
-    # integers). So there is no sub-voxel z truth to regress toward -- the task
-    # in z is picking the right slice, which is a discrete choice this head
-    # expresses only by clearing 0.5. z still holds 60% of the localisation MSE.
+    # Aux heads
     "offset_head": False,
     "offset_radius": 2,       # grid voxels a cell's vote reaches
-    "annot_head": True,  # A second head asking "would an annotator have labelled this cell"
+    "annot_head": False,  # A second head asking "would an annotator have labelled this cell"
 
     # Stage 1 - Synthetic data pretraining
     "synthetic_pretraining": {
-        "enabled": True,
+        "enabled": False,
         "synthetic_dir": "../input/synthetic/v5/",
         "synthetic_proportion": 1,
+        # Real zebrahub crops
+        "zebrahub_dir": "../input/zebrahub_crops/",
+        "zebrahub_embryos": [],   # e.g. ["ZSNS001_tail", "ZSNS003"]
+        "zebrahub_proportion": 0.,
         "weights": None,
         # Data
         "mosaic_p": 0.,
         "mosaic_jitter": 0.2,  # +/- fraction of img width/height the join wanders off centre, 0 = equal quarters
         "crop_size": (32, 128, 128),
-        "max_nodes": 768,       # a synthetic frame holds up to ~656 cells
+        "max_nodes": 768,       # a synthetic frame holds up to ~656 cells; zebrahub crops reach 786
         "aug_strength": 3,
         # Training
         "iterations": 1000,
@@ -244,15 +267,20 @@ DEFAULTS = {
         # Override the image peaks above; combined with pl_folder when both are
         # set, the pl_folder point winning any duplicate. A stack the folder does
         # not cover or that fails a gate below falls back to the image peaks.
-        "use_focus_3d": False,
+        "use_focus_3d": True,
         "focus_3d_dir": OUTPUT_FOLDER + "focus3d/",
-        "focus_3d_min_recall": 0.,   # drop a stack that misses annotated cells
-        "focus_3d_max_ratio": 1.75,    # drop a stack predicting far too many cells
-        # Weak positives from pl_folder
-        # "pl_folder": "../logs/2026-08-31/33/preds_pl_0.50/",  # 1st round PL
-        "pl_folder": "../logs/2026-09-01/9/preds_pl_pp/",  # 2nd round PL + PP
-        # "pl_folder": "logs/2026-09-13/1/preds_pl_pp/",  # New best
-        "pl_ignore_folder": None,  # Expects lower threshold coords
+        "focus_3d_min_recall": 0.5,   # drop a stack that misses annotated cells
+        "focus_3d_max_ratio": 1.25,    # drop a stack predicting far too many cells
+        # Weak positives from pl_folder - V1
+        # "pl_folder": "../logs/2026-09-01/9/preds_pl_pp/",  # 2nd round PL + PP  --  BEST
+        "pl_folder": "../logs/2026-09-23/3/preds_pl_pp/",  # Focus3D + Synth + 0.1 extra
+        "pl_folder": "../logs/2026-09-23/5/preds_pl_pp/",  # Round 2
+        # Weak positives from pl_folder - V2
+        # "pl_folder": "../logs/2026-09-13/1/preds_pl_0.60_annot_head/",  # 2nd round PL + PP
+        # Ignore regions from a second folder. Run 10 (0.7632) turned this on
+        # against run 6's 0.7693 and lost; off is run 6's setting.
+        # "pl_ignore_folder": "../logs/2026-09-01/9/preds_pl_pp/",  # Expects lower threshold coords
+        "pl_ignore_folder": None,
         "ignore_min_dist_um": 7.0,  # the pl_ignore_folder path only
     },
 
@@ -260,27 +288,31 @@ DEFAULTS = {
     "pretraining": {
         "enabled": True,
         # "weights": "../logs/2026-09-13/1/fold_0/ckpt_synthetic.pt",  # temporal wide
-        "weights": "../logs/2026-09-15/0/fold_0/ckpt_synthetic.pt",  # temporal_v2
+        "weights": "../logs/2026-09-22/10/fold_0/ckpt_synthetic.pt",  # temporal wide
+        # "weights": "../logs/2026-09-15/0/fold_0/ckpt_synthetic.pt",  # temporal_v2
+        # "weights": "../logs/2026-09-20/1/fold_0/ckpt_synthetic.pt",  # timm25d
         # "weights": "../logs/2026-09-13/1/fold_*/ckpt_pretrain.pt",  # "../logs/2026-09-11/3/fold_*/ckpt_pretrain.pt",
         # "weights": None,
         # Data
         "crop_size": (32, 128, 128),  # (48, 192, 192)
         "aug_strength": 3,
         "synthetic_dir": "../input/synthetic/v4/",
-        "synthetic_proportion": 0.5,
+        "synthetic_proportion": 0.4,
+        "zebrahub_dir": "../input/zebrahub_crops/",
+        "zebrahub_embryos": ["ZSNS001_tail", "ZSNS003", "ZSNS004", "ZSNS005"],  # ["ZSNS001", "ZSNS001_tail", "ZSNS003", "ZSNS004", "ZSNS005"]
+        # 0.1 is run 6's (0.7693). 0.0 is run 10 (0.7632) and 0.2 is run 9
+        # (0.7494), so the mix has an interior optimum rather than being a
+        # straight cost -- but the 0.0 and 0.1 arms are one run each and sit
+        # inside the run-to-run spread, so this is the weakest of the three.
+        "zebrahub_proportion": 0.1,
         # Training
-        "iterations": 10000,
+        # 2500 is run 6 (0.7693); 2000 run 7 (0.7562), 4000 run 8 (0.7686) --
+        # non-monotonic, so 2500 vs 4000 is a coin flip and 2000 is short.
+        "iterations": 3000,
         "epochs": None,
         "batch_size": 16,
-        "loss_config": {
-            "det_use_weak_positives": True,
-            "det_loss_weight": 1,
-            "det_neg_weight": 0.05,
-            "det_weak_weight": 0.2,        # To balance GT share of positive weight 
-            "det_weak_smoothing": 0.01,      # smoothing factor for weak positives
-        },
         # Eval
-        "n_val_videos": 5,
+        "n_val_videos": 20,
         "eval_every": 500,
         # # lr
         # "lr": 1e-4,
@@ -312,6 +344,11 @@ DEFAULTS = {
         "weights": None,  # "../logs/2026-09-09/0/fold_0/ckpt_pretrain.pt"
         # Data
         "crop_size": None,
+        "synthetic_proportion": 0.,
+        "synthetic_dir": "../input/synthetic/v4/",
+        # Only the proportion has to be set here; the directory and embryo list
+        # fall back to the synthetic_pretraining / pretraining blocks.
+        "zebrahub_proportion": 0.,
         # Training
         "iterations": 200,
         "epochs": None,
@@ -319,9 +356,10 @@ DEFAULTS = {
         "val_batch_size": 8,
         "det_warmup_prop": 0.,
         "teacher_forcing_prop": 0,   # use GT points as nodes for this opening fraction of training
+        "transformer_warmup_prop": 0.,
         # Eval
         "eval_every": 50,
-        "n_val_videos": 5,
+        "n_val_videos": 20,
     },
 
     "optimizer_config": {
@@ -339,10 +377,21 @@ DEFAULTS = {
     "loss_config": {
         "det_use_weak_positives": True,
         "det_loss_weight": 1,
-        "det_neg_weight": 1,
-        "det_weak_weight": 0.2,        # To balance GT share of positive weight 
+        "det_neg_weight": 0.05,
+        "det_weak_weight": 0.5,        # To balance GT share of positive weight 
         "det_weak_smoothing": 0.01,      # smoothing factor for weak positives
         "det_gaussian_sigma": 1.0,
+        # How that scalar sigma is restated per axis on the fine (1,2,2)
+        # detection head, whose grid voxel is 1.625/0.8125/0.8125 um:
+        #   "grid"   sigma in grid voxels      -> (1.625, 0.8125, 0.8125) um
+        #   "fine"   round, finest axis        -> (0.8125, 0.8125, 0.8125) um
+        #   "coarse" round, coarsest axis      -> (1.625, 1.625, 1.625) um
+        # The coarse (1,4,4) head is cubic, so none of them changes it.
+        # "fine" landed 2026-09-22 together with border_keep, and every run
+        # since shows a threshold-0.50 collapse (-0.03..-0.18 against
+        # -0.01..-0.04 before) that the two changes are confounded in.
+        # "grid" is what every run up to that point trained with.
+        "det_sigma_anchor": "grid",  # "fine" / "grid" / "coarse"
         "det_ds_weight": 1.0,          # deep-supervision heatmap, relative to the fine one
         # The annotation head. Its positives are the ~3 annotated cells a frame
         # rather than the ~500 the detector sees, and the focal loss normalises
@@ -352,13 +401,16 @@ DEFAULTS = {
         "annot_loss_weight": 1.0,
         "annot_neg_weight": 1e-3,
         "annot_pos_scale": 1.0,
+        # What to do with the pseudo-labelled detections:
+        "det_weak_mode": None,  # "positive" / "ignore" / "negative" - None = old behaviour
+        "det_weak_ignore_radius": 0.0,  # grid voxels; 0 = det_gaussian_sigma
         "det_ignore_radius": 0.0,      # Ignore radius around ignored_peaks
         "offset_loss_weight": 1.0,     # Offset loss weight
         "offset_beta": 1.0,            # SmoothL1 knee, grid voxels
     },
 
     # Eval
-    "eval_thresholds": [0.4, 0.5],
+    "eval_thresholds": [0.3, 0.4, 0.5],
     "eval_node_match_um": 3.0,
 
     # Multi-GPU

@@ -16,14 +16,21 @@ cd src
 torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" main_track.py
 
 torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" main_predict.py \
-    --det_threshold 0.3,0.4,0.5 \
-    --nms_radius_um 5,6,7 \
+    --det_threshold 0.3,0.35,0.4,0.45,0.5 \
+    --nms_radius_um 6,7 \
+
+torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" main_track.py
+
+torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" main_predict.py \
+    --det_threshold 0.3,0.35,0.4,0.45 \
+    --nms_radius_um 6,7 \
 
 # torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" main_predict.py \
-#     --det_threshold 0.3,0.4,0.5 \
-#     --nms_radius_um 5,6,7 \
+#     --det_threshold 0.3,0.4,0.5,0.6 \
+#     --nms_radius_um 6,7 \
 #     --pl 
-# python main_postprocess.py --pl
+
+# python main_postprocess.py --pl  # --preds_dir ../logs/2026-09-23/4/preds_pl_r6_0.30/
 
 # torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" main_inference_ensemble.py \
 #     --experiments ../logs/2026-09-11/1 ../logs/2026-09-15/0 \

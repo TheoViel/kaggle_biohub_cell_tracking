@@ -124,7 +124,7 @@ def parse_args():
                    help="detection threshold, or a comma-separated list to sweep several "
                         "in one forward pass")
     p.add_argument("--pool_kernel_um", type=float, default=PredictConfig.pool_kernel_um)
-    p.add_argument("--nms", choices=("maxpool", "greedy"), default=PredictConfig.nms)
+    p.add_argument("--nms", choices=("maxpool", "greedy", "centroid"), default=PredictConfig.nms)
     p.add_argument("--nms_radius_um", type=_floats, default=[PredictConfig.nms_radius_um],
                    help="greedy NMS radius, or a comma-separated list to sweep several "
                         "in the same forward pass; crossed with --det_threshold")

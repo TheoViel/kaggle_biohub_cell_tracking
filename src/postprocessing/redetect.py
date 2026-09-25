@@ -22,6 +22,7 @@ from common import RESULTS, SAMPLE, load_gt, save, score, to_graph
 from main_predict import _reconcile_arch
 from params import SCALE, TRAIN_DIR
 from relink import relink
+from tracking.data import normalize_frames, resolve_normalization
 from tracking.main import build_model
 from tracking.post_process import detect_cells_pooled, pool_kernel_from_um
 from tracking_cellmot.io import open_dataset
@@ -48,7 +49,8 @@ def detection_maps():
 
     ds = open_dataset(f"{TRAIN_DIR}/{SAMPLE}.zarr", normalize=False, load_image=False)
     arr = zarr.open_group(str(ds.zarr_path), mode="r")["0"]
-    q_low, q_high = float(ds.quantiles["0.001"]), float(ds.quantiles["0.999"])
+    # Follow the model's own config; see the note in dump_edge_scores.py.
+    norm = resolve_normalization(getattr(cfg, "normalization", None))
     T = ds.image_shape[0]
 
     maps = []
@@ -56,8 +58,9 @@ def detection_maps():
         # Windows of two frames, matching how the model was trained and run.
         for t in range(0, T, 2):
             idx = [t, min(t + 1, T - 1)]
-            imgs = torch.from_numpy(np.stack([arr[i] for i in idx]).astype(np.float32))
-            imgs = ((imgs - q_low) / (q_high - q_low + 1e-6)).clamp(0.0, 4.0)
+            imgs = torch.from_numpy(
+                normalize_frames(np.stack([arr[i] for i in idx]), norm, ds.quantiles)
+            )
             imgs = imgs.unsqueeze(0).to(DEVICE)
             _, det, _, _ = model.encode(imgs)
             for k, i in enumerate(idx):

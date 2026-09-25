@@ -12,20 +12,24 @@ from model_zoo.temporal_unet import TemporalUNet3D
 from model_zoo.temporal_unet_v2 import TemporalUNet3Dv2
 from model_zoo.temporal_unet_v3 import TemporalUNet3Dv3
 from model_zoo.temporal_unet_v4 import TemporalUNet3Dv4
+from model_zoo.timm_25d_unet import Timm25DUNet3D
 
 
 # Backbones the tracking model can be built on, by name. "temporal" is the plain two-conv
 # U-Net; "resenc" is the nnU-Net residual encoder at the same geometry, which is deeper at
 # equal widths. "temporal_v2" keeps "temporal"'s geometry but moves the temporal interaction
 # out of the encoder and into the decoder, where it is a motion-compensated local
-# corroboration rather than a same-voxel attention -- see temporal_unet_v2. All take the
-# same geometry arguments and return (B, T, C, Z', Y', X').
+# corroboration rather than a same-voxel attention -- see temporal_unet_v2. "timm25d" is
+# the CZII 4th-place 2.5D architecture: a pretrained 2D encoder run per Z slice, with the
+# depth axis reduced by pooling and a 3D U-Net decoder over it -- see timm_25d_unet. All
+# take the same geometry arguments and return (B, T, C, Z', Y', X').
 UNET_BACKBONES = {
     "temporal": TemporalUNet3D,
     "temporal_v2": TemporalUNet3Dv2,
     "temporal_v3": TemporalUNet3Dv3,
     "temporal_v4": TemporalUNet3Dv4,
     "resenc": TemporalResEncUNet3D,
+    "timm25d": Timm25DUNet3D,
 }
 
 
@@ -429,6 +433,12 @@ def define_track_model(
     unet_stem: str = "stride",
     unet_norm: str = "batch",
     unet_hires_fusion: bool = False,
+    # "timm25d" only.
+    unet_timm_backbone: str = "convnext_nano.in12k_ft_in1k",
+    unet_timm_slice_size: int = 5,
+    unet_timm_pretrained: bool = True,
+    unet_timm_drop_path_rate: float = 0.0,
+    unet_timm_max_levels: int | None = None,
     transformer_hidden: int = 128,
     transformer_heads: int = 4,
     transformer_blocks: int = 4,
@@ -512,6 +522,19 @@ def define_track_model(
     unet_hires_fusion : bool
         Temporal backbone only: pool the encoder skips finer than the head's
         grid back into the head instead of discarding them.
+    unet_timm_backbone : str
+        ``"timm25d"`` only: the 2D timm encoder run per Z slice.
+    unet_timm_slice_size : int
+        ``"timm25d"`` only: neighbouring Z slices stacked into that encoder's
+        channel axis.
+    unet_timm_pretrained : bool
+        ``"timm25d"`` only: load the ImageNet weights, which is the whole reason
+        for the architecture. Turn it off only when a checkpoint is about to
+        overwrite them anyway.
+    unet_timm_drop_path_rate : float
+        ``"timm25d"`` only: stochastic depth in the 2D encoder.
+    unet_timm_max_levels : int or None
+        ``"timm25d"`` only: cap on the encoder's pyramid levels, deepest first.
     """
     if unet_layers is None:
         unet_layers = [32, 64, 128]
@@ -560,6 +583,15 @@ def define_track_model(
             extra["temporal_value_channels"] = int(unet_temporal_value_channels)
     else:
         extra["temporal_attention"] = unet_temporal_attention
+
+    if unet_arch == "timm25d":
+        extra["timm_backbone"] = unet_timm_backbone
+        extra["timm_slice_size"] = int(unet_timm_slice_size)
+        extra["timm_pretrained"] = bool(unet_timm_pretrained)
+        extra["timm_drop_path_rate"] = float(unet_timm_drop_path_rate)
+        extra["timm_max_levels"] = (
+            None if unet_timm_max_levels is None else int(unet_timm_max_levels)
+        )
 
     unet = backbone(
         in_channels=1,

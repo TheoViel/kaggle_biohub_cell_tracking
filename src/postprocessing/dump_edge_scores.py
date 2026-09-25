@@ -21,6 +21,7 @@ import zarr
 from common import EXPERIMENT, PRED_NPZ, RESULTS, SAMPLE, load_prediction
 from main_predict import _reconcile_arch
 from params import TRAIN_DIR
+from tracking.data import normalize_frames, resolve_normalization
 from tracking.main import build_model
 from tracking.targets import pos_embed_numpy
 from tracking_cellmot.io import open_dataset
@@ -49,7 +50,9 @@ def main():
 
     ds = open_dataset(f"{TRAIN_DIR}/{SAMPLE}.zarr", normalize=False, load_image=False)
     zarr_arr = zarr.open_group(str(ds.zarr_path), mode="r")["0"]
-    q_low, q_high = float(ds.quantiles["0.001"]), float(ds.quantiles["0.999"])
+    # Follow the model's own config: pinning quantiles here would score under a
+    # different normalisation than the one it was trained with.
+    norm = resolve_normalization(getattr(cfg, "normalization", None))
 
     frames = sorted(np.unique(coords[:, 0]).tolist())
     rows_by_t = {t: np.flatnonzero(coords[:, 0] == t) for t in frames}
@@ -59,8 +62,9 @@ def main():
     for t in frames[:-1]:
         if t + 1 not in rows_by_t:
             continue
-        imgs = torch.from_numpy(np.stack([zarr_arr[t], zarr_arr[t + 1]]).astype(np.float32))
-        imgs = ((imgs - q_low) / (q_high - q_low + 1e-6)).clamp(0.0, 4.0)
+        imgs = torch.from_numpy(
+            normalize_frames(np.stack([zarr_arr[t], zarr_arr[t + 1]]), norm, ds.quantiles)
+        )
         imgs = imgs.unsqueeze(0).to(DEVICE)
 
         unet_out, _, _, _ = model.encode(imgs)

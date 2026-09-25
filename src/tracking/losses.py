@@ -15,10 +15,62 @@ L_offset: SmoothL1 on the centroid vote, over the voxels near a GT cell only.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+# How `sigma_per_axis` turns one scalar sigma into a per-axis one.
+#   "fine"   physical width anchored on the finest axis -- the tightest the
+#            grid can express, and what has been running since 2026-09-22.
+#   "grid"   no restatement at all: sigma is in grid voxels on every axis, so
+#            the splat is elongated along whichever axis has the coarser voxel.
+#            This is what every run up to 2026-09-22 trained with.
+#   "coarse" anchored on the *coarsest* axis: physically round like "fine", but
+#            at the width "grid" gave z rather than the one it gave y/x.
+SIGMA_ANCHORS = ("fine", "grid", "coarse")
+
+
+def sigma_per_axis(
+    sigma: float,
+    unet_scaling: Sequence[float] | None,
+    voxel_size: Sequence[float] | None,
+    anchor: str = "fine",
+) -> float | tuple[float, float, float]:
+    """``sigma`` restated per axis so the splat is physically round.
+
+    The detection grid is the image grid divided by ``unet_scaling``, so its
+    voxel is ``voxel_size * unet_scaling`` microns on each axis. A single sigma
+    on a non-cubic grid means a target stretched along whichever axis has the
+    coarser voxel -- on the (1, 2, 2) head that was 1.625 um in z against
+    0.8125 um in y/x, twice as tall as it was wide.
+
+    The physical width is anchored on the *finest* axis, so making the grid
+    finer tightens the target rather than leaving z to dictate it. On the
+    (1, 2, 2) head that gives sigma (0.5, 1, 1) voxels -- 1.62 um across on all
+    three axes, the sharpest the grid can express -- and z is narrowed to match
+    y/x rather than y/x widened to match z.
+
+    On a cubic grid this returns ``sigma`` unchanged, so the deep-supervision
+    head at (1, 4, 4) -- where 4 y/x voxels of 0.40625 um make 1.625 um,
+    exactly the z step -- trains as it always has.
+    """
+    if anchor not in SIGMA_ANCHORS:
+        raise ValueError(f"sigma anchor must be one of {SIGMA_ANCHORS}, got {anchor!r}")
+    if anchor == "grid" or unet_scaling is None or voxel_size is None:
+        return sigma
+    grid_um = np.asarray(voxel_size, dtype=np.float64) * np.asarray(unet_scaling, dtype=np.float64)
+    if not np.isfinite(grid_um).all() or (grid_um <= 0).any():
+        return sigma
+    # microns, anchored on the finest axis ("fine") or the coarsest ("coarse")
+    physical = sigma * (grid_um.min() if anchor == "fine" else grid_um.max())
+    per_axis = physical / grid_um
+    if np.allclose(per_axis, per_axis[0]):
+        return float(per_axis[0])
+    return tuple(float(v) for v in per_axis)
 
 # Focal exponents, CenterNet's defaults: alpha sharpens the easy/hard split on
 # the prediction, beta discounts negatives by how close they sit to a peak.
@@ -34,15 +86,18 @@ def gaussian_heatmap(
     coords: torch.Tensor,  # (B, max_nodes, 3) in detection-grid space
     mask: torch.Tensor,  # (B, max_nodes) bool
     spatial: tuple,  # (Z, Y, X)
-    sigma: float,
+    sigma: float | Sequence[float],
 ) -> torch.Tensor:  # (B, Z, Y, X) float, peak 1.0 at each GT point
-    """Splat an isotropic Gaussian at every GT point (CenterNet-style targets).
+    """Splat a Gaussian at every GT point (CenterNet-style targets).
 
     Overlapping splats combine with max, so each GT point keeps a peak of
     exactly 1.0. ``sigma <= 0`` degenerates to single-voxel targets.
 
-    Sigma is expressed in *detection-grid voxels* (the grid det_logits lives
-    on), not microns.
+    Sigma is expressed in *detection-grid voxels*, not microns, and may be one
+    value or one per axis. Per-axis is what keeps the splat a fixed *physical*
+    size on a grid whose voxels are not cubic: a head that refines y/x but not
+    z has voxels 2x taller than they are wide, and a single sigma there means a
+    target 2x taller than it is wide. See ``sigma_per_axis``.
     """
     B = coords.shape[0]
     device = coords.device
@@ -52,15 +107,20 @@ def gaussian_heatmap(
     # One extra slot absorbs out-of-bounds / padded writes, then is dropped.
     heat = torch.zeros(n_vox + 1, device=device)
 
-    r = max(1, int(math.ceil(3.0 * sigma))) if sigma > 0 else 0
-    off = torch.arange(-r, r + 1, device=device)
-    oz, oy, ox = torch.meshgrid(off, off, off, indexing="ij")
+    sig = np.broadcast_to(np.asarray(sigma, dtype=np.float64).ravel(), (3,))
+    radii = [max(1, int(math.ceil(3.0 * s))) if s > 0 else 0 for s in sig]
+    offs = [torch.arange(-r, r + 1, device=device) for r in radii]
+    oz, oy, ox = torch.meshgrid(*offs, indexing="ij")
     oz, oy, ox = oz.reshape(-1), oy.reshape(-1), ox.reshape(-1)  # (K,)
-    sq = (oz * oz + oy * oy + ox * ox).float()
-    if sigma > 0:
-        g = torch.exp(-sq / (2.0 * sigma * sigma))
+    if (sig > 0).all():
+        # Normalised squared distance, so each axis is measured in its own
+        # sigma and the skirt is an ellipsoid matching the voxel aspect.
+        sq = sum(
+            (o.float() / float(s)) ** 2 for o, s in zip((oz, oy, ox), sig)
+        )
+        g = torch.exp(-sq / 2.0)
     else:
-        g = (sq == 0).float()
+        g = ((oz * oz + oy * oy + ox * ox) == 0).float()
 
     zc = coords[..., 0].round().long().unsqueeze(-1) + oz  # (B, M, K)
     yc = coords[..., 1].round().long().unsqueeze(-1) + oy
@@ -94,10 +154,14 @@ def build_detection_target(
     weak_weight: float = 0.3,
     weak_smoothing: float = 0.1,
     gaussian_sigma: float = 1.0,
+    sigma_anchor: str = "fine",
     weak_positives: torch.Tensor | None = None,  # (B, N, 3), -1 padded
     use_weak_positives: bool = True,
+    weak_mode: str | None = None,  # "positive" | "ignore" | "negative"
+    weak_ignore_radius: float = 0.0,  # grid voxels; 0 = gaussian_sigma
     ignore_positives: torch.Tensor | None = None,  # (B, N, 3), -1 padded
     ignore_radius: float = 0.0,  # detection-grid voxels; 0 disables
+    voxel_size: Sequence[float] | None = None,  # image voxel, microns
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Build the Gaussian-splatted target heatmap and per-voxel positive weight.
 
@@ -132,8 +196,13 @@ def build_detection_target(
         scale = torch.tensor(unet_scaling, dtype=coords.dtype, device=coords.device)
         coords = torch.div(coords, scale, rounding_mode="floor")
 
+    # Every splat below -- the target, the weak peaks, and both ignore balls --
+    # uses this, so a "say nothing here" region is the same physical size as
+    # the peak it stands in for rather than inheriting the voxel aspect.
+    sigma = sigma_per_axis(gaussian_sigma, unet_scaling, voxel_size, sigma_anchor)
+
     # Peak 1.0 at each GT point, decaying across the Gaussian skirt.
-    gt_heat = gaussian_heatmap(coords, mask, spatial, gaussian_sigma)
+    gt_heat = gaussian_heatmap(coords, mask, spatial, sigma)
     heat = gt_heat
     # Weight of the *positive* term. Only a peak voxel is a positive; its own
     # skirt is a discounted negative (see below).
@@ -141,14 +210,43 @@ def build_detection_target(
     th = 0.5
     pos_weight = (gt_heat >= th).float()
 
-    if use_weak_positives:
+    # `weak_mode` supersedes `use_weak_positives`; the old flag maps onto the
+    # two modes it could express.
+    mode = weak_mode or ("positive" if use_weak_positives else "negative")
+    if mode not in ("positive", "ignore", "negative"):
+        raise ValueError(f"weak_mode must be positive/ignore/negative, got {mode!r}")
+
+    weak_ignore = None
+    if mode == "ignore":
+        # Neither a positive nor a negative: the annotation does not say these
+        # are cells, and the detector can see that they are, so calling them
+        # background is the one thing that is certainly wrong -- it is what
+        # collapsed node recall from 0.99 to 0.75 in `logs/2026-09-18/6`.
+        # Masking them leaves the positives exactly the annotation and the
+        # negatives exactly the background, which is what "unweighted" means
+        # here: they contribute no gradient at all.
+        assert weak_positives is not None, "weak_mode='ignore' with no weak_positives"
+        wp_valid = (weak_positives >= 0).all(dim=-1)
+        if wp_valid.any():
+            wp_i = weak_positives
+            if unet_scaling is not None:
+                wp_i = torch.div(wp_i, scale, rounding_mode="floor")
+            # A ball like `ignore_positives`, not a Gaussian -- "say nothing
+            # here" has no shape worth grading. Defaults to the splat width, so
+            # the masked region matches what a positive would have covered.
+            r = (sigma_per_axis(weak_ignore_radius, unet_scaling, voxel_size,
+                                sigma_anchor)
+                 if weak_ignore_radius else sigma)
+            weak_ignore = gaussian_heatmap(wp_i, wp_valid, spatial, r) > _BALL_EDGE
+
+    if mode == "positive":
         assert weak_positives is not None, "use_weak_positives set with no weak_positives"
         valid = (weak_positives >= 0).all(dim=-1)
         wp = weak_positives
         if unet_scaling is not None:
             wp = torch.div(wp, scale, rounding_mode="floor")
 
-        weak_heat = gaussian_heatmap(wp, valid, spatial, gaussian_sigma)
+        weak_heat = gaussian_heatmap(wp, valid, spatial, sigma)
         # Weak peaks are cells too, so they must not be driven to 0 as
         # background; smoothing keeps their target just under a GT peak.
         heat = torch.maximum(gt_heat, weak_heat * (1.0 - weak_smoothing))
@@ -166,7 +264,15 @@ def build_detection_target(
             ig = torch.div(ig, scale, rounding_mode="floor")
         ig_valid = (ignore_positives >= 0).all(dim=-1)
         if ig_valid.any():
-            ignore = gaussian_heatmap(ig, ig_valid, spatial, ignore_radius) > _BALL_EDGE
+            ignore = gaussian_heatmap(
+                ig, ig_valid, spatial,
+                sigma_per_axis(ignore_radius, unet_scaling, voxel_size,
+                               sigma_anchor),
+            ) > _BALL_EDGE
+
+    # The two ignore sources are independent and both mean "no gradient here".
+    if weak_ignore is not None:
+        ignore = weak_ignore if ignore is None else (ignore | weak_ignore)
 
     return heat, pos_weight, ignore
 
@@ -180,11 +286,15 @@ def detection_loss(
     weak_weight: float = 0.3,
     weak_smoothing: float = 0.1,
     gaussian_sigma: float = 1.0,
+    sigma_anchor: str = "fine",
     weak_positives: torch.Tensor | None = None,  # (B, N, 3), -1 padded
     use_weak_positives: bool = True,
     ignore_positives: torch.Tensor | None = None,  # (B, N, 3), -1 padded
     ignore_radius: float = 0.0,  # detection-grid voxels; 0 disables
+    weak_mode: str | None = None,
+    weak_ignore_radius: float = 0.0,
     pos_weight_scale: float = 1.0,
+    voxel_size: Sequence[float] | None = None,  # image voxel, microns
 ) -> torch.Tensor:
     """Penalty-reduced focal loss on a Gaussian-splatted detection heatmap.
 
@@ -215,10 +325,14 @@ def detection_loss(
         weak_weight=weak_weight,
         weak_smoothing=weak_smoothing,
         gaussian_sigma=gaussian_sigma,
+        sigma_anchor=sigma_anchor,
         weak_positives=weak_positives,
         use_weak_positives=use_weak_positives,
         ignore_positives=ignore_positives,
         ignore_radius=ignore_radius,
+        weak_mode=weak_mode,
+        weak_ignore_radius=weak_ignore_radius,
+        voxel_size=voxel_size,
     )
 
     # Penalty-reduced focal loss (CenterNet). Two properties matter here:
@@ -388,6 +502,9 @@ class TrackingLoss(nn.Module):
         Per-voxel weight for weak-positive voxels (image local maxima).
     det_weak_smoothing : float
         Label smoothing applied to weak positives.
+    det_sigma_anchor : str
+        How a scalar sigma is restated per axis on a non-cubic detection grid;
+        see SIGMA_ANCHORS. "grid" reproduces every run before 2026-09-22.
     det_gaussian_sigma : float
         Std-dev, in detection-grid voxels, of the Gaussian splatted at each
         GT point. 0 falls back to single-voxel targets.
@@ -431,7 +548,14 @@ class TrackingLoss(nn.Module):
         det_weak_weight: float = 0.3,
         det_weak_smoothing: float = 0.1,
         det_gaussian_sigma: float = 1.0,
+        det_sigma_anchor: str = "fine",
         det_use_weak_positives: bool = True,
+        # "positive" (weak peaks are discounted positives), "ignore" (masked
+        # out -- positives are the annotation alone, negatives the background
+        # alone), or "negative" (weak peaks train as background). None keeps
+        # `det_use_weak_positives`, so existing configs are unchanged.
+        det_weak_mode: str | None = None,
+        det_weak_ignore_radius: float = 0.0,
         det_ignore_radius: float = 0.0,
         det_ds_weight: float = 1.0,
         annot_loss_weight: float = 1.0,
@@ -447,7 +571,18 @@ class TrackingLoss(nn.Module):
         self.det_weak_weight = det_weak_weight
         self.det_weak_smoothing = det_weak_smoothing
         self.det_gaussian_sigma = det_gaussian_sigma
+        # Validated here, not at the first splat: sigma_per_axis only runs once
+        # a batch has been loaded, so a typo would otherwise surface minutes
+        # into a run instead of at construction.
+        if det_sigma_anchor not in SIGMA_ANCHORS:
+            raise ValueError(
+                f"det_sigma_anchor must be one of {SIGMA_ANCHORS}, "
+                f"got {det_sigma_anchor!r}"
+            )
+        self.det_sigma_anchor = det_sigma_anchor
         self.det_use_weak_positives = det_use_weak_positives
+        self.det_weak_mode = det_weak_mode
+        self.det_weak_ignore_radius = det_weak_ignore_radius
         self.det_ignore_radius = det_ignore_radius
         self.det_ds_weight = det_ds_weight
         self.annot_loss_weight = annot_loss_weight
@@ -482,6 +617,7 @@ class TrackingLoss(nn.Module):
         annot_logits_per_frame: (
             list[torch.Tensor] | None
         ) = None,  # W × (B, 1, Z, Y, X) on det_logits' grid, None when the head is off
+        voxel_size: Sequence[float] | None = None,  # image voxel, microns
         progress: float = 1.0,  # fraction of training elapsed, in [0, 1]
     ) -> tuple[torch.Tensor, dict[str, float]]:
         W = len(det_logits_per_frame)
@@ -501,13 +637,17 @@ class TrackingLoss(nn.Module):
                     gt_mask_per_frame[i],
                     self.det_neg_weight,
                     unet_scaling=scaling,
+                    voxel_size=voxel_size,
                     weak_weight=self.det_weak_weight,
                     weak_smoothing=self.det_weak_smoothing,
                     gaussian_sigma=self.det_gaussian_sigma,
+                    sigma_anchor=self.det_sigma_anchor,
                     weak_positives=(
                         weak_pos_per_frame[i] if weak_pos_per_frame is not None else None
                     ),
                     use_weak_positives=self.det_use_weak_positives,
+                    weak_mode=self.det_weak_mode,
+                    weak_ignore_radius=self.det_weak_ignore_radius,
                     ignore_positives=(
                         ignore_pos_per_frame[i]
                         if ignore_pos_per_frame is not None else None
@@ -563,8 +703,10 @@ class TrackingLoss(nn.Module):
                     gt_mask_per_frame[i],
                     self.annot_neg_weight,
                     unet_scaling=unet_scaling if det_stride is None else det_stride,
+                    voxel_size=voxel_size,
                     weak_smoothing=self.det_weak_smoothing,
                     gaussian_sigma=self.det_gaussian_sigma,
+                    sigma_anchor=self.det_sigma_anchor,
                     use_weak_positives=False,
                     pos_weight_scale=self.annot_pos_scale,
                 )

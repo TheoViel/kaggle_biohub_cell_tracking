@@ -123,14 +123,15 @@ def build_model(args, dataset: EdgeDataset, ctx):
 def _training_runs(args) -> list[dict]:
     runs = []
     for fold, val_embryo in enumerate(EMBRYOS):
-        if fold in args.selected_folds:
-            runs.append({
-                "name": f"fold_{fold}",
-                "fold": fold,
-                "train_embryos": [e for e in EMBRYOS if e != val_embryo],
-                "val_embryos": [val_embryo],
-                "leaky_val": False,
-            })
+        if args.selected_folds is not None:
+            if fold in args.selected_folds:
+                runs.append({
+                    "name": f"fold_{fold}",
+                    "fold": fold,
+                    "train_embryos": [e for e in EMBRYOS if e != val_embryo],
+                    "val_embryos": [val_embryo],
+                    "leaky_val": False,
+                })
     if getattr(args, "fullfit", False):
         runs.append({
             "name": "fold_fullfit",

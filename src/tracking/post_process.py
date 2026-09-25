@@ -139,6 +139,54 @@ def _peak_indices(
     raise ValueError(f"unknown nms mode {nms!r}, expected 'maxpool' or 'greedy'")
 
 
+def _centroid_peaks(
+    probas: torch.Tensor,
+    threshold: float,
+    voxel_size: tuple[float, float, float],
+    radius_um: float,
+    max_candidates: int = 50_000,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Greedy NMS clusters, returned as confidence-weighted centroids.
+
+    Same traversal and the same number of survivors as `detect_peaks_greedy`;
+    only the reported position differs -- the weighted mean of the ball rather
+    than its strongest voxel. See `utils/centroid_merge.py` for why the greedy
+    form and not single-linkage.
+
+    Returns float positions, so unlike the other two modes this one does not go
+    through `_stamp_time`'s int16 cast -- the sub-voxel refinement *is* the
+    point, and rounding it away would leave only the cluster-switching effect.
+
+    This mode does **not** nest across thresholds the way the other two do: a
+    lower threshold admits more members into a ball, which moves its centroid.
+    `detect_cells_multi_threshold` therefore runs it once per threshold instead
+    of filtering one pass, and costs what that implies.
+    """
+    from utils.centroid_merge import centroid_merge
+
+    above = probas > threshold
+    pts = torch.nonzero(above)
+    if pts.shape[0] == 0:
+        return np.empty((0, 3), np.float32), np.empty(0, np.float32)
+    scores = probas[above]
+    if pts.shape[0] > max_candidates:
+        keep = scores.topk(max_candidates).indices
+        pts, scores = pts[keep], scores[keep]
+    merged, kept = centroid_merge(
+        pts.float().cpu().numpy(), scores.float().cpu().numpy(),
+        radius=radius_um, scale=np.asarray(voxel_size, dtype=np.float64),
+    )
+    return merged.astype(np.float32), kept.astype(np.float32)
+
+
+def _stamp_time_f(points: np.ndarray, t: int) -> np.ndarray:
+    """`_stamp_time` for float positions -- no int16 cast."""
+    if len(points) == 0:
+        return np.empty((0, 4), dtype=np.float32)
+    t_col = np.full((len(points), 1), t, dtype=np.float32)
+    return np.concatenate([t_col, points.astype(np.float32)], axis=1)
+
+
 def _stamp_time(peak_idx: torch.Tensor, t: int) -> np.ndarray:
     """Prefix (N, 3) peak coordinates with their frame index."""
     if peak_idx.shape[0] == 0:
@@ -218,6 +266,16 @@ def detect_cells_multi_threshold(
 
     def out(coords, scores):
         return (coords, scores) if return_scores else coords
+
+    if nms == "centroid":
+        if voxel_size is None or nms_radius_um is None:
+            raise ValueError("nms='centroid' needs voxel_size and nms_radius_um")
+        # Per threshold, not one pass filtered: see `_centroid_peaks`.
+        return {
+            th: out(*(lambda pc: (_stamp_time_f(pc[0], t), pc[1]))(
+                _centroid_peaks(probas, th, voxel_size, nms_radius_um)))
+            for th in thresholds
+        }
 
     peak_idx = _peak_indices(
         probas, min(thresholds), nms=nms, pool_kernel=pool_kernel,

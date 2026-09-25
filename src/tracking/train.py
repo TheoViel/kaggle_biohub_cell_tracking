@@ -95,6 +95,29 @@ def fit(
         for param in core_model.parameters():
             param.requires_grad_(True)
 
+    # Freeze the UNet for the opening fraction of the stage, then hand it back.
+    #
+    # Stage 3 starts with a *randomly initialised* transformer -- `load_backbone`
+    # filters `transformer.` out of whatever checkpoint seeded the backbone --
+    # so on the first steps the edge loss is nearly pure noise. Training the two
+    # together from step 0 pushes that noise straight into a pretrained
+    # detector at `lr_unet`, and it does not survive: node recall fell from
+    # ~0.98 to 0.465 inside 100 steps at 9e-4, then spent the rest of the run
+    # climbing back. The warmup lets the head become worth listening to before
+    # anything it says reaches the backbone.
+    #
+    # Not the same knob as `optimizer_config.warmup_prop`, which ramps the
+    # learning rate for everything. This one is about *who* is being trained.
+    tf_warmup = float(getattr(args, "transformer_warmup_prop", 0.0) or 0.0)
+    backbone_frozen = bool(tf_warmup > 0.0) and not transformer_only
+    if backbone_frozen:
+        for name, param in core_model.named_parameters():
+            param.requires_grad_(name.startswith("transformer."))
+        # eval() as well as requires_grad_: BatchNorm's running statistics are
+        # buffers updated on the forward pass, so a detector frozen by
+        # gradients alone still drifts -- see `set_frozen_eval`.
+        set_frozen_eval(core_model, ("transformer",))
+
     # Mixup
     mix_config = getattr(args, "mixup", None) or {}
     mixer = None
@@ -168,7 +191,7 @@ def fit(
 
     for epoch in range(n_epochs):
         model.train()
-        if transformer_only:
+        if transformer_only or backbone_frozen:
             set_frozen_eval(core_model, ("transformer",))
 
         # Once the cache covers every window this rank will ever be given, the
@@ -223,8 +246,28 @@ def fit(
                 pre_emb = batch["pre_emb"].to(device, non_blocking=True)
 
             progress = global_step / max(total_steps, 1)
+            if backbone_frozen and progress >= tf_warmup:
+                backbone_frozen = False
+                for param in core_model.parameters():
+                    param.requires_grad_(True)
+                # Restores train mode on the modules `set_frozen_eval` put into
+                # eval; the optimiser already holds these parameters, since
+                # `define_optimizer` collects them all regardless of
+                # `requires_grad`, so they simply start moving again.
+                model.train()
             teacher_forcing = progress < getattr(args, "teacher_forcing_prop", 0.0)
-            edges_enabled = transformer_only or (global_step / total_steps > args.det_warmup_prop)
+            # `backbone_frozen` forces the edges on for the same reason
+            # `transformer_only` does: with the UNet frozen the edge head is the
+            # only thing that can learn, so a step without an edge loss has no
+            # trainable parameter in it at all. That is not merely wasted work
+            # -- the loss comes back with no `grad_fn` and `backward()` raises.
+            # It bites on step 0 of every run, where `progress` is 0.0 and
+            # `0.0 > det_warmup_prop` is false even at the default of 0.0.
+            edges_enabled = (
+                transformer_only
+                or backbone_frozen
+                or (global_step / total_steps > args.det_warmup_prop)
+            )
 
             with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                 if precomputed_nodes:
@@ -321,6 +364,9 @@ def fit(
                     det_stride=det_stride,
                     det_logits_ds_per_frame=det_logits_ds,
                     annot_logits_per_frame=annot_logits,
+                    # The splat is sized in grid voxels; the loss needs the
+                    # physical voxel to keep it round on a non-cubic grid.
+                    voxel_size=voxel_size,
                     weak_pos_per_frame=(
                         [weak_pos[:, i] for i in range(window_size)]
                         if weak_pos is not None else None
@@ -400,7 +446,7 @@ def fit(
                         for t, m in sorted(per_th.items())
                     )
                     model.train()
-                    if transformer_only:
+                    if transformer_only or backbone_frozen:
                         set_frozen_eval(core_model, ("transformer",))
                 elif eval_due and val_loader is not None:
                     (val_loss, val_edge_jaccard, val_node_recall,
@@ -430,7 +476,7 @@ def fit(
                         val_message = f"  val_loss={val_loss:.4f}" + val_message
 
                     model.train()
-                    if transformer_only:
+                    if transformer_only or backbone_frozen:
                         set_frozen_eval(core_model, ("transformer",))
 
                 # After the evaluation, so its cost shows up in the timing.
@@ -499,6 +545,16 @@ def _model_config(args) -> dict:
         "unet_stem": getattr(args, "unet_stem", "stride"),
         "unet_norm": getattr(args, "unet_norm", "batch"),
         "unet_hires_fusion": bool(getattr(args, "unet_hires_fusion", False)),
+        # "timm25d" only. This config exists to rebuild the model a checkpoint
+        # is about to be loaded into, and that load overwrites the ImageNet
+        # weights wholesale, so it records `pretrained=False` whatever training
+        # used -- fetching them again would only cost time.
+        "unet_timm_backbone": getattr(
+            args, "unet_timm_backbone", "convnext_nano.in12k_ft_in1k"
+        ),
+        "unet_timm_slice_size": int(getattr(args, "unet_timm_slice_size", 5)),
+        "unet_timm_max_levels": getattr(args, "unet_timm_max_levels", None),
+        "unet_timm_pretrained": False,
         "annot_head": bool(getattr(args, "annot_head", False)),
         "transformer_hidden": args.transformer_hidden,
         "transformer_heads": args.transformer_heads,

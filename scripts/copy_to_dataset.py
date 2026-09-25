@@ -63,6 +63,48 @@ def parse_tracking_from_nodes_folder(nodes_folder: str) -> tuple[str, str, Path]
     return date, exp, LOGS / date / exp
 
 
+def parse_tracking_runs(nodes_folder: str) -> list[tuple[str, str, Path]]:
+    """Every tracking run behind a nodes_folder, as (date, exp, run path).
+
+    A single-detector folder is ``../logs/<date>/<exp>/preds_*`` and yields one
+    run. An ensemble folder is ``../ensemble/<tag>/`` and yields *two* -- the
+    blend's settings.json records which detectors were fused, and both have to
+    reach Kaggle or the notebook cannot rebuild the node set at test time.
+    """
+    text = nodes_folder.replace("\\", "/").rstrip("/")
+    match = re.search(r"logs/(\d{4}-\d{2}-\d{2})/(\d+)/", text)
+    if match:
+        date, exp = match.group(1), match.group(2)
+        return [(date, exp, LOGS / date / exp)]
+
+    if "/ensemble/" in text or text.startswith("ensemble/"):
+        tag = text.split("ensemble/")[-1]
+        settings = ROOT / "ensemble" / tag / "settings.json"
+        if not settings.exists():
+            raise ValueError(
+                f"{nodes_folder!r} is an ensemble folder but {settings} is missing, "
+                "so the detectors behind it cannot be identified"
+            )
+        cfg = json.loads(settings.read_text())
+        # append blends name base_run/add_run; consensus blends model_a/model_b.
+        runs = [cfg.get(k) for k in ("base_run", "add_run", "model_a", "model_b")]
+        out = []
+        for r in runs:
+            if not r:
+                continue
+            m = re.search(r"logs/(\d{4}-\d{2}-\d{2})/(\d+)", r.replace("\\", "/"))
+            if not m:
+                raise ValueError(f"cannot parse a tracking run from {r!r}")
+            key = (m.group(1), m.group(2), LOGS / m.group(1) / m.group(2))
+            if key not in out:
+                out.append(key)
+        if not out:
+            raise ValueError(f"{settings} names no detector runs")
+        return out
+
+    raise ValueError(f"Cannot parse tracking run from nodes_folder: {nodes_folder!r}")
+
+
 def parse_contrastive_from_key(key: str) -> tuple[str, str, Path]:
     """embeddings_contrastive_2026-09-09_1 -> date, exp, run path."""
     match = re.fullmatch(r"embeddings_contrastive_(\d{4}-\d{2}-\d{2})_(\d+)", key)
@@ -174,17 +216,23 @@ def main() -> int:
         print("error: edge args.json has no embeddings_key", file=sys.stderr)
         return 1
 
-    tr_date, tr_exp, tracking_src = parse_tracking_from_nodes_folder(nodes_folder)
+    tracking_runs = parse_tracking_runs(nodes_folder)
     ct_date, ct_exp, contrastive_src = parse_contrastive_from_key(embeddings_key)
     edge_date, edge_exp = parse_edge_run_id(edge_src)
 
     print("Pipeline models:")
-    print(f"  tracking:    tracking_{tr_date}_{tr_exp}")
+    for tr_date, tr_exp, src in tracking_runs:
+        missing = "" if (src / "fold_fullfit" / "ckpt_final.pt").exists() else \
+            "   !! no fold_fullfit/ckpt_final.pt -- inference cannot load it"
+        print(f"  tracking:    tracking_{tr_date}_{tr_exp}{missing}")
     print(f"  contrastive: contrastive_{ct_date}_{ct_exp}")
     print(f"  edge:        edge_{edge_date}_{edge_exp}")
+    if len(tracking_runs) > 1:
+        print(f"  (ensemble node set -- all {len(tracking_runs)} detectors are needed)")
     print()
 
-    copy_run(tracking_src, f"tracking_{tr_date}_{tr_exp}", dest_root, args.dry_run)
+    for tr_date, tr_exp, src in tracking_runs:
+        copy_run(src, f"tracking_{tr_date}_{tr_exp}", dest_root, args.dry_run)
     copy_run(contrastive_src, f"contrastive_{ct_date}_{ct_exp}", dest_root, args.dry_run)
     copy_run(edge_src, f"edge_{edge_date}_{edge_exp}", dest_root, args.dry_run)
 

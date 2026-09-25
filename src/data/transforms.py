@@ -245,6 +245,8 @@ def random_crop_track(
     rng: np.random.Generator,
     anchor: bool = True,
     halo: Sequence[int] = (0, 0, 0),
+    border_margin: Sequence[float] | None = None,
+    border_keep: float = 0.5,
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
     tuple[int, int, int],
@@ -324,7 +326,8 @@ def random_crop_track(
         ]
 
     size = tuple(c + 2 * r for c, r in zip(crop_size, room))
-    return _crop_at(imgs, coords, point_sets, masks, targets, starts, size)
+    return _crop_at(imgs, coords, point_sets, masks, targets, starts, size,
+                    border_margin=border_margin, border_keep=border_keep)
 
 
 def _resolve_halo(halo, crop_size, spatial, anchor_lo=None, anchor_hi=None):
@@ -355,6 +358,15 @@ def _resolve_halo(halo, crop_size, spatial, anchor_lo=None, anchor_hi=None):
     return room
 
 
+# Index of the "no gradient here" point set, by the ordering every caller
+# builds: (weak_positives, ignore_positives, [pre_coords]).
+_IGNORE_SET = 1
+
+# Half a nucleus, microns. A cell whose centre sits within this of a crop face
+# still has body inside the crop; see the border handling in `_crop_at`.
+CELL_RADIUS_UM = 4.25
+
+
 def _crop_at(
     imgs: torch.Tensor,
     coords: torch.Tensor,
@@ -363,6 +375,8 @@ def _crop_at(
     targets: torch.Tensor,
     starts: Sequence[int],
     crop_size: tuple[int, int, int],
+    border_margin: Sequence[float] | None = None,
+    border_keep: float = 0.5,
 ):
     """Take the box at ``starts``, shifting every label with it."""
     starts = [int(v) for v in starts]
@@ -371,12 +385,30 @@ def _crop_at(
     imgs = imgs[:, z0:(z0 + cz), y0:(y0 + cy), x0:(x0 + cx)]
 
     offset = coords.new_tensor(starts)
-    shifted_coords = coords - offset
+    shifted = coords - offset
+    shifted_coords = shifted
     voxels = torch.floor(coords).to(torch.long)
     starts_t = voxels.new_tensor(starts)
     ends_t = starts_t + voxels.new_tensor(list(crop_size))
     in_crop = ((voxels >= starts_t) & (voxels < ends_t)).all(dim=-1)
     keep = masks & in_crop
+
+    # A crop that cuts a cell leaves its centre outside while its body stays in
+    # frame, and dropping it puts the visible half under the negative term -- a
+    # gradient saying "this cell is background", on ~33% of the cells a crop
+    # overlaps (measured on dense annotation, 2026-09-22). How far outside the
+    # centre lies says how much is left of the cell: inside `border_keep` of a
+    # nucleus radius most of it still shows, so keep it and let the clamp below
+    # move its centre onto the face it left through. The position is wrong by
+    # at most that fraction of a radius, which is under the 3 um the metric
+    # matches on. Past it only a sliver is visible and a peak there would claim
+    # a centre the image cannot support, so it is still dropped.
+    if border_margin is not None:
+        margin = shifted.new_tensor(list(border_margin)).clamp(min=1e-6)
+        over = torch.maximum(starts_t - voxels, voxels - (ends_t - 1))
+        over = over.clamp(min=0).to(shifted.dtype)
+        mostly_visible = ((over / margin) <= float(border_keep)).all(dim=-1)
+        keep = masks & (in_crop | mostly_visible)
 
     # Containment is decided on the voxel a coordinate falls in, so a cell at
     # 63.7 of a 64-wide crop is inside it -- but the coordinate itself then
@@ -442,6 +474,8 @@ def centre_crop_track(
     masks: torch.Tensor,
     targets: torch.Tensor,
     crop_size: tuple[int, int, int],
+    border_margin: Sequence[float] | None = None,
+    border_keep: float = 0.5,
 ):
     """Cut the middle ``crop_size`` box out of a window, labels and all.
 
@@ -451,7 +485,8 @@ def centre_crop_track(
     spatial = tuple(imgs.shape[1:])
     crop_size = tuple(min(c, n) for c, n in zip(crop_size, spatial))
     starts = [(n - c) // 2 for n, c in zip(spatial, crop_size)]
-    out = _crop_at(imgs, coords, point_sets, masks, targets, starts, crop_size)
+    out = _crop_at(imgs, coords, point_sets, masks, targets, starts, crop_size,
+                   border_margin=border_margin, border_keep=border_keep)
     return (*out[:5], crop_size)
 
 
@@ -543,19 +578,45 @@ def _sample_grid(
     a_inv: torch.Tensor,        # (3, 3) physical inverse map
     voxel_size: torch.Tensor,   # (3,)
 ) -> torch.Tensor:
-    """grid_sample grid pulling ``shape_out`` voxels out of ``shape_in``."""
-    s = voxel_size.to(torch.float64)
-    axes = [
-        (torch.arange(n, dtype=torch.float64) - (n - 1) / 2.0) * s[i]
-        for i, n in enumerate(shape_out)
-    ]
-    q = torch.stack(torch.meshgrid(*axes, indexing="ij"), dim=-1)  # (Cz, Cy, Cx, 3) µm
-    v = centre.to(torch.float64) + (q @ a_inv.T) / s               # input voxel coords
+    """grid_sample grid pulling ``shape_out`` voxels out of ``shape_in``.
 
-    # grid_sample wants normalised coords, last axis ordered (x, y, z).
+    The map is affine, so it is separable: the output voxel (i, j, k) reads
+    ``centre + (A^-1 (z_i + y_j + x_k)) / s``, and A^-1 distributes over that
+    sum. Building the three 1-D terms and broadcasting their sum costs three
+    (n, 3) outer products instead of materialising a (Cz, Cy, Cx, 3) meshgrid
+    and pushing it through a 3x3 matmul -- the same numbers, ~4x less work, and
+    it was the single most expensive thing in the augmentation pipeline (360 of
+    the affine's 466 ms on a 48x192x192 window, measured 2026-09-23).
+
+    The per-axis terms stay in float64 so the geometry is still resolved
+    exactly; only the broadcast sum and the normalisation run in float32, which
+    is what ``grid_sample`` consumes anyway. Peak coordinate error against the
+    all-float64 version is 1.2e-7 in normalised units, i.e. 2e-5 of a voxel.
+    """
+    s = voxel_size.to(torch.float64)
     lengths = torch.tensor(shape_in, dtype=torch.float64)
-    n = (2.0 * v + 1.0) / lengths - 1.0
-    return n.flip(-1).unsqueeze(0).float()
+    a_inv = a_inv.to(torch.float64)
+
+    # Each axis contributes `coord_um * column of A^-1`, in input voxels, then
+    # pre-normalised to [-1, 1]. The `+ centre` and the `- 1` ride on z alone so
+    # the broadcast sum stays a plain addition.
+    terms = []
+    for i, n in enumerate(shape_out):
+        um = (torch.arange(n, dtype=torch.float64) - (n - 1) / 2.0) * s[i]
+        vox = torch.outer(um, a_inv[:, i]) / s          # (n, 3) input voxels
+        if i == 0:
+            vox = vox + centre.to(torch.float64)
+        term = 2.0 * vox / lengths
+        if i == 0:
+            term = term + 1.0 / lengths - 1.0
+        terms.append(term.float())
+
+    n = (terms[0][:, None, None, :]
+         + terms[1][None, :, None, :]
+         + terms[2][None, None, :, :])
+
+    # grid_sample wants the last axis ordered (x, y, z).
+    return n.flip(-1).unsqueeze(0)
 
 
 def _map_points(
@@ -783,11 +844,19 @@ def blur_augment(
     voxel_size: tuple[float, float, float],
     sigma_um: float = 1.0,
 ) -> torch.Tensor:
-    """Separable Gaussian blur with a physical sigma, widening the PSF."""
+    """Separable Gaussian blur with a physical sigma, widening the PSF.
+
+    Each pass is a ``conv1d`` over the blurred axis moved to the end, not a
+    ``conv3d`` with a 1x1xK kernel: the degenerate-kernel conv3d hits a generic
+    im2col path that is ~4x slower for bit-identical output (453 -> 115 ms on a
+    2x48x192x192 window, single-threaded, measured 2026-09-23). At sigma_um 1.0
+    and 0.40625 um voxels the Y/X kernels are 17 taps, so this is the second
+    most expensive augmentation after the affine.
+    """
     sigma = float(rng.uniform(0.0, sigma_um))
     if sigma <= 0:
         return imgs
-    out = imgs.unsqueeze(1).float()
+    out = imgs.float()
     for axis, vs in enumerate(voxel_size):
         s = sigma / float(vs)
         radius = int(np.ceil(3 * s))
@@ -795,13 +864,19 @@ def blur_augment(
             continue
         t = torch.arange(-radius, radius + 1, dtype=torch.float32)
         k = torch.exp(-0.5 * (t / s) ** 2)
-        k = k / k.sum()
-        shape = [1, 1, 1, 1, 1]
-        shape[2 + axis] = k.numel()
-        pad = [0, 0, 0, 0, 0, 0]
-        pad[2 * (2 - axis)] = pad[2 * (2 - axis) + 1] = radius
-        out = F.conv3d(F.pad(out, pad, mode="replicate"), k.view(shape))
-    return out.squeeze(1)
+        k = (k / k.sum()).view(1, 1, -1)
+        # (W, Z, Y, X) -> the blurred axis last, then one row per line of voxels
+        # so a depthwise conv1d sweeps all of them in one call.
+        moved = out.movedim(axis + 1, -1)
+        shape = moved.shape
+        flat = moved.reshape(1, -1, shape[-1])
+        flat = F.conv1d(
+            F.pad(flat, (radius, radius), mode="replicate"),
+            k.expand(flat.shape[1], 1, -1),
+            groups=flat.shape[1],
+        )
+        out = flat.reshape(shape).movedim(-1, axis + 1)
+    return out
 
 
 def background_level_augment(
@@ -1240,6 +1315,14 @@ AUG_DEFAULTS: dict = {
     # the volume, including the ~53% of it that holds no cells — which is what
     # the detector otherwise never sees, and why it over-predicts.
     "crop_anchor_p": 1.0,
+    # A crop that cuts a cell leaves its centre outside it while the body stays
+    # in frame. Keep such a cell when its centre is within this fraction of a
+    # nucleus radius of the face — `_crop_at` then clamps the centre onto that
+    # face, wrong by at most 0.5 * 4.25 um, under the 3 um the metric matches
+    # on. Beyond it too little of the cell is left to place a peak on and it is
+    # dropped. 0 restores the old behaviour of dropping every cut cell, which
+    # left their visible halves supervised as background.
+    "border_keep": 0.5,
     # Frame gap within a window. 1 is consecutive frames; higher values are
     # built at load time, so this is read by build_loader, not per sample.
     "time_stride_max": 1,
@@ -1362,12 +1445,18 @@ def augment_track(
             halo=halo,
         )
 
+    # One nucleus radius, in voxels of this stack -- the reach over which a
+    # cut cell still shows body inside the crop.
+    border_margin = [CELL_RADIUS_UM / float(v) for v in voxel_size]
+    border_keep = float(cfg.get("border_keep", 0.5))
+
     if done is not None:
         imgs, coords, point_sets, masks, targets, coord_spatial = done
     elif crop_size is not None:
         imgs, coords, point_sets, masks, targets, _ = random_crop_track(
             imgs, coords, point_sets, masks, targets, crop_size, rng,
-            anchor=anchor, halo=halo,
+            anchor=anchor, halo=halo, border_margin=border_margin,
+            border_keep=border_keep,
         )
         coord_spatial = tuple(imgs.shape[1:])
 
@@ -1392,7 +1481,8 @@ def augment_track(
     # to the oversized one would deliver only their middle to the model.
     if crop_size is not None and tuple(coord_spatial) != tuple(crop_size):
         imgs, coords, point_sets, masks, targets, coord_spatial = centre_crop_track(
-            imgs, coords, point_sets, masks, targets, crop_size
+            imgs, coords, point_sets, masks, targets, crop_size,
+            border_margin=border_margin, border_keep=border_keep,
         )
 
     if rng.random() < cfg["brightness_p"]:

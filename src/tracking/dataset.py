@@ -14,6 +14,8 @@ from data.transforms import (
 from tracking.data import (
     VideoMeta,
     FrameWindowData,
+    apply_normalization,
+    frame_anchors,
     load_dataset_windows,
     _pad_window,
 )
@@ -415,9 +417,24 @@ class TrackDataset(Dataset):
             else:
                 raw = z_arr[t_slice]
 
-            imgs = torch.from_numpy(
-                (raw.astype(np.float32) - vm.q_low) / (vm.q_high - vm.q_low + 1e-6)
-            ).clamp(0.0, self.clamp_max)  # (W, Z, Y, X)
+            raw = raw.astype(np.float32)
+            # self.clamp_max is the dataset's own knob and stays authoritative,
+            # so the two branches cannot clamp differently.
+            norm = {**(vm.norm or {"scope": "video", "clamp_min": 0.0}),
+                    "clamp_max": self.clamp_max}
+            if norm.get("scope") == "frame":
+                # Anchors per frame, so illumination drift across a stack does
+                # not shift the detector's operating point mid-video.
+                imgs = torch.from_numpy(
+                    np.stack([
+                        apply_normalization(fr, *frame_anchors(fr, norm), norm)
+                        for fr in raw
+                    ])
+                )
+            else:
+                imgs = torch.from_numpy(
+                    (raw - vm.q_low) / (vm.q_high - vm.q_low + 1e-6)
+                ).clamp(float(norm.get("clamp_min", 0.0)), self.clamp_max)  # (W, Z, Y, X)
         else:
             # Transformer-only training after the first epoch: the node features
             # are cached, so decompressing the volume is pure waste. The shape is

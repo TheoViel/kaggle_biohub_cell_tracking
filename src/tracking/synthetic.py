@@ -35,6 +35,8 @@ never looks at edges, but it would bias a division prior trained on this.
 
 from __future__ import annotations
 
+import json
+from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
@@ -59,6 +61,44 @@ def find_sequences(root: str | Path) -> list[Path]:
         if files:
             return files
     raise FileNotFoundError(f"No seq_*.npz under {root} or {root / 'sequences'}")
+
+
+def find_embryo_sequences(
+    root: str | Path, embryos: Sequence[str], max_nodes: int | None = None
+) -> list[Path]:
+    """Crops for each named embryo under ``root``, one subdirectory per embryo.
+
+    ``scripts/make_zebrahub_crops.py`` writes ``<root>/<embryo>/sequences/seq_*.npz``
+    beside a ``metadata.json`` recording how they were generated. These are real
+    images in the synthetic set's format, so they load through the same dataset.
+
+    Passing ``max_nodes`` checks it against each embryo's recorded
+    ``max_cells_per_frame``. Unlike the synthetic set these crops annotate every
+    cell, so a frame holding more than ``max_nodes`` is silently truncated and
+    the dropped cells then supervise as background -- the one error this data
+    exists to avoid, and not something that shows up in a loss curve.
+    """
+    root = Path(root)
+    files: list[Path] = []
+    for name in embryos:
+        directory = root / name
+        if not directory.is_dir():
+            available = sorted(p.name for p in root.iterdir() if p.is_dir()) if root.is_dir() else []
+            raise FileNotFoundError(
+                f"No crops for embryo {name!r} under {root}; available: {available}"
+            )
+        meta_path = directory / "metadata.json"
+        if max_nodes is not None and meta_path.exists():
+            needed = int(json.loads(meta_path.read_text()).get("max_cells_per_frame", 0))
+            if needed > max_nodes:
+                raise ValueError(
+                    f"embryo {name!r} has frames of up to {needed} cells but max_nodes is "
+                    f"{max_nodes}: every cell past it would be dropped and supervised as "
+                    f"background. Raise max_nodes to >= {needed}, or rebuild the crops with "
+                    f"--max-cells {max_nodes}."
+                )
+        files += find_sequences(directory)
+    return files
 
 
 class SyntheticDataset(Dataset):
@@ -334,27 +374,39 @@ def mosaic_samples(
 
 
 class MixedDataset(Dataset):
-    """Real windows, with a ``proportion`` of them replaced by synthetic ones.
+    """Real windows, with a share of them replaced by ones from other sources.
+
+    ``sources`` is a sequence of ``(dataset, proportion)``. Each proportion is a
+    share of the whole, so they must sum to at most 1 and the remainder is drawn
+    from ``real``: at ``[(synthetic, 0.3), (zebrahub, 0.2)]`` half the samples
+    are real. Sources with a proportion of 0 are dropped, so a stage that
+    configures only one of them costs nothing for the others.
 
     Length and index space are the real dataset's, so the samplers around it --
     DistributedSampler, the stable-shard SubsetRandomSampler -- keep working
     unchanged and every rank still gets an equal share. The draw is per access,
-    like the augmentations', so the proportion holds in expectation over an
+    like the augmentations', so the proportions hold in expectation over an
     epoch rather than exactly within it.
     """
 
-    def __init__(self, real: Dataset, synthetic: Dataset, proportion: float):
-        if not 0.0 <= proportion <= 1.0:
-            raise ValueError(f"proportion must be in [0, 1], got {proportion}")
+    def __init__(self, real: Dataset, sources: Sequence[tuple[Dataset, float]]):
         self.real = real
-        self.synthetic = synthetic
-        self.proportion = float(proportion)
-        # The two halves must collate together, and the real path's padding
+        self.sources = [
+            (dataset, float(proportion))
+            for dataset, proportion in sources
+            if dataset is not None and float(proportion) > 0 and len(dataset)
+        ]
+        self.proportion = sum(p for _, p in self.sources)
+        if self.proportion > 1.0:
+            raise ValueError(
+                f"source proportions must sum to at most 1, got {self.proportion}"
+            )
+        # The halves must collate together, and the real path's padding
         # widths depend on the weak-positive config in ways not worth
         # reproducing here (which strategy, whether a pl_ignore folder is set).
         # Read them off one real sample instead, once, in the parent process.
         self._widths: dict[str, int] = {}
-        if proportion > 0 and len(real):
+        if self.sources and len(real):
             probe = real[0]
             for key in ("weak_positives", "ignore_positives"):
                 if key in probe:
@@ -372,8 +424,8 @@ class MixedDataset(Dataset):
         extra = set(sample) - self._keys
         if missing or extra:
             raise KeyError(
-                "synthetic and real samples must carry the same keys to collate; "
-                f"synthetic is missing {sorted(missing)} and adds {sorted(extra)}"
+                "mixed-in and real samples must carry the same keys to collate; "
+                f"the mixed-in one is missing {sorted(missing)} and adds {sorted(extra)}"
             )
         for key, width in self._widths.items():
             pts = sample.get(key)
@@ -403,7 +455,11 @@ class MixedDataset(Dataset):
         return self.real.crop_size
 
     def __getitem__(self, idx: int):
-        if self.proportion > 0 and np.random.default_rng().random() < self.proportion:
-            j = int(np.random.default_rng().integers(0, len(self.synthetic)))
-            return self._match_widths(self.synthetic[j])
+        if self.sources:
+            rng = np.random.default_rng()
+            draw = rng.random()
+            for dataset, proportion in self.sources:
+                if draw < proportion:
+                    return self._match_widths(dataset[int(rng.integers(0, len(dataset)))])
+                draw -= proportion
         return self.real[idx]
