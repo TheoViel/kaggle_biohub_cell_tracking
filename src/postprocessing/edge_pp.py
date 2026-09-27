@@ -52,9 +52,17 @@ def load_pred(path):
     `coords` comes back as float64 -- the file stores int16 to stay small, but
     every stage downstream works in microns and `recover` writes sub-voxel
     positions, so widening once here keeps the rest of the module honest.
+
+    `coords_f` is preferred when the folder carries it: widening the rounded
+    column recovers nothing, and the detection head's sub-voxel offsets are a
+    mean 0.33 voxel that every micron gate and every image crop below this
+    point would otherwise be reading through a quantiser. Folders written
+    before `main_edge_predict.py` carried the column fall back to `coords`, so
+    an old run still loads and still reproduces its own numbers.
     """
     data = np.load(path, allow_pickle=True)
-    coords = data["coords"].astype(np.float64)
+    coords = (data["coords_f"] if "coords_f" in data.files
+              else data["coords"]).astype(np.float64)
     edges = data["edges"].astype(np.float64).reshape(-1, 4)
     cand = (data["candidates"].astype(np.float64).reshape(-1, 5)
             if "candidates" in data.files else np.empty((0, 5)))

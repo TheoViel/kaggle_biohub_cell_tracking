@@ -467,6 +467,62 @@ def crop_halo(
     )
 
 
+def required_crop_margin(cfg: dict, crop_size, voxel_size) -> float:
+    """The smallest ``crop_margin`` that still lets the affine read real data.
+
+    The halo exists so ``affine_track`` samples inside the volume instead of
+    into zero padding, and how much it needs is a property of the transform,
+    not a constant:
+
+    * a rotation by theta in the imaging plane maps the output box to its
+      bounding box, so the half-extent along y becomes ``hy|cos| + hx|sin|`` --
+      at 45 degrees on a square crop that is the ``sqrt(2)`` the 1.5 default was
+      chosen to clear;
+    * an out-of-plane tilt does the same, mixing z with y/x;
+    * shrinking by ``k`` stretches the read region by ``1/k``, so the binding
+      case is the smallest factor ``scale_range`` and ``anisotropic_scale`` can
+      draw between them;
+    * ``shift_um`` moves the read centre by that many microns on top.
+
+    With rotations off -- which is the shipped configuration, ``rot_z_deg`` and
+    ``rot_xy_deg`` both 0 -- none of the rotation terms apply and the answer
+    collapses to ``1 / min_scale``: 1.111 at ``scale_range`` (0.9, 1.45),
+    against the 1.5 that was being paid. The difference is halo voxels taken out
+    of the volume for nothing; see the note in ``augment_track``.
+
+    Angles are swept numerically rather than solved, because the worst case sits
+    at 45 degrees only for a square crop and at an interior angle otherwise.
+    Returns one factor, the max over axes, since ``crop_halo`` takes one.
+    """
+    h = np.asarray(crop_size, dtype=np.float64) / 2.0 * np.asarray(voxel_size, np.float64)
+    if not np.isfinite(h).all() or (h <= 0).any():
+        return float(cfg.get("crop_margin", 1.0))
+
+    reach = h.copy()                      # physical half-extent the affine reads
+
+    def sweep(ax_a, ax_b, deg):
+        """Worst bounding half-extent when ax_a/ax_b rotate into each other."""
+        if not deg:
+            return
+        t = np.radians(np.linspace(0.0, float(deg), 91))
+        ca, sa = np.abs(np.cos(t)), np.abs(np.sin(t))
+        reach[ax_a] = max(reach[ax_a], float((h[ax_a] * ca + h[ax_b] * sa).max()))
+        reach[ax_b] = max(reach[ax_b], float((h[ax_b] * ca + h[ax_a] * sa).max()))
+
+    sweep(1, 2, cfg.get("rot_z_deg", 0.0))          # in-plane: y against x
+    sweep(0, 1, cfg.get("rot_xy_deg", 0.0))         # tilt: z against y
+    sweep(0, 2, cfg.get("rot_xy_deg", 0.0))         # tilt: z against x
+
+    bounds = _scale_bounds(cfg.get("scale_range", 0.0))
+    k_min = float(bounds[0]) if bounds else 1.0
+    k_min *= float(np.exp(-abs(float(cfg.get("anisotropic_scale", 0.0)))))
+    if k_min > 0:
+        reach = reach / k_min
+
+    reach = reach + abs(float(cfg.get("shift_um", 0.0)))
+    return float(np.max(reach / h))
+
+
 def centre_crop_track(
     imgs: torch.Tensor,
     coords: torch.Tensor,
@@ -1423,12 +1479,53 @@ def augment_track(
     # and shared by whichever crop path runs.
     anchor = rng.random() < cfg["crop_anchor_p"]
 
-    # Context for the resampling stages to consume: the crop is placed exactly
-    # as it always was, then widened by up to this many voxels a side.
-    halo = crop_halo(crop_size, tuple(imgs.shape[1:]), cfg["crop_margin"])
+    # Whether this sample gets the affine, drawn here rather than at the call
+    # below because the halo depends on it. The draw order is unchanged --
+    # `anchor` then this -- so the RNG stream is identical to before.
+    do_affine = rng.random() < cfg["affine_p"]
+
+    # Context for the rotation to read into, and *only* for it.
+    #
+    # The halo is taken out of the volume rather than added around the crop:
+    # `random_crop_track` draws `start` in [0, size - crop - 2r] and returns
+    # `crop + 2r`, which the centre-crop trims back to `crop`, so the delivered
+    # voxels always begin at `start + r >= r`. The outermost r voxels of every
+    # axis are therefore never shown to the model -- at crop (32, 128, 128) and
+    # margin 1.5, r = (8, 32, 32), a third of the z range of a 48-slice stack
+    # and 20% of a 320-wide axis, invisible for all of training while inference
+    # is asked about them.
+    #
+    # Only `affine_track` earns that price, and only because a rotation pulls
+    # padding into the corners. Measured depth of the border artefact the other
+    # two leave, against a halo of (8, 32, 32):
+    #
+    #     blur, sigma_um 1.0      (1, 4, 4)     bounded by the replicate-padded
+    #     blur, sigma_um 2.0      (0, 1, 1)     kernel radius
+    #     lowres, factor <= 2     global        F.interpolate resamples on a
+    #                                           grid whose phase follows the
+    #                                           input extent, so a halo shifts
+    #                                           the phase rather than removing
+    #                                           an edge artefact -- it never
+    #                                           fixed lowres in the first place
+    #
+    # So the halo is taken when the affine fires and not otherwise. That covers
+    # aug_strength 0 and 1 entirely (affine_p 0) and about half the samples at
+    # rung 3 (affine_p 0.5).
+    # `crop_margin` is an upper bound, not the value used: `required_crop_margin`
+    # reads the affine's own parameters and returns what it actually needs. With
+    # the shipped rotations-off config that is 1.111 rather than 1.5, so the
+    # halo shrinks from (8, 32, 32) to (2, 7, 7) voxels.
+    margin = min(
+        float(cfg["crop_margin"]),
+        required_crop_margin(cfg, crop_size, voxel_size),
+    ) if crop_size is not None else float(cfg["crop_margin"])
+    halo = (
+        crop_halo(crop_size, tuple(imgs.shape[1:]), margin)
+        if do_affine else (0, 0, 0)
+    )
 
     done = None
-    if rng.random() < cfg["affine_p"]:
+    if do_affine:
         done = affine_track(
             imgs, coords, point_sets, masks, targets,
             out_size=crop_size,

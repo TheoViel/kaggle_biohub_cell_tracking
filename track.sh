@@ -13,17 +13,27 @@ n_gpus=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
 
 cd src
 
-torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" main_track.py
-
 torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" main_predict.py \
-    --det_threshold 0.3,0.35,0.4,0.45,0.5 \
+    --det_threshold 0.3,0.35,0.4,0.45,0.5,0.55,0.6,0.65,0.7 \
     --nms_radius_um 6,7 \
 
 torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" main_track.py
 
 torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" main_predict.py \
-    --det_threshold 0.3,0.35,0.4,0.45 \
+    --det_threshold 0.3,0.35,0.4,0.45,0.5,0.55,0.6,0.65,0.7 \
     --nms_radius_um 6,7 \
+
+# torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" main_track.py
+
+# torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" main_predict.py \
+#     --det_threshold 0.4,0.45,0.5,0.55,0.6,0.65,0.7 \
+#     # --nms_radius_um 6,7 \
+
+# torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" main_predict.py \
+#     --det_threshold 0.4,0.45,0.5,0.55,0.6,0.65,0.7 \
+#     --nms_radius_um 6,7 \
+#     --pl \
+#     --log_folder ../logs/2026-09-25/4/
 
 # torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" main_predict.py \
 #     --det_threshold 0.3,0.4,0.5,0.6 \

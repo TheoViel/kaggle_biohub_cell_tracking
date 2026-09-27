@@ -51,6 +51,7 @@ class VideoData:
     rows_by_frame: dict[int, np.ndarray]
     links: dict[int, np.ndarray]                # t -> (K, 3) [src_row, tgt_row, _]
     frames: np.ndarray
+    coords_exact: np.ndarray | None = None      # (N, 4) float32, pre-rounding
     n_gt_added: int = 0                         # unmatched GT nodes appended
     pl_links: dict[int, np.ndarray] | None = None   # t -> (K, 2), pseudo-labels
     n_pl_dropped: int = 0                       # pseudo-labels the GT contradicted
@@ -220,6 +221,18 @@ def load_video(
     """
     with np.load(node_path) as d:
         coords = np.asarray(d["coords"]).astype(np.float32)
+        # The same positions before the detector rounded them to the voxel
+        # grid. Deliberately *not* used as the model's input: every edge
+        # checkpoint was trained on the rounded column, and swapping the
+        # inference features for a distribution the model never saw is a
+        # change that has to be measured, not assumed. It is carried through
+        # to the prediction npz so post-processing and the division
+        # classifier -- which derive micron distances and centre image crops
+        # on these positions -- can work from what the detector actually
+        # predicted. Rounding discards a mean 0.33 voxel, and the same loss
+        # later in the chain was worth 0.0140 cv.
+        coords_exact = (np.asarray(d["coords_f"]).astype(np.float32)
+                        if "coords_f" in d.files else None)
         emb = None
         if use_embeddings:
             if embeddings_key not in d:
@@ -271,6 +284,13 @@ def load_video(
             # both read a frame's rows in file order, so the new nodes simply
             # come last within their frame.
             coords = np.concatenate([coords, gt_coords[add]], axis=0)
+            if coords_exact is not None:
+                # Row alignment with `coords` is the whole contract of this
+                # array, so it has to grow with it. A GT node has no rounded
+                # and unrounded form -- its annotated position is exact -- so
+                # the same rows go in.
+                coords_exact = np.concatenate(
+                    [coords_exact, gt_coords[add]], axis=0)
             if emb is not None:
                 emb = np.concatenate([emb, gt_emb[add]], axis=0)
             if conf is not None:
@@ -300,7 +320,8 @@ def load_video(
     )
 
     return VideoData(
-        name=name, path=ds_path, coords=coords, emb=emb, conf=conf,
+        name=name, path=ds_path, coords=coords, coords_exact=coords_exact,
+        emb=emb, conf=conf,
         rows_by_frame=rows_by_frame, links=links, frames=frames,
         n_gt_added=n_gt_added, pl_links=pl_links, n_pl_dropped=n_pl_dropped,
     )

@@ -86,6 +86,11 @@ def main() -> None:
                         "every kept base node; must clear the NMS radius")
     p.add_argument("--both-directions", action="store_true",
                    help="append mode: also try the partner as the base")
+    p.add_argument("--candidates", default=None,
+                   help="comma-separated runs to pair with --partner, e.g. "
+                        "'2026-09-26/1'. Default: the CANDIDATES list above. "
+                        "In append mode the candidate is the *base* and the "
+                        "partner is appended, so this names the base")
     p.add_argument("--tag", default="r6_0.30")
     p.add_argument("--fallback-tag", default="r6_0.40")
     p.add_argument("--jobs", type=int, default=48)
@@ -103,7 +108,8 @@ def main() -> None:
         raise SystemExit(f"no predictions under {partner}")
 
     cands = []
-    for c in CANDIDATES:
+    for c in (([s.strip() for s in args.candidates.split(",")] if args.candidates
+               else CANDIDATES)):
         run = REPO / "logs" / c
         if run == partner:
             continue

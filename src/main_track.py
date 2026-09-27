@@ -217,7 +217,7 @@ DEFAULTS = {
     # Aux heads
     "offset_head": False,
     "offset_radius": 2,       # grid voxels a cell's vote reaches
-    "annot_head": False,  # A second head asking "would an annotator have labelled this cell"
+    "annot_head": True,  # False,  # A second head asking "would an annotator have labelled this cell"
 
     # Stage 1 - Synthetic data pretraining
     "synthetic_pretraining": {
@@ -267,13 +267,12 @@ DEFAULTS = {
         # Override the image peaks above; combined with pl_folder when both are
         # set, the pl_folder point winning any duplicate. A stack the folder does
         # not cover or that fails a gate below falls back to the image peaks.
-        "use_focus_3d": True,
+        "use_focus_3d": False,
         "focus_3d_dir": OUTPUT_FOLDER + "focus3d/",
         "focus_3d_min_recall": 0.5,   # drop a stack that misses annotated cells
         "focus_3d_max_ratio": 1.25,    # drop a stack predicting far too many cells
         # Weak positives from pl_folder - V1
         # "pl_folder": "../logs/2026-09-01/9/preds_pl_pp/",  # 2nd round PL + PP  --  BEST
-        "pl_folder": "../logs/2026-09-23/3/preds_pl_pp/",  # Focus3D + Synth + 0.1 extra
         "pl_folder": "../logs/2026-09-23/5/preds_pl_pp/",  # Round 2
         # Weak positives from pl_folder - V2
         # "pl_folder": "../logs/2026-09-13/1/preds_pl_0.60_annot_head/",  # 2nd round PL + PP
@@ -287,11 +286,8 @@ DEFAULTS = {
     # Stage 1.5 - Pretraining
     "pretraining": {
         "enabled": True,
-        # "weights": "../logs/2026-09-13/1/fold_0/ckpt_synthetic.pt",  # temporal wide
-        "weights": "../logs/2026-09-22/10/fold_0/ckpt_synthetic.pt",  # temporal wide
-        # "weights": "../logs/2026-09-15/0/fold_0/ckpt_synthetic.pt",  # temporal_v2
-        # "weights": "../logs/2026-09-20/1/fold_0/ckpt_synthetic.pt",  # timm25d
-        # "weights": "../logs/2026-09-13/1/fold_*/ckpt_pretrain.pt",  # "../logs/2026-09-11/3/fold_*/ckpt_pretrain.pt",
+        "weights": "../logs/2026-09-13/1/fold_0/ckpt_synthetic.pt",  # temporal wide 13/1
+        # "weights": "../logs/2026-09-22/10/fold_0/ckpt_synthetic.pt",  # temporal wide new
         # "weights": None,
         # Data
         "crop_size": (32, 128, 128),  # (48, 192, 192)
@@ -308,7 +304,7 @@ DEFAULTS = {
         # Training
         # 2500 is run 6 (0.7693); 2000 run 7 (0.7562), 4000 run 8 (0.7686) --
         # non-monotonic, so 2500 vs 4000 is a coin flip and 2000 is short.
-        "iterations": 3000,
+        "iterations": 5000,
         "epochs": None,
         "batch_size": 16,
         # Eval
@@ -378,7 +374,7 @@ DEFAULTS = {
         "det_use_weak_positives": True,
         "det_loss_weight": 1,
         "det_neg_weight": 0.05,
-        "det_weak_weight": 0.5,        # To balance GT share of positive weight 
+        "det_weak_weight": 0.2,        # To balance GT share of positive weight 
         "det_weak_smoothing": 0.01,      # smoothing factor for weak positives
         "det_gaussian_sigma": 1.0,
         # How that scalar sigma is restated per axis on the fine (1,2,2)

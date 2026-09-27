@@ -75,7 +75,16 @@ def build_candidates(preds_dir, out_path):
     stem_col, tables = [], []
     for stem in stems:
         z = np.load(Path(preds_dir) / f"{stem}.npz")
-        table = forks_table(z["coords"].astype(float),
+        # `coords` is rounded to the voxel grid on the way to disk, and the
+        # features below (parent_dist_um, sister_dist_um) plus the crop centre
+        # are derived from these positions -- so the rounded copy makes this
+        # gate score something the chain never proposed. Measured: reading
+        # `coords` instead of `coords_exact` costs 0.0140 cv on
+        # edge_run/2026-09-24/4 (0.8715 against the sweep's 0.8855), because
+        # the shifted features move the classifier off its saturated regime
+        # and it then rejects 2.5x as many forks.
+        coords = z["coords_exact"] if "coords_exact" in z.files else z["coords"]
+        table = forks_table(np.asarray(coords, float),
                             np.asarray(z["edges"], float).reshape(-1, 4))
         if len(table):
             stem_col += [stem] * len(table)
@@ -87,11 +96,51 @@ def build_candidates(preds_dir, out_path):
     return stems, len(table)
 
 
+def rank_per_stack(stems, score):
+    """`score` replaced by its within-stack rank in [0, 1], NaN preserved.
+
+    Identical to `merge_fork_scores.py --mode rank`, and for its reasons: the
+    models are calibrated differently -- one saturates at 0/1, another does not
+    -- so averaging probabilities lets the confident-but-wrong model decide.
+    Ranks carry only the ordering, which is all the threshold uses. Per stack,
+    because one threshold is applied everywhere and a stack with many forks
+    would otherwise set the scale for all of them.
+    """
+    stems = np.asarray([str(s) for s in stems])
+    s = np.asarray(score, float)
+    out = np.full(len(s), np.nan)
+    for stem in set(stems.tolist()):
+        m = stems == stem
+        v = s[m]
+        ok = np.isfinite(v)
+        if not ok.any():
+            continue
+        rr = np.full(len(v), np.nan)
+        # argsort(argsort(v)) IS the rank vector; scattering it instead returns
+        # the sorting indices, a different permutation that destroys the order.
+        rr[ok] = np.argsort(np.argsort(v[ok])) / max(ok.sum() - 1, 1)
+        out[m] = rr
+    return out
+
+
 def score_candidates(cand_path, data_dir, run_dir, device, batch_size, workers,
                      fold="mean"):
     """One probability per fork row, averaged over the fold models."""
-    ckpts = sorted(Path(run_dir).glob("fold_*/ckpt_final.pt"))
-    if fold != "mean":
+    if fold == "fullfit":
+        # One model trained on every embryo. Half the crops-and-forward cost of
+        # averaging the folds, and trained on both embryos' divisions rather
+        # than one -- but it has seen every annotated stack, so it is only
+        # honest on a test split. Scoring the out-of-fold stacks with it is
+        # leakage, and the number it produces is not comparable to anything
+        # else in this repo.
+        ckpts = [Path(run_dir) / "fold_fullfit" / "ckpt_final.pt"]
+    elif fold == "mean":
+        # `fold_fullfit` matches `fold_*`, and averaging it in here would
+        # quietly turn an out-of-fold estimator into a leaked one -- the
+        # failure would look like an improvement. Excluded by name; ask for it.
+        ckpts = sorted(q for q in Path(run_dir).glob("fold_*/ckpt_final.pt")
+                       if q.parent.name != "fold_fullfit")
+    else:
         ckpts = [Path(run_dir) / f"fold_{int(fold)}" / "ckpt_final.pt"]
     if not ckpts:
         raise FileNotFoundError(f"no fold_*/ckpt_final.pt under {run_dir}")
@@ -177,11 +226,20 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--preds_dir", required=True, help="main_edge_postprocess output")
     p.add_argument("--data_dir", required=True, help="the zarr folder the crops come from")
-    p.add_argument("--run_dir", required=True, help="a division_cls run")
+    p.add_argument("--run_dir", required=True, nargs="+",
+                   help="one or more division_cls runs. With several, each "
+                        "scores every fork and the scores are rank-averaged "
+                        "per stack -- so --tau becomes a QUANTILE, not a "
+                        "probability. Measured on the v4 harvest: one model at "
+                        "prob 0.5 gives cv 0.8860 / div_J 0.2398; the four-model "
+                        "set (c48nf, f5, c48f5, base) at rank 0.90 gives 0.8883 "
+                        "/ 0.2622, by cutting division FPs 77 -> 45")
     p.add_argument("--out_dir", required=True)
     p.add_argument("--geff_dir", required=True)
     p.add_argument("--tau", type=float, default=0.5)
-    p.add_argument("--fold", default="mean", help='"mean" (default) or a fold index')
+    p.add_argument("--fold", default="mean",
+                   help='"mean" (default, out-of-fold models only), '
+                        '"fullfit" for the all-embryo model, or a fold index')
     p.add_argument("--reprune", type=int, default=0,
                    help="re-run prune_short at this min_track after gating; "
                         "0 = off, which is what the measured arm does")
@@ -197,11 +255,23 @@ def main():
         cand_path = Path(tmp) / "forks.npz"
         stems, n = build_candidates(a.preds_dir, cand_path)
         print(f"-> {len(stems)} stacks, {n} forks", flush=True)
-        scores = score_candidates(cand_path, a.data_dir, a.run_dir, a.device,
-                                  a.batch_size, a.num_workers, a.fold)
         blob = np.load(cand_path, allow_pickle=True)
         cand_stems = [str(s) for s in blob["stem"]]
         table = blob["table"]
+        per_model = []
+        for rd in a.run_dir:
+            s = score_candidates(cand_path, a.data_dir, rd, a.device,
+                                 a.batch_size, a.num_workers, a.fold)
+            print(f"  {Path(rd).name}: median {np.nanmedian(s):.3f}", flush=True)
+            per_model.append(s)
+        if len(per_model) == 1:
+            scores = per_model[0]
+        else:
+            ranked = np.vstack([rank_per_stack(cand_stems, s) for s in per_model])
+            scores = np.nansum(ranked, axis=0) / len(per_model)
+            scores[np.all(~np.isfinite(ranked), axis=0)] = np.nan
+            print(f"-> rank-averaged {len(per_model)} models; --tau {a.tau} is a "
+                  f"quantile", flush=True)
 
     lookups: dict[str, dict] = {}
     ip = list(COLUMNS).index("child_prob")
@@ -212,7 +282,11 @@ def main():
     total_drop = 0
     for stem in stems:
         z = np.load(Path(a.preds_dir) / f"{stem}.npz")
-        coords = z["coords"].astype(float)
+        # Must be the array `build_candidates` keyed the lookup on, or every
+        # `_key` misses and the gate silently keeps every fork.
+        coords = np.asarray(
+            z["coords_exact"] if "coords_exact" in z.files else z["coords"],
+            float)
         coords, edges, n_drop = gate_stack(
             coords, z["edges"], lookups.get(stem, {}), a.tau, a.reprune)
         total_drop += n_drop

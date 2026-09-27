@@ -47,6 +47,15 @@ refined at half a step. They are a conjunction, so each one reads flat while
 the others are still rejecting and then falls off a cliff -- a shape a line
 search reads as a local optimum and stops on. `sweep_knob` says more.
 
+**They are off unless `--tune_div`.** Three of the five knobs in `SEARCH` are
+division gates and they are swept rather than walked, so they are most of the
+budget; `div_min_prob` splits by protocol rather than by checkpoint, which is
+the signature of a knob that is easy to overfit; and a chain that hands its
+forks to `division_cls/apply_fork_gate.py` replaces these gates outright, so
+tuning them there fits a stage that is about to be overruled. Naming one in
+`--knobs` opts it back in without the flag, and `--sweep`/`--arms` are
+unaffected -- they return before the knob list is built.
+
 The ILP node filter is off unless `--ilp`, whatever the starting config says.
 It is the first stage of the chain and reads none of the knobs below it, so
 with `--ilp` it is solved once per stack and the filtered graph is cached for
@@ -669,7 +678,7 @@ def sweep_pair(paths, cfg, best, pair, grids, jobs, both, min_gain):
 def _units(knobs):
     """`knobs` regrouped so a PAIR whose members are both present is one unit.
 
-    A pair only fires when both members survived `--knobs` / `--no_div`; asking
+    A pair only fires when both members survived `--knobs` / `--tune_div`; asking
     for one of them alone still walks it, rather than silently dragging its
     partner back into a search the caller excluded it from.
     """
@@ -925,9 +934,13 @@ def main():
     p.add_argument("--both", action="store_true",
                    help="only accept a move that does not lose on either "
                         "embryo -- the bar README_edge.md sets")
-    p.add_argument("--no_div", "--no-div", action="store_true",
-                   help="leave the division gates where they are. They are the "
-                        "swept knobs, so this is also the cheap search")
+    p.add_argument("--tune_div", "--tune-div", action="store_true",
+                   help="also tune the division gates (div_*). Off by default: "
+                        "they are the swept knobs and so most of the cost, they "
+                        "are the easiest here to overfit, and a chain that gates "
+                        "its forks with division_cls/apply_fork_gate.py replaces "
+                        "them anyway. Naming one in --knobs turns it on for that "
+                        "knob without this flag")
     p.add_argument("--knobs", default=None,
                    help="comma-separated subset of the SEARCH knobs to visit")
     p.add_argument("--fold", default="0",
@@ -1028,12 +1041,20 @@ def main():
                                                       "ilp_* knobs)"))
         knobs = [(k, v) for k, v in available if k in want]
 
-    if a.no_div:
+    if not a.tune_div:
         # By prefix rather than by a list, so a gate added to SEARCH later is
         # covered without having to remember this flag exists.
-        knobs = [(k, v) for k, v in knobs if not k.startswith("div_")]
+        #
+        # Naming a gate in `--knobs` is itself the opt-in, so an explicit
+        # request is not silently dropped -- the flag is the default-path
+        # switch, not a veto over what was asked for by name.
+        named = {k.strip() for k in a.knobs.split(",")} if a.knobs else set()
+        knobs = [(k, v) for k, v in knobs
+                 if not k.startswith("div_") or k in named]
         if not knobs:
-            raise SystemExit("--no_div leaves nothing to tune")
+            raise SystemExit(
+                "nothing left to tune once the division gates are out; "
+                "pass --tune_div to include them")
 
     cfg, best = coordinate_descent(
         paths, base, a.jobs, a.passes, a.both, knobs, a.min_gain)

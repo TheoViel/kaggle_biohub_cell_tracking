@@ -475,6 +475,20 @@ def parse_args():
                    help="drop the divergence requirement (measured: 10x the "
                         "false positives -- see README_edge.md)")
     p.add_argument("--div_no_mutual_nn", action="store_true")
+    p.add_argument("--ilp_div_forks", action="store_true",
+                   help="harvest the ILP's own division forks as the proposal "
+                        "pool, instead of the geometric proposer's. Only useful "
+                        "with the caps opened (--div_frame_frac_cap 1 "
+                        "--div_global_frac_cap 1) and followed by "
+                        "division_cls/apply_fork_gate.py --reprune 1: ungated "
+                        "this scores *below* no-divisions at all (0.8531 vs "
+                        "0.8638 on edge_run/2026-09-24/4), because it finds 81 "
+                        "of 151 divisions and brings 2362 false ones")
+    p.add_argument("--ilp_fork_division", type=float,
+                   default=DEFAULTS["ilp_fork_division"],
+                   help="division weight for the fork-harvesting solve only. "
+                        "Must be < 1.0 or the solver never forks "
+                        "(default %(default)s)")
     p.add_argument("--div_frame_frac_cap", type=float,
                    default=DEFAULTS["div_frame_frac_cap"])
     p.add_argument("--div_global_frac_cap", type=float,
@@ -913,6 +927,16 @@ def process(job):
         # round, not truncate: linefit smoothing leaves sub-voxel positions and
         # astype() would drag every one of them toward zero.
         coords=np.round(np.asarray(coords, np.float64)).astype(np.int16),
+        # The same positions before rounding. `coords` is what the submission
+        # and every existing reader want, and it is kept exactly as it was --
+        # but rounding to the voxel grid is lossy, and a consumer that derives
+        # *features* from these positions is not measuring what the chain
+        # computed. division_cls/apply_fork_gate.py is that consumer: reading
+        # the rounded copy moved parent_dist_um by ~0.2 um a fork, which
+        # changed the classifier's probabilities enough to cost 0.0140 cv
+        # against the in-memory sweep (0.8715 against 0.8855 on
+        # edge_run/2026-09-24/4). Cheap insurance: float32 here is 8 MB a run.
+        coords_exact=np.asarray(coords, np.float32),
         edges=np.asarray(edges, np.float64).reshape(-1, 4),
     )
 
@@ -1002,6 +1026,8 @@ def main():
         div_max_sister_um=args.div_max_sister_um,
         div_symmetry_tau=args.div_symmetry_tau,
         div_diverge_um=args.div_diverge_um,
+        ilp_div_forks=1 if args.ilp_div_forks else 0,
+        ilp_fork_division=args.ilp_fork_division,
         div_require_divergence=0 if args.div_no_divergence else 1,
         div_require_mutual_nn=0 if args.div_no_mutual_nn else 1,
         div_frame_frac_cap=args.div_frame_frac_cap,

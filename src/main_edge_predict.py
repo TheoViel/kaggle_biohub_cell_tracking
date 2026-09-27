@@ -457,6 +457,14 @@ def main():
                     coords=np.round(np.asarray(coords, np.float64)).astype(np.int16),
                     edges=np.asarray(edges, np.float64).reshape(-1, 4),
                     candidates=candidates,
+                    # `link_video` returns the video's own node array and the
+                    # edges index its rows, so this is row-aligned with
+                    # `coords` by construction. Written separately rather than
+                    # widening `coords`, which every existing reader and the
+                    # submission expect to be the rounded int16 column.
+                    **({} if video.coords_exact is None else
+                       {"coords_f": np.asarray(video.coords_exact, np.float32)
+                        .reshape(-1, 4)}),
                 )
                 part = f"[thr {th:g}] {len(edges):05d} edges"
                 if not args.no_score:

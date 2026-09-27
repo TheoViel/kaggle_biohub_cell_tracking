@@ -53,7 +53,8 @@ DEFAULTS = {
     # Global
     # "coords_log_folder": "../logs/2026-09-07/4/preds_r6_0.50/",
     # "coords_log_folder": "../logs/2026-09-09/4/preds_r6_0.40/",
-    "coords_log_folder": "../logs/2026-09-13/1/preds_r6_0.40/",
+    # "coords_log_folder": "../logs/2026-09-13/1/preds_r6_0.40/",
+    "coords_log_folder": "../logs/2026-09-25/4/preds_r6_0.60/",
     "data_dir": TRAIN_DIR,
     "selected_folds": [0, 1],
     "fullfit": True,

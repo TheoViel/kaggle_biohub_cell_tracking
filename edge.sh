@@ -16,9 +16,7 @@ echo
 echo "Training"
 echo
 
-# torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" main_edge.py --nodes_folder ../ensemble/v8_2026-09-13_1_2026-09-24_5_append_b0.50_a0.45_d7
-torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" main_edge.py --nodes_folder ../ensemble/v9_2026-09-24_5_2026-09-13_1_append_b0.50_a0.45_d7
-
+torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" main_edge.py --nodes_folder ../ensemble/v15_2026-09-26_1_2026-09-24_5_append_b0.45_a0.45_d7
 
 echo
 echo "Running Inference"
@@ -35,20 +33,26 @@ python main_edge_postprocess.py --ilp  # --preds_dir ../logs/edge_run/2026-09-24
 
 # ---------------------------------------------
 
-# echo
-# echo "Training"
-# echo
+echo
+echo "Training"
+echo
 
-# torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" main_edge.py --nodes_folder ../ensemble/v9_2026-09-24_5_2026-09-13_1_append_b0.50_a0.45_d7
+torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" main_edge.py --nodes_folder ../ensemble/v14_2026-09-26_1_2026-09-24_5_append_b0.45_a0.40_d7
 
-# echo
-# echo "Running Inference"
-# echo
+echo
+echo "Running Inference"
+echo
 
-# torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" main_edge_predict.py
+torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" main_edge_predict.py #  --log_folder ../logs/edge_run/2026-09-07/4/
+
+echo
+echo "Postprocessing"
+echo
+
+python main_edge_postprocess.py --ilp  # --preds_dir ../logs/edge_run/2026-09-24/4/preds_0.45/
 
 # ---------------------------------------------
 
 # # PP Tuning
 # cd src/postprocessing
-# python tune_edge_pp.py --preds_dir ../logs/edge_run/2026-09-13/5/preds_0.4
+# python tune_edge_pp.py --preds_dir ../logs/edge_run/2026-09-27/0/preds_0.45 --fold all
