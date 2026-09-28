@@ -1,17 +1,27 @@
 # Ensemble Summary
 
-**Best ensemble edge model as of 2026-09-27: `cv 0.8802`**
+**Best ensemble edge model as of 2026-09-28: `cv 0.8802`**
 (`v1`, `edge_run/2026-09-23/2`, `preds_0.45_pp_fall_tuned_ilp`)
+
+**But `v16` leads on the shared default-knob config, at `cv 0.8797`** against
+`v1`'s 0.8786 — and on `adj` (0.8669 vs 0.8645), on raw detections
+(0.8314 vs 0.8263) and on 6bba (0.8529, the best recorded). It has no tuned
+variants yet; `_pp_fall_tuned_ilp` was worth +0.0016 on `v1` and +0.0031 on
+`v4`, so a tuned `v16` is the obvious next run.
 
 ## Ranked
 
 | node set | edge run | best raw | **best pp** | macro adj | div | macro rec | 44b6 adj | **6bba adj** |
 |---|---|---|---|---|---|---|---|---|
-| `v1_2026-09-13_1_2026-09-23_6` | `23/2` | 0.8263 @0.45 | **0.8786** | **0.8645** | 0.1405 | 0.9656 | 0.8817 | 0.8473 |
-| `v12_2026-09-25_2_2026-09-23_6_append_b0.55_a0.40_d7` | `26/0` | — | 0.8767 | 0.8633 | 0.1346 | 0.9608 | 0.8743 | **0.8523** |
+| `v16_2026-09-26_1_eduardo_current_mean3_append_b0.45_a0.35_d7` | `28/0` | **0.8314** @0.45 | **0.8797** | **0.8669** | 0.1283 | 0.9750 | 0.8808 | **0.8529** |
+| `v1_2026-09-13_1_2026-09-23_6` | `23/2` | 0.8263 @0.45 | 0.8786 | 0.8645 | 0.1405 | 0.9656 | 0.8817 | 0.8473 |
+| `v19_2026-09-25_4_eduardo_current_mean3_append_b0.65_a0.45_d7` | `28/3` | 0.8298 @0.45 | 0.8776 | 0.8664 | 0.1121 | 0.9621 | **0.8813** | 0.8515 |
+| `v17_2026-09-26_1_eduardo_current_mean3_append_b0.45_a0.45_d7` | `28/1` | 0.8303 @0.45 | 0.8773 | 0.8642 | 0.1304 | 0.9625 | 0.8789 | 0.8496 |
 | `v14_2026-09-26_1_2026-09-24_5_append_b0.45_a0.40_d7` | `27/2` | 0.8294 @0.45 | 0.8773 | 0.8633 | 0.1396 | 0.9681 | 0.8783 | **0.8484** |
-| `v15_2026-09-26_1_2026-09-24_5_append_b0.45_a0.45_d7` | `27/1` | **0.8301** @0.45 | 0.8770 | 0.8629 | 0.1411 | 0.9616 | 0.8791 | 0.8467 |
+| `v15_2026-09-26_1_2026-09-24_5_append_b0.45_a0.45_d7` | `27/1` | 0.8301 @0.45 | 0.8770 | 0.8629 | 0.1411 | 0.9616 | 0.8791 | 0.8467 |
 | `v4` *(new contrastive)* | `27/0` | 0.8253 @0.45 | 0.8768 | 0.8634 | 0.1334 | 0.9697 | 0.8816 | 0.8453 |
+| `v12_2026-09-25_2_2026-09-23_6_append_b0.55_a0.40_d7` | `26/0` | — | 0.8767 | 0.8633 | 0.1346 | 0.9608 | 0.8743 | 0.8523 |
+| `v18_2026-09-25_4_eduardo_current_mean3_append_b0.60_a0.45_d7` | `28/2` | 0.8300 @0.45 | 0.8760 | 0.8641 | 0.1196 | 0.9698 | 0.8790 | 0.8492 |
 | `v4_2026-09-13_1_2026-09-24_5_append_b0.45_a0.40_d7` | `24/4` | 0.8258 @0.45 | 0.8760 | 0.8631 | 0.1283 | **0.9698** | 0.8810 | 0.8453 |
 | `v13_2026-09-25_4_2026-09-23_6_append_b0.65_a0.40_d7` | `26/1` | — | 0.8754 | 0.8629 | 0.1255 | 0.9603 | 0.8751 | 0.8507 |
 | `v12` *(seed repeat)* | `25/1` | — | 0.8752 | 0.8640 | 0.1122 | 0.9612 | 0.8760 | 0.8520 |
@@ -101,5 +111,27 @@ Not yet scored: both `v3` consensus blends.
 | **`v11`** `25/2`+`24/5` | append `b0.50 a0.45 d7` | 0.9698 | 0.7767 | 0.7885 | 0.145 |
 | **`v12`** `25/2`+`23/6` | append `b0.55 a0.40 d7` | 0.9655 | **0.7806** | **0.7891** | 0.100 |
 | **`v13`** `25/4`+`23/6` | append `b0.65 a0.40 d7` | 0.9657 | 0.7812 | 0.7887 | 0.088 |
+
+| **`v16`** `26/1`+`ed` | append `b0.45 a0.35 d7` | 0.9798 | 0.7756 | 0.7897 | 0.194 |
+| **`v17`** `26/1`+`ed` | append `b0.45 a0.45 d7` | 0.9668 | 0.7779 | 0.7869 | 0.118 |
+| **`v18`** `25/4`+`ed` | append `b0.60 a0.45 d7` | 0.9754 | 0.7795 | **0.7910** | 0.147 |
+| **`v19`** `25/4`+`ed` | append `b0.65 a0.45 d7` | 0.9668 | 0.7808 | 0.7884 | 0.099 |
+
+`ed` is `output/eduardo_predictions/current_mean3`, a teammate's detector,
+scored out of fold on our own fold split (his `OOF_ROUTING.json` uses the same
+one). It is the first partner from outside this repo, and it is the first to
+move the screen's ceiling: `v18` posts `edge_jac 0.7910` against `v13`'s 0.7887,
+at node recall 0.9754 against 0.9657.
+
+His other two sets lost. `official_only` drives `ratio` *negative* (down to
+-0.113): it is largely a subset of our coverage, so it removes more than it
+adds. `pseudo_label` inflates the node count (ratio to 0.485) without the
+quality to match. `current_mean3` is the one to use.
+
+**The screen ranked these four in the wrong order.** It put `v18`/`v19` above
+`v16` on every column, and end to end `v16` wins: 0.8797 against 0.8760 and
+0.8776. That is the same failure the consensus blends showed -- this metric
+ranks within the append family well enough to shortlist, and not well enough to
+choose. It did get the family right: all four beat `v4`'s 0.7720.
 
 - v4 -> LB 0.924

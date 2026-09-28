@@ -65,6 +65,7 @@ class UNetNodeTransformer(nn.Module):
         offset_head: bool = False,
         offset_radius: int = 2,
         annot_head: bool = False,
+        div_head: bool = False,
         verbose: int = 0,
     ):
         super().__init__()
@@ -119,6 +120,40 @@ class UNetNodeTransformer(nn.Module):
             )
             self.annot_head = nn.Sequential(
                 nn.Conv3d(annot_in, unet_out_channels, kernel_size=1),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Conv3d(unet_out_channels, 1, kernel_size=1),
+            )
+
+        # "Does this cell divide into the next frame?" -- the same shape of
+        # auxiliary question as `annot_head`, on the same features.
+        #
+        # Why here rather than only downstream. The division term is where the
+        # score is lost and the binding constraint is *recall of proposals*:
+        # of 151 annotated divisions the chain converts ~50, and the 98 it
+        # misses were never proposed as forks, so no amount of gating recovers
+        # them (measured: a gate must delete 4.3 false forks per true one to
+        # break even, and the best geometric gate manages 3.0). The separate
+        # image classifier in `division_cls/` shows the appearance signal is
+        # there -- 9-10x chance -- but it runs *after* the forks exist and can
+        # only ever remove. A head here scores every cell, before anything has
+        # been proposed, on features the detector already computes.
+        #
+        # It is also nearly free: one 1x1 conv pair on a tensor that is already
+        # in memory, against `division_cls`' separate CNN re-reading 32x32x3
+        # crops from the zarr.
+        #
+        # `div_loss_weight` bounds how far this task may move the detector, as
+        # `annot_loss_weight` does for the annotation head. Divisions are 0.13%
+        # of annotated links, so this is a rare-positive task on a shared
+        # backbone and the risk is that it pulls the trunk for nothing.
+        self.div_head = None
+        if div_head:
+            div_in = (
+                2 * unet_out_channels + 1 if self.deep_supervision else unet_out_channels
+            )
+            self.div_head = nn.Sequential(
+                nn.Conv3d(div_in, unet_out_channels, kernel_size=1),
                 nn.GELU(),
                 nn.Dropout(dropout),
                 nn.Conv3d(unet_out_channels, 1, kernel_size=1),
@@ -221,7 +256,7 @@ class UNetNodeTransformer(nn.Module):
         self,
         imgs: torch.Tensor,  # (B, W, *spatial) — already downsampled, single channel
     ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor] | None,
-               list[torch.Tensor] | None]:
+               list[torch.Tensor] | None, list[torch.Tensor] | None]:
         """Run the temporal U-Net on W frames.
 
         ``unet_out`` is the node-feature map and never moves: it stays on the
@@ -270,7 +305,7 @@ class UNetNodeTransformer(nn.Module):
         self,
         out: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor] | None,
-               list[torch.Tensor] | None]:
+               list[torch.Tensor] | None, list[torch.Tensor] | None]:
         """Apply coarse/fine detection heads to a backbone output."""
         unet_out, fine_out = out if self.deep_supervision else (out, None)
 
@@ -279,12 +314,15 @@ class UNetNodeTransformer(nn.Module):
 
         W = unet_out.shape[1]
         annot_logits = [] if self.annot_head is not None else None
+        div_logits = [] if self.div_head is not None else None
         if fine_out is None:
             det_logits, det_logits_ds = [], None
             for i in range(W):
                 det_logits.append(self.detect_head(unet_out[:, i]))
                 if annot_logits is not None:
                     annot_logits.append(self.annot_head(unet_out[:, i]))
+                if div_logits is not None:
+                    div_logits.append(self.div_head(unet_out[:, i]))
         else:
             det_logits, det_logits_ds = [], []
             for i in range(W):
@@ -305,11 +343,13 @@ class UNetNodeTransformer(nn.Module):
                 det_logits_ds.append(ds_logit)
                 if annot_logits is not None:
                     annot_logits.append(self.annot_head(fine_in))
+                if div_logits is not None:
+                    div_logits.append(self.div_head(fine_in))
 
         if self.verbose >= 1:
             print(f"UNetNodeTransformer - Encode - Detect logits shape: {[det.shape for det in det_logits]}")
 
-        return unet_out, det_logits, det_logits_ds, annot_logits
+        return unet_out, det_logits, det_logits_ds, annot_logits, div_logits
 
     def encode_offsets(
         self,
@@ -456,6 +496,7 @@ def define_track_model(
     offset_head: bool = False,
     offset_radius: int = 2,
     annot_head: bool = False,
+    div_head: bool = False,
     verbose: int = 0,
 ) -> UNetNodeTransformer:
     """Build the full tracking model (UNet + detect head + transformer).
@@ -655,6 +696,7 @@ def define_track_model(
         offset_head=offset_head,
         offset_radius=offset_radius,
         annot_head=annot_head,
+        div_head=div_head,
         dropout=transformer_dropout,
         verbose=verbose,
     )

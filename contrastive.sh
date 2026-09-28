@@ -17,5 +17,7 @@ cd src
 
 # torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" inference_contrastive.py --exp_folder ../logs/contrastive/2026-09-09/1/ --coords_log_folder ...
 
-torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" inference_contrastive.py --exp_folder ../logs/contrastive/2026-09-26/0/ --coords_log_folder ../ensemble/v14_2026-09-26_1_2026-09-24_5_append_b0.45_a0.40_d7
-torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" inference_contrastive.py --exp_folder ../logs/contrastive/2026-09-26/0/ --coords_log_folder ../ensemble/v15_2026-09-26_1_2026-09-24_5_append_b0.45_a0.45_d7
+torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" inference_contrastive.py --exp_folder ../logs/contrastive/2026-09-26/0/ --coords_log_folder ../ensemble/v16_2026-09-26_1_eduardo_current_mean3_append_b0.45_a0.35_d7
+torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" inference_contrastive.py --exp_folder ../logs/contrastive/2026-09-26/0/ --coords_log_folder ../ensemble/v17_2026-09-26_1_eduardo_current_mean3_append_b0.45_a0.45_d7
+torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" inference_contrastive.py --exp_folder ../logs/contrastive/2026-09-26/0/ --coords_log_folder ../ensemble/v18_2026-09-25_4_eduardo_current_mean3_append_b0.60_a0.45_d7
+torchrun --standalone --local-addr=127.0.0.1 --nproc_per_node="$n_gpus" inference_contrastive.py --exp_folder ../logs/contrastive/2026-09-26/0/ --coords_log_folder ../ensemble/v19_2026-09-25_4_eduardo_current_mean3_append_b0.65_a0.45_d7

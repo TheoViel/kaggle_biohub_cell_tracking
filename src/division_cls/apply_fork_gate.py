@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -123,79 +124,129 @@ def rank_per_stack(stems, score):
     return out
 
 
-def score_candidates(cand_path, data_dir, run_dir, device, batch_size, workers,
-                     fold="mean"):
-    """One probability per fork row, averaged over the fold models."""
+def _ckpts_for(run_dir, fold):
+    """The checkpoints of one run that `fold` selects."""
     if fold == "fullfit":
         # One model trained on every embryo. Half the crops-and-forward cost of
         # averaging the folds, and trained on both embryos' divisions rather
         # than one -- but it has seen every annotated stack, so it is only
-        # honest on a test split. Scoring the out-of-fold stacks with it is
-        # leakage, and the number it produces is not comparable to anything
-        # else in this repo.
-        ckpts = [Path(run_dir) / "fold_fullfit" / "ckpt_final.pt"]
-    elif fold == "mean":
+        # honest on a test split.
+        return [Path(run_dir) / "fold_fullfit" / "ckpt_final.pt"]
+    if fold == "mean":
         # `fold_fullfit` matches `fold_*`, and averaging it in here would
         # quietly turn an out-of-fold estimator into a leaked one -- the
         # failure would look like an improvement. Excluded by name; ask for it.
-        ckpts = sorted(q for q in Path(run_dir).glob("fold_*/ckpt_final.pt")
-                       if q.parent.name != "fold_fullfit")
-    else:
-        ckpts = [Path(run_dir) / f"fold_{int(fold)}" / "ckpt_final.pt"]
-    if not ckpts:
-        raise FileNotFoundError(f"no fold_*/ckpt_final.pt under {run_dir}")
+        return sorted(q for q in Path(run_dir).glob("fold_*/ckpt_final.pt")
+                      if q.parent.name != "fold_fullfit")
+    return [Path(run_dir) / f"fold_{int(fold)}" / "ckpt_final.pt"]
 
+
+def score_candidates(cand_path, data_dir, run_dirs, device, batch_size, workers,
+                     fold="mean", devices=None):
+    """`{run_dir: (n,) probabilities}` for every model, in as few passes as possible.
+
+    Two costs to beat, and the profile is lopsided: the network forward on the
+    ~80 forks of a stack is nothing, while opening the zarr and cutting the
+    crops is nearly all of it -- 8.4 s a stack for two fold models against
+    5.2 s for one, so the *second* model costs 3.2 s and the crop pass ~2 s.
+
+    **One crop pass per crop geometry, not per model.** Any models that agree on
+    ``(patch_yx, patch_z, n_frames)`` read the same tensors, so they are scored
+    inside one batch loop. The five-model ensemble has three geometries --
+    32/3/3 (three models), 32/3/5, 48/3/5 -- so this is three passes rather
+    than five, and the two extra models on the shared geometry are nearly free.
+    Mismatched geometry is grouped apart rather than silently shared: scoring a
+    model on another's crops is wrong, not slow.
+
+    **Both GPUs, sharded by row.** The forks are independent, so each device
+    takes a contiguous half of the candidate table and runs the whole group --
+    dataset, loader and models -- on its own. Sharding rows rather than
+    assigning whole groups to devices keeps the split even; with three groups
+    on two devices, per-group assignment would leave one card doing two thirds
+    of the work. A thread per device is enough: the GIL is released across the
+    CUDA calls and the loader's workers are separate processes anyway.
+    """
+    devices = devices or [device]
     blob = np.load(cand_path, allow_pickle=True)
     n = len(blob["table"])
     if not n:
-        return np.zeros(0, np.float32)
+        return {rd: np.zeros(0, np.float32) for rd in run_dirs}
 
-    loaded = [load_model(c, device) for c in ckpts]
-    # One crop pass for every model, not one per model. The network forward on 81
-    # forks a stack is nothing; the cost is opening the zarr and cutting the
-    # crops, so reading them once and handing each batch to both models is
-    # most of the fold-averaging price -- measured 8.4 s a stack against 5.2 s
-    # for a single fold, of which this recovers ~3 s.
-    #
-    # Every fold of a run shares its crop geometry (same `patch_yx`, `patch_z`,
-    # `n_frames`), so one dataset serves them all. Refuse rather than silently
-    # score one model on another's crops.
-    geom = {(c["patch_yx"], c["patch_z"], c["n_frames"]) for _, c in loaded}
-    if len(geom) > 1:
-        raise RuntimeError(
-            f"fold models disagree on crop geometry {sorted(geom)}; they cannot "
-            "share one pass. Score them separately with --fold <n>.")
-    cfg = loaded[0][1]
+    # Load each run's checkpoints once, on the first device, only to read the
+    # crop geometry out of the config; the per-device copies are loaded below.
+    groups: dict[tuple, list] = {}
+    for rd in run_dirs:
+        ck = _ckpts_for(rd, fold)
+        if not ck:
+            raise FileNotFoundError(f"no fold_*/ckpt_final.pt under {rd}")
+        _, cfg = load_model(ck[0], "cpu")
+        geom = (cfg["patch_yx"], cfg["patch_z"], cfg["n_frames"])
+        for c in ck[1:]:
+            _, c2 = load_model(c, "cpu")
+            if (c2["patch_yx"], c2["patch_z"], c2["n_frames"]) != geom:
+                raise RuntimeError(
+                    f"{rd}: fold models disagree on crop geometry; they cannot "
+                    "share one pass. Score them separately with --fold <n>.")
+        groups.setdefault(geom, []).append((rd, ck, cfg))
 
-    ds = DivisionDataset(
-        data_dir, embryos=None, candidates=str(cand_path),
-        candidates_labelled_only=False, augment=False,
-        patch_yx=cfg["patch_yx"], patch_z=cfg["patch_z"],
-        n_frames=cfg["n_frames"],
-    )
-    if len(ds.samples) != n:
-        raise RuntimeError(
-            f"dataset has {len(ds.samples)} rows against {n} candidates; "
-            "they must be the same rows in the same order")
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
-                        num_workers=workers, pin_memory=True)
+    print(f"-> {len(run_dirs)} model(s) in {len(groups)} crop geometr"
+          f"{'y' if len(groups) == 1 else 'ies'}, {len(devices)} device(s)",
+          flush=True)
 
-    got = [[] for _ in loaded]
-    with torch.no_grad():
-        for batch in loader:
-            clip = batch["clip"].to(device, non_blocking=True)
-            feat = batch.get("feat")
-            feat = (feat.to(device, non_blocking=True)
-                    if feat is not None and feat.numel() else None)
-            with torch.autocast("cuda", torch.float16,
-                                enabled=str(device).startswith("cuda")):
-                for i, (model, _) in enumerate(loaded):
-                    got[i].append(torch.sigmoid(model(clip, feat)).float().cpu())
-    acc = np.zeros(n, np.float64)
-    for i, ckpt in enumerate(ckpts):
-        acc += torch.cat(got[i]).numpy().astype(np.float64)
-        print(f"  scored with {ckpt.parent.name}", flush=True)
-    return (acc / len(loaded)).astype(np.float32)
+    out = {rd: np.zeros(n, np.float64) for rd in run_dirs}
+    counts = {rd: 0 for rd in run_dirs}
+
+    for geom, members in groups.items():
+        cfg = members[0][2]
+        ds = DivisionDataset(
+            data_dir, embryos=None, candidates=str(cand_path),
+            candidates_labelled_only=False, augment=False,
+            patch_yx=cfg["patch_yx"], patch_z=cfg["patch_z"],
+            n_frames=cfg["n_frames"],
+        )
+        if len(ds.samples) != n:
+            raise RuntimeError(
+                f"dataset has {len(ds.samples)} rows against {n} candidates; "
+                "they must be the same rows in the same order")
+        shards = np.array_split(np.arange(n), len(devices))
+
+        def work(dev, rows):
+            if not len(rows):
+                return
+            loaded = [(rd, [load_model(c, dev)[0] for c in ck])
+                      for rd, ck, _ in members]
+            loader = DataLoader(
+                torch.utils.data.Subset(ds, rows.tolist()),
+                batch_size=batch_size, shuffle=False,
+                num_workers=workers, pin_memory=True)
+            acc = {rd: [] for rd, _, _ in members}
+            with torch.no_grad():
+                for batch in loader:
+                    clip = batch["clip"].to(dev, non_blocking=True)
+                    feat = batch.get("feat")
+                    feat = (feat.to(dev, non_blocking=True)
+                            if feat is not None and feat.numel() else None)
+                    with torch.autocast("cuda", torch.float16,
+                                        enabled=str(dev).startswith("cuda")):
+                        for rd, models in loaded:
+                            p = sum(torch.sigmoid(mo(clip, feat)).float()
+                                    for mo in models) / len(models)
+                            acc[rd].append(p.cpu())
+            for rd, parts in acc.items():
+                out[rd][rows] = torch.cat(parts).numpy().astype(np.float64)
+
+        threads = [threading.Thread(target=work, args=(d, r))
+                   for d, r in zip(devices, shards)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        for rd, ck, _ in members:
+            counts[rd] = len(ck)
+            print(f"   {Path(rd).name}: {len(ck)} ckpt(s) on geometry "
+                  f"{geom[0]}/{geom[1]}/{geom[2]}", flush=True)
+
+    return {rd: out[rd].astype(np.float32) for rd in run_dirs}
 
 
 def gate_stack(coords, edges, lookup, tau, min_track=None):
@@ -244,9 +295,22 @@ def main():
                    help="re-run prune_short at this min_track after gating; "
                         "0 = off, which is what the measured arm does")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--devices", default=None,
+                   help="comma-separated devices to shard the forks over, e.g. "
+                        "'cuda:0,cuda:1'. Default: every visible CUDA device. "
+                        "The forks are independent, so each device takes a "
+                        "contiguous slice of the table and runs the whole "
+                        "model group on it")
     p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--num_workers", type=int, default=4)
     a = p.parse_args()
+
+    if a.devices:
+        devices = [d.strip() for d in a.devices.split(",") if d.strip()]
+    elif str(a.device).startswith("cuda") and torch.cuda.device_count() > 1:
+        devices = [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+    else:
+        devices = [a.device]
 
     Path(a.out_dir).mkdir(parents=True, exist_ok=True)
     Path(a.geff_dir).mkdir(parents=True, exist_ok=True)
@@ -258,12 +322,15 @@ def main():
         blob = np.load(cand_path, allow_pickle=True)
         cand_stems = [str(s) for s in blob["stem"]]
         table = blob["table"]
-        per_model = []
-        for rd in a.run_dir:
-            s = score_candidates(cand_path, a.data_dir, rd, a.device,
-                                 a.batch_size, a.num_workers, a.fold)
-            print(f"  {Path(rd).name}: median {np.nanmedian(s):.3f}", flush=True)
-            per_model.append(s)
+        # One call for every model: it groups them by crop geometry and
+        # shards the rows across the devices, so the crops are cut once per
+        # geometry rather than once per model.
+        scored = score_candidates(cand_path, a.data_dir, a.run_dir, a.device,
+                                  a.batch_size, a.num_workers, a.fold,
+                                  devices=devices)
+        per_model = [scored[rd] for rd in a.run_dir]
+        for rd, sc in zip(a.run_dir, per_model):
+            print(f"  {Path(rd).name}: median {np.nanmedian(sc):.3f}", flush=True)
         if len(per_model) == 1:
             scores = per_model[0]
         else:

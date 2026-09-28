@@ -535,6 +535,7 @@ def _detect_frame(
     pool_k,
     voxel_size_det,
     det_scaling,
+    div_logits_t: torch.Tensor | None = None,
 ) -> None:
     """NMS one frame's (already merged) heatmaps into every registry.
 
@@ -547,7 +548,8 @@ def _detect_frame(
     Coordinates come out in detection-grid space (same grid as det_logits /
     unet_out), matching tracking/targets.py.
     """
-    source = {"det": [det_logits_t], "annot": [annot_logits_t]}
+    source = {"det": [det_logits_t], "annot": [annot_logits_t],
+              "div": [div_logits_t]}
     cache: dict[str, torch.Tensor] = {}
     for h in heads:
         for r in radii:
@@ -663,9 +665,13 @@ def predict_video_thresholds(
         raise ValueError("thresholds must not be empty")
 
     heads = tuple(dict.fromkeys(heads))     # de-duplicate, keep order
-    unknown = set(heads) - {"det", "annot"}
+    unknown = set(heads) - {"det", "annot", "div"}
     if unknown:
         raise ValueError(f"unknown head(s) {sorted(unknown)}, expected 'det' / 'annot'")
+    if "div" in heads and getattr(model, "div_head", None) is None:
+        raise ValueError(
+            "heads includes 'div' but this model was built without a division "
+            "head; rebuild with div_head=True or drop it")
     if "annot" in heads and getattr(model, "annot_head", None) is None:
         raise ValueError(
             "heads includes 'annot' but this model was built without an "
@@ -819,11 +825,10 @@ def predict_video_thresholds(
                     _split_prepared_frames(fresh, missing_keys)
                 )
             prepared = _collate_prepared_window(prepared_cache, frame_indices)
-            unet_out, det_logits, _, annot_logits = model.encode_prepared_window(
-                prepared
-            )
+            unet_out, det_logits, _, annot_logits, div_logits = \
+                model.encode_prepared_window(prepared)
         else:
-            unet_out, det_logits, _, annot_logits = model.encode(imgs)
+            unet_out, det_logits, _, annot_logits, div_logits = model.encode(imgs)
         if det_logits_fn is not None:
             det_logits = det_logits_fn(window_i, det_logits)
         offset_maps = model.encode_offsets(unet_out) if use_offset else None
@@ -882,7 +887,7 @@ def predict_video_thresholds(
         if len(flips) > 1:
             for dims in flips[1:]:
                 imgs_flip = imgs.flip(dims)
-                _, det_flip, _, annot_flip = model.encode(imgs_flip)
+                _, det_flip, _, annot_flip, _ = model.encode(imgs_flip)
                 for f in range(W):
                     det_logits[f] = det_logits[f] + det_flip[f].flip(dims)
                     if annot_logits is not None:
@@ -907,11 +912,13 @@ def predict_video_thresholds(
             slot = pending_frames.get(t)
             det_f = det_logits[f_idx].detach()
             annot_f = None if annot_logits is None else annot_logits[f_idx].detach()
+            div_f = None if div_logits is None else div_logits[f_idx].detach()
             off_f = None if offset_maps is None else offset_maps[f_idx]
             if slot is None:
                 pending_frames[t] = {
                     "det": det_f.clone(), "n": 1,
                     "annot": None if annot_f is None else annot_f.clone(),
+                    "div": None if div_f is None else div_f.clone(),
                     # The offset vote and the node features are *not* averaged:
                     # they are read at integer coordinates and are a direction
                     # in grid space, the same reason TTA leaves them alone. The
@@ -923,6 +930,8 @@ def predict_video_thresholds(
                 slot["n"] += 1
                 if slot["annot"] is not None and annot_f is not None:
                     slot["annot"] += annot_f
+                if slot.get("div") is not None and div_f is not None:
+                    slot["div"] += div_f
         pending_windows.append((frame_indices, node_feat_maps))
 
         # --- Detect in every frame this window completes ---
@@ -937,10 +946,13 @@ def predict_video_thresholds(
             slot = pending_frames.pop(t)
             det_logits_t = slot["det"] / slot["n"]
             annot_logits_t = None if slot["annot"] is None else slot["annot"] / slot["n"]
+            div_logits_t = (None if slot.get("div") is None
+                            else slot["div"] / slot["n"])
             offsets_t = slot["offsets"]
             _detect_frame(
                 t, det_logits_t, annot_logits_t, offsets_t, registries,
                 heads, radii, thresholds, cfg, pool_k, voxel_size_det, det_scaling,
+                div_logits_t=div_logits_t,
             )
 
         # --- Edges, for every retained window whose frames are all final ---
@@ -976,6 +988,8 @@ def predict_video_thresholds(
             None if slot["annot"] is None else slot["annot"] / slot["n"],
             slot["offsets"], registries,
             heads, radii, thresholds, cfg, pool_k, voxel_size_det, det_scaling,
+            div_logits_t=(None if slot.get("div") is None
+                          else slot["div"] / slot["n"]),
         )
     for w_frames, w_feats in pending_windows:
         for reg in registries.values():

@@ -263,7 +263,7 @@ def encode_nodes(
     embeddings with gradient attached.
     """
     _, window_size, d, h, w = imgs.shape
-    unet_out, det_logits, det_logits_ds, annot_logits = core_model.encode(imgs)
+    unet_out, det_logits, det_logits_ds, annot_logits, div_logits = core_model.encode(imgs)
     offset_maps = core_model.encode_offsets(unet_out)
 
     d_out, h_out, w_out = unet_out.shape[-3:]
@@ -326,7 +326,7 @@ def encode_nodes(
         )
 
     return (frame_det, det_logits, unet_scaling, offset_maps, det_logits_ds,
-            det_stride, annot_logits)
+            det_stride, annot_logits, div_logits)
 
 
 def node_scaling_from_voxel(voxel_size) -> tuple[float, float, float]:

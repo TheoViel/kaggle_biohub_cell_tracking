@@ -484,6 +484,16 @@ def parse_args():
                         "this scores *below* no-divisions at all (0.8531 vs "
                         "0.8638 on edge_run/2026-09-24/4), because it finds 81 "
                         "of 151 divisions and brings 2362 false ones")
+    p.add_argument("--div_steal_margin", type=float, default=None,
+                   help="let a division take a second daughter the assignment "
+                        "already gave to another parent, deleting that edge, "
+                        "when p(new parent->q) - p(old parent->q) >= this. Off "
+                        "by default. Measured on the v4 harvest: of 151 "
+                        "annotated divisions, 63 (42%%) have both daughters "
+                        "detected but linked to *different* parents -- a "
+                        "one-to-one assignment must give the sister to "
+                        "somebody, and at a division a neighbour is cheaper "
+                        "than forking. Those 63 are unreachable without this")
     p.add_argument("--ilp_fork_division", type=float,
                    default=DEFAULTS["ilp_fork_division"],
                    help="division weight for the fork-harvesting solve only. "
@@ -1028,6 +1038,7 @@ def main():
         div_diverge_um=args.div_diverge_um,
         ilp_div_forks=1 if args.ilp_div_forks else 0,
         ilp_fork_division=args.ilp_fork_division,
+        div_steal_margin=args.div_steal_margin,
         div_require_divergence=0 if args.div_no_divergence else 1,
         div_require_mutual_nn=0 if args.div_no_mutual_nn else 1,
         div_frame_frac_cap=args.div_frame_frac_cap,

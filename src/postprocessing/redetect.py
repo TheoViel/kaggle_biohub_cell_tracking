@@ -62,7 +62,7 @@ def detection_maps():
                 normalize_frames(np.stack([arr[i] for i in idx]), norm, ds.quantiles)
             )
             imgs = imgs.unsqueeze(0).to(DEVICE)
-            _, det, _, _ = model.encode(imgs)
+            _, det, _, _, _ = model.encode(imgs)
             for k, i in enumerate(idx):
                 if i == len(maps):
                     maps.append(det[k][0, 0].sigmoid().cpu().numpy().astype(np.float16))

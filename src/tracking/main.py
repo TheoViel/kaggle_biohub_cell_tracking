@@ -295,6 +295,7 @@ def build_model(args, ctx):
         offset_head=bool(getattr(args, "offset_head", False)),
         offset_radius=int(getattr(args, "offset_radius", 2)),
         annot_head=bool(getattr(args, "annot_head", False)),
+        div_head=bool(getattr(args, "div_head", False)),
     )
 
     if ctx is None:

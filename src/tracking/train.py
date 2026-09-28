@@ -279,6 +279,7 @@ def fit(
                     # is no heatmap and no U-Net in the graph at all.
                     det_logits, unet_scaling, offset_maps = [], None, None
                     det_logits_ds, det_stride, annot_logits = None, None, None
+                    div_logits = None
                 elif transformer_only:
                     names = batch["name"]
                     if any(name not in fts_cache for name in names):
@@ -294,9 +295,11 @@ def fit(
                     # the vote is being supervised.
                     det_logits, unet_scaling, offset_maps = [], None, None
                     det_logits_ds, det_stride, annot_logits = None, None, None
+                    div_logits = None
                 else:
                     (frame_det, det_logits, unet_scaling, offset_maps,
-                     det_logits_ds, det_stride, annot_logits) = encode_nodes(
+                     det_logits_ds, det_stride, annot_logits,
+                     div_logits) = encode_nodes(
                         core_model,
                         imgs,
                         coords,
@@ -364,6 +367,7 @@ def fit(
                     det_stride=det_stride,
                     det_logits_ds_per_frame=det_logits_ds,
                     annot_logits_per_frame=annot_logits,
+                    div_logits_per_frame=div_logits,
                     # The splat is sized in grid voxels; the loss needs the
                     # physical voxel to keep it round on a non-cubic grid.
                     voxel_size=voxel_size,

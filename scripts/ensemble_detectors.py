@@ -308,7 +308,7 @@ def node_arrays(db, da) -> list[str]:
 
 def save_merged(out_dir: Path, base: Path, add: Path, tag: str,
                 names: list[str], th_base: float, th_add: float, d_add: float,
-                command: str) -> dict:
+                command: str, add_tag: str | None = None) -> dict:
     """Write one npz per sample, in the source preds_<tag> layout.
 
     Every per-node array is carried over from whichever model contributed the
@@ -322,8 +322,8 @@ def save_merged(out_dir: Path, base: Path, add: Path, tag: str,
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     src = {}
-    for run in (base, add):
-        src[run] = {n: np.load(run / f"preds_{tag}" / f"{n}.npz") for n in names}
+    for run, t in ((base, tag), (add, add_tag or tag)):
+        src[run] = {n: np.load(run / f"preds_{t}" / f"{n}.npz") for n in names}
 
     n_base = n_add = 0
     carried = None
@@ -419,15 +419,17 @@ def run_cfg(names, data, th_a, th_b, d_add, max_disp, mutual, n_jobs):
     return macro(rows)
 
 
-def load(base: Path, add: Path, tag: str, names: list[str]) -> dict:
+def load(base: Path, add: Path, tag: str, names: list[str],
+         add_tag: str | None = None) -> dict:
     """(base_coords, base_probs, add_coords, add_probs) per sample.
 
     `merge` treats its *second* pair as the base, so the pairs are stored in
     that order and no caller has to remember the convention.
     """
     out = {}
+    at = add_tag or tag
     for n in names:
-        da = np.load(add / f"preds_{tag}" / f"{n}.npz")
+        da = np.load(add / f"preds_{at}" / f"{n}.npz")
         db = np.load(base / f"preds_{tag}" / f"{n}.npz")
         out[n] = (da["coords"].astype(float), da["node_probs"].astype(float),
                   db["coords"].astype(float), db["node_probs"].astype(float))
@@ -463,6 +465,12 @@ def main() -> None:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--base", required=True, help="log folder of the base detector")
     p.add_argument("--add", required=True, help="log folder whose extras get appended")
+    p.add_argument("--add-tag", default=None,
+                   help="preds_<tag> folder for --add, when it differs from "
+                        "--tag. A partner trained outside this repo floors its "
+                        "pool at its own threshold (Eduardo's sets stop at "
+                        "0.05, ours at 0.30), and naming his folder after our "
+                        "floor would misstate what is in it")
     p.add_argument("--tag", default="r6_0.30",
                    help="preds_<tag> folder to read; use the lowest threshold "
                         "available, higher ones are reached by filtering")
@@ -508,7 +516,8 @@ def main() -> None:
         raise SystemExit(f"no predictions under {RUN_B}/preds_{args.tag}")
     swept = stratified(names_all, args.n)
     data = ({} if args.no_score else
-            load(RUN_B, RUN_A, args.tag, names_all if args.all else swept))
+            load(RUN_B, RUN_A, args.tag, names_all if args.all else swept,
+                 add_tag=args.add_tag))
 
     if args.sweep:
         print(f"sweep on {len(swept)} samples, tag {args.tag}\n")
@@ -568,6 +577,7 @@ def main() -> None:
             "model_a": str(RUN_B.relative_to(REPO)),
             "model_b": str(RUN_A.relative_to(REPO)),
             "source_preds": f"preds_{args.tag}",
+        "source_preds_add": f"preds_{args.add_tag or args.tag}",
             "nms_radius_um": _radius_of(args.tag),
             "radius_um": radius, "th": th, "cluster_th": args.cluster_th,
             "voxel_scale_um": list(SCALE),
@@ -643,7 +653,8 @@ def main() -> None:
     # Save on every sample the source runs have, not just whatever split was
     # scored: a saved artefact that silently held a subset would be a trap.
     stats = save_merged(out_dir, RUN_B, RUN_A, args.tag, names_all,
-                        th_base, th_add, d_add, " ".join(sys.argv))
+                        th_base, th_add, d_add, " ".join(sys.argv),
+                        add_tag=args.add_tag)
     settings = {
         "created": datetime.now().astimezone().isoformat(timespec="seconds"),
         "command": "python " + " ".join(sys.argv),
@@ -653,6 +664,7 @@ def main() -> None:
         "base_run": str(RUN_B.relative_to(REPO)),
         "add_run": str(RUN_A.relative_to(REPO)),
         "source_preds": f"preds_{args.tag}",
+        "source_preds_add": f"preds_{args.add_tag or args.tag}",
         "nms_radius_um": _radius_of(args.tag),
         "th_base": th_base, "th_add": th_add, "d_add_um": d_add,
         "voxel_scale_um": list(SCALE),

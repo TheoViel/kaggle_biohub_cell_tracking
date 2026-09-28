@@ -102,6 +102,16 @@ def parse_args():
                         "(`_annot_head` folders). Off by default: it doubles "
                         "every radius x threshold point, and the edge model is "
                         "fitted on the detection head. Turn on to compare them.")
+    p.add_argument("--div_head", action="store_true",
+                   help="also sweep and write the division head's node sets "
+                        "(`_div_head` folders). The head answers \"does this "
+                        "cell divide into the next frame\" on the detector's "
+                        "own features, so its peaks are division *locations* "
+                        "rather than a score on an existing fork -- which is "
+                        "what the fork pool is short of: of 151 annotated "
+                        "divisions the chain proposes a fork for 57 at their "
+                        "own frame, and 63 more have both daughters detected "
+                        "but linked to different parents.")
     p.add_argument("--pl", action="store_true",
                    help="pseudo-labelling: predict on the fold's TRAIN embryos "
                         "instead of its val one, writing to <log_folder>/preds_pl")
@@ -193,6 +203,7 @@ def _key_suffix(
         + (f"_{threshold:.2f}" if sweep_th else "")
         + (f"_tta{n_tta}" if n_tta > 1 else "")
         + ("_annot_head" if head == "annot" else "")
+        + ("_div_head" if head == "div" else "")
     )
 
 
@@ -581,7 +592,13 @@ def main():
     if want_annot and not has_annot and ctx.is_main:
         print("-> --annot_head requested but this run has no annotation head; "
               "writing the detection head only")
-    heads = ("det", "annot") if (want_annot and has_annot) else ("det",)
+    want_div = bool(getattr(args, "div_head", False))
+    has_div = bool(getattr(cfg, "div_head", False))
+    if want_div and not has_div and ctx.is_main:
+        print("-> --div_head requested but this run has no division head; "
+              "writing the detection head only")
+    heads = ("det",) + (("annot",) if (want_annot and has_annot) else ()) \
+        + (("div",) if (want_div and has_div) else ())
     # The grid, in the order everything downstream iterates it.
     keys = [(h, r, th) for h in heads for r in radii for th in thresholds]
 

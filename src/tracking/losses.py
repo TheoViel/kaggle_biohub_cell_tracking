@@ -561,6 +561,9 @@ class TrackingLoss(nn.Module):
         annot_loss_weight: float = 1.0,
         annot_neg_weight: float = 1e-2,
         annot_pos_scale: float = 1.0,
+        div_loss_weight: float = 0.2,
+        div_neg_weight: float = 1e-2,
+        div_pos_scale: float = 1.0,
         offset_loss_weight: float = 1.0,
         offset_radius: int = 2,
         offset_beta: float = 1.0,
@@ -588,6 +591,13 @@ class TrackingLoss(nn.Module):
         self.annot_loss_weight = annot_loss_weight
         self.annot_neg_weight = annot_neg_weight
         self.annot_pos_scale = annot_pos_scale
+        # 0.2 rather than 1.0: divisions are 0.13% of annotated links, so this
+        # is a very rare positive on a shared trunk. The weight bounds how far
+        # it may drag the detector, which is the whole risk of the head -- the
+        # detection task is the one that has to keep working.
+        self.div_loss_weight = div_loss_weight
+        self.div_neg_weight = div_neg_weight
+        self.div_pos_scale = div_pos_scale
         self.offset_loss_weight = offset_loss_weight
         self.offset_radius = offset_radius
         self.offset_beta = offset_beta
@@ -615,6 +625,9 @@ class TrackingLoss(nn.Module):
         ) = None,  # W × (B, 1, Z, Y, X) on the node grid, None without deep supervision
         det_stride: tuple | None = None,  # image voxels per heatmap voxel
         annot_logits_per_frame: (
+            list[torch.Tensor] | None
+        ) = None,  # W × (B, 1, Z, Y, X) on det_logits' grid, None when the head is off
+        div_logits_per_frame: (
             list[torch.Tensor] | None
         ) = None,  # W × (B, 1, Z, Y, X) on det_logits' grid, None when the head is off
         voxel_size: Sequence[float] | None = None,  # image voxel, microns
@@ -714,6 +727,47 @@ class TrackingLoss(nn.Module):
             ) / len(annot_logits_per_frame)
             total = total + self.annot_loss_weight * l_annot
             breakdown["annot"] = self.annot_loss_weight * l_annot.item()
+
+        if div_logits_per_frame:
+            # Which annotated cells divide into the next frame. The transition
+            # matrices already say so and nothing new has to be read: a row of
+            # `edge_targets_per_pair[i]` carries one 1 per child, so a parent
+            # that splits sums to >= 2. `_k_step_transition` documents that
+            # shape -- "a cell that divides somewhere inside the gap reaches
+            # both daughters and the row carries two ones".
+            #
+            # Ground truth only, like the annotation head: a weak positive has
+            # no lineage, so its row is not evidence of anything either way.
+            # The last frame of the window has no transition matrix after it
+            # and is skipped rather than labelled negative -- "no successor
+            # recorded" is not "did not divide".
+            l_div, n_div = 0.0, 0
+            for i in range(min(len(div_logits_per_frame), len(edge_targets_per_pair))):
+                tgt = edge_targets_per_pair[i]              # (B, N_t, N_t1)
+                mask_src = det_mask_per_pair[i][0]          # (B, N_t) real rows
+                divides = (tgt.sum(dim=-1) >= 2) & mask_src.bool()
+                coords = gt_coords_per_frame[i].clone()
+                # Keep the dividing cells; the rest become padding rather than
+                # negatives, exactly as `gt_mask_per_frame` marks absent nodes.
+                keep = divides & gt_mask_per_frame[i].bool()
+                l_div = l_div + detection_loss(
+                    div_logits_per_frame[i],
+                    coords,
+                    keep,
+                    self.div_neg_weight,
+                    unet_scaling=unet_scaling if det_stride is None else det_stride,
+                    voxel_size=voxel_size,
+                    weak_smoothing=self.det_weak_smoothing,
+                    gaussian_sigma=self.det_gaussian_sigma,
+                    sigma_anchor=self.det_sigma_anchor,
+                    use_weak_positives=False,
+                    pos_weight_scale=self.div_pos_scale,
+                )
+                n_div += 1
+            if n_div:
+                l_div = l_div / n_div
+                total = total + self.div_loss_weight * l_div
+                breakdown["div"] = self.div_loss_weight * l_div.item()
 
         if det_logits_ds_per_frame:
             l_det_ds = _det_term(det_logits_ds_per_frame, unet_scaling)

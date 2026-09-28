@@ -94,12 +94,22 @@ def parse_tracking_runs(nodes_folder: str) -> list[tuple[str, str, Path]]:
                 continue
             m = re.search(r"logs/(\d{4}-\d{2}-\d{2})/(\d+)", r.replace("\\", "/"))
             if not m:
-                raise ValueError(f"cannot parse a tracking run from {r!r}")
+                # A partner from outside this repo -- `logs/eduardo_current_mean3`
+                # is a shim over output/eduardo_predictions, not a training run,
+                # so there are no fold_*/ckpt_final.pt here to copy. Its weights
+                # ship as their own Kaggle dataset and the notebook mounts them
+                # directly; copying anything for it would be inventing a run
+                # folder that does not exist. Reported, not raised: an ensemble
+                # with an external member is a valid pipeline, and refusing to
+                # package the rest of it because one member lives elsewhere was
+                # the bug.
+                out.append((None, r.rstrip("/").split("/")[-1], None))
+                continue
             key = (m.group(1), m.group(2), LOGS / m.group(1) / m.group(2))
             if key not in out:
                 out.append(key)
-        if not out:
-            raise ValueError(f"{settings} names no detector runs")
+        if not any(d for d, _, _ in out):
+            raise ValueError(f"{settings} names no detector runs in this repo")
         return out
 
     raise ValueError(f"Cannot parse tracking run from nodes_folder: {nodes_folder!r}")
@@ -220,15 +230,22 @@ def main() -> int:
     ct_date, ct_exp, contrastive_src = parse_contrastive_from_key(embeddings_key)
     edge_date, edge_exp = parse_edge_run_id(edge_src)
 
+    external = [name for d, name, _ in tracking_runs if d is None]
+    tracking_runs = [t for t in tracking_runs if t[0] is not None]
+
     print("Pipeline models:")
     for tr_date, tr_exp, src in tracking_runs:
         missing = "" if (src / "fold_fullfit" / "ckpt_final.pt").exists() else \
             "   !! no fold_fullfit/ckpt_final.pt -- inference cannot load it"
         print(f"  tracking:    tracking_{tr_date}_{tr_exp}{missing}")
+    for name in external:
+        print(f"  tracking:    {name}   (external partner -- NOT copied; its "
+              f"weights ship as their own dataset)")
     print(f"  contrastive: contrastive_{ct_date}_{ct_exp}")
     print(f"  edge:        edge_{edge_date}_{edge_exp}")
-    if len(tracking_runs) > 1:
-        print(f"  (ensemble node set -- all {len(tracking_runs)} detectors are needed)")
+    n_det = len(tracking_runs) + len(external)
+    if n_det > 1:
+        print(f"  (ensemble node set -- all {n_det} detectors are needed)")
     print()
 
     for tr_date, tr_exp, src in tracking_runs:

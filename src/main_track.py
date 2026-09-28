@@ -217,7 +217,17 @@ DEFAULTS = {
     # Aux heads
     "offset_head": False,
     "offset_radius": 2,       # grid voxels a cell's vote reaches
-    "annot_head": True,  # False,  # A second head asking "would an annotator have labelled this cell"
+    "annot_head": False,  # True,  # A second head asking "would an annotator have labelled this cell"
+    # A third head asking "does this cell divide into the next frame". Off by
+    # default and unproven: it is the first attempt to move divisions upstream
+    # of the proposal stage. The chain converts ~50 of 151 annotated divisions
+    # and the 98 it misses were never proposed as forks, so the downstream
+    # gates -- which can only ever delete -- cannot reach them; see
+    # division_cls/README.md. Labels come free from the transition matrices
+    # (a dividing parent's row sums to >= 2), so this costs one 1x1 conv pair
+    # and no new data. `loss_config.div_loss_weight` bounds how far it may
+    # pull the shared trunk.
+    "div_head": True,
 
     # Stage 1 - Synthetic data pretraining
     "synthetic_pretraining": {
@@ -267,7 +277,7 @@ DEFAULTS = {
         # Override the image peaks above; combined with pl_folder when both are
         # set, the pl_folder point winning any duplicate. A stack the folder does
         # not cover or that fails a gate below falls back to the image peaks.
-        "use_focus_3d": False,
+        "use_focus_3d": True,
         "focus_3d_dir": OUTPUT_FOLDER + "focus3d/",
         "focus_3d_min_recall": 0.5,   # drop a stack that misses annotated cells
         "focus_3d_max_ratio": 1.25,    # drop a stack predicting far too many cells
@@ -286,8 +296,8 @@ DEFAULTS = {
     # Stage 1.5 - Pretraining
     "pretraining": {
         "enabled": True,
-        "weights": "../logs/2026-09-13/1/fold_0/ckpt_synthetic.pt",  # temporal wide 13/1
-        # "weights": "../logs/2026-09-22/10/fold_0/ckpt_synthetic.pt",  # temporal wide new
+        # "weights": "../logs/2026-09-13/1/fold_0/ckpt_synthetic.pt",  # temporal wide 13/1
+        "weights": "../logs/2026-09-22/10/fold_0/ckpt_synthetic.pt",  # temporal wide new
         # "weights": None,
         # Data
         "crop_size": (32, 128, 128),  # (48, 192, 192)
@@ -304,7 +314,7 @@ DEFAULTS = {
         # Training
         # 2500 is run 6 (0.7693); 2000 run 7 (0.7562), 4000 run 8 (0.7686) --
         # non-monotonic, so 2500 vs 4000 is a coin flip and 2000 is short.
-        "iterations": 5000,
+        "iterations": 3000,
         "epochs": None,
         "batch_size": 16,
         # Eval
@@ -374,7 +384,7 @@ DEFAULTS = {
         "det_use_weak_positives": True,
         "det_loss_weight": 1,
         "det_neg_weight": 0.05,
-        "det_weak_weight": 0.2,        # To balance GT share of positive weight 
+        "det_weak_weight": 0.5,        # To balance GT share of positive weight 
         "det_weak_smoothing": 0.01,      # smoothing factor for weak positives
         "det_gaussian_sigma": 1.0,
         # How that scalar sigma is restated per axis on the fine (1,2,2)
@@ -387,7 +397,7 @@ DEFAULTS = {
         # since shows a threshold-0.50 collapse (-0.03..-0.18 against
         # -0.01..-0.04 before) that the two changes are confounded in.
         # "grid" is what every run up to that point trained with.
-        "det_sigma_anchor": "grid",  # "fine" / "grid" / "coarse"
+        "det_sigma_anchor": "coarse",  # "fine" / "grid" / "coarse"
         "det_ds_weight": 1.0,          # deep-supervision heatmap, relative to the fine one
         # The annotation head. Its positives are the ~3 annotated cells a frame
         # rather than the ~500 the detector sees, and the focal loss normalises
@@ -397,6 +407,14 @@ DEFAULTS = {
         "annot_loss_weight": 1.0,
         "annot_neg_weight": 1e-3,
         "annot_pos_scale": 1.0,
+        # The division head (`div_head`). 0.2 because divisions are 0.13% of
+        # annotated links: a rare positive sharing the detector's trunk, where
+        # the failure mode is dragging detection for a task with ~150 examples.
+        # `div_neg_weight` mirrors `annot_neg_weight` -- the head sees the same
+        # sea of background, and the annotation is the only positive evidence.
+        "div_loss_weight": 0.2,
+        "div_neg_weight": 1e-2,
+        "div_pos_scale": 1.0,
         # What to do with the pseudo-labelled detections:
         "det_weak_mode": None,  # "positive" / "ignore" / "negative" - None = old behaviour
         "det_weak_ignore_radius": 0.0,  # grid voxels; 0 = det_gaussian_sigma

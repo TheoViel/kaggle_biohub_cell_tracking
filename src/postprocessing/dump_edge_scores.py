@@ -67,7 +67,7 @@ def main():
         )
         imgs = imgs.unsqueeze(0).to(DEVICE)
 
-        unet_out, _, _, _ = model.encode(imgs)
+        unet_out, _, _, _, _ = model.encode(imgs)
         if scaling is None:
             scaling = tuple(s // o for s, o in zip(imgs.shape[-3:], unet_out.shape[-3:]))
             print(f"-> unet scaling {scaling}, out shape {tuple(unet_out.shape[-3:])}")
