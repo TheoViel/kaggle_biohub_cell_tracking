@@ -172,6 +172,30 @@ def _ckpts_for(run_dir, fold):
     return [Path(run_dir) / f"fold_{int(fold)}" / "ckpt_final.pt"]
 
 
+def _usable_devices(devices):
+    """`devices` minus the ones this process cannot actually put a tensor on.
+
+    Visible is not the same as usable. A Kaggle 2xT4 session lists two CUDA
+    devices and then raises "CUDA driver error: operation not permitted" the
+    moment a second context is created, which is why this probes with a real
+    allocation rather than trusting `torch.cuda.device_count()`.
+    """
+    ok = []
+    for d in devices:
+        if not str(d).startswith("cuda"):
+            ok.append(d)
+            continue
+        try:
+            torch.zeros(1, device=d)
+            ok.append(d)
+        except Exception as e:                                # noqa: BLE001
+            print(f"-> {d} is visible but unusable ({type(e).__name__}: {e}); "
+                  "not sharding onto it", flush=True)
+    if not ok:
+        raise RuntimeError(f"none of {devices} can hold a tensor")
+    return ok
+
+
 def score_candidates(cand_path, data_dir, run_dirs, device, batch_size, workers,
                      fold="mean", devices=None, n_tta=1):
     """`{run_dir: (n,) probabilities}` for every model, in as few passes as possible.
@@ -197,7 +221,7 @@ def score_candidates(cand_path, data_dir, run_dirs, device, batch_size, workers,
     of the work. A thread per device is enough: the GIL is released across the
     CUDA calls and the loader's workers are separate processes anyway.
     """
-    devices = devices or [device]
+    devices = _usable_devices(devices or [device])
     blob = np.load(cand_path, allow_pickle=True)
     n = len(blob["table"])
     if not n:
@@ -224,7 +248,13 @@ def score_candidates(cand_path, data_dir, run_dirs, device, batch_size, workers,
           f"{'y' if len(groups) == 1 else 'ies'}, {len(devices)} device(s)",
           flush=True)
 
-    out = {rd: np.zeros(n, np.float64) for rd in run_dirs}
+    # NaN, not zeros. Every consumer treats a non-finite score as 'no
+    # opinion' and keeps the fork, so a row this function fails to fill
+    # survives instead of being silently deleted. Zero-init made an unscored
+    # shard indistinguishable from a confident reject: on a Kaggle 2xT4 the
+    # second device raised inside its worker thread and the run went on to
+    # drop 2991 of 3029 forks and exit 0.
+    out = {rd: np.full(n, np.nan, np.float64) for rd in run_dirs}
     counts = {rd: 0 for rd in run_dirs}
 
     for geom, members in groups.items():
@@ -266,17 +296,41 @@ def score_candidates(cand_path, data_dir, run_dirs, device, batch_size, workers,
             for rd, parts in acc.items():
                 out[rd][rows] = torch.cat(parts).numpy().astype(np.float64)
 
-        threads = [threading.Thread(target=work, args=(d, r))
+        # A bare Thread swallows whatever its target raises: the exception is
+        # printed and the join succeeds, so the caller cannot tell a finished
+        # shard from a dead one. Collect and re-raise.
+        errors = []
+
+        def guarded(dev, rows):
+            try:
+                work(dev, rows)
+            except BaseException as e:                        # noqa: BLE001
+                errors.append((dev, e))
+
+        threads = [threading.Thread(target=guarded, args=(d, r))
                    for d, r in zip(devices, shards)]
         for t in threads:
             t.start()
         for t in threads:
             t.join()
+        if errors:
+            dev, err = errors[0]
+            raise RuntimeError(
+                f"scoring failed on {dev} ({type(err).__name__}: {err}). "
+                f"{len(errors)} of {len(threads)} shard(s) died; refusing to "
+                "gate on a partial result") from err
         for rd, ck, _ in members:
             counts[rd] = len(ck)
             print(f"   {Path(rd).name}: {len(ck)} ckpt(s) on geometry "
                   f"{geom[0]}/{geom[1]}/{geom[2]}", flush=True)
 
+    for rd in run_dirs:
+        bad = int(np.isnan(out[rd]).sum())
+        if bad:
+            raise RuntimeError(
+                f"{Path(rd).name}: {bad} of {n} forks were never scored. The "
+                "gate refuses to write a partial result -- unscored forks "
+                "would be indistinguishable from rejected ones downstream.")
     return {rd: out[rd].astype(np.float32) for rd in run_dirs}
 
 
