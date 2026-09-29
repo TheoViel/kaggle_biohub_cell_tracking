@@ -124,6 +124,37 @@ def rank_per_stack(stems, score):
     return out
 
 
+TTA_FLIPS = [(), (-1,), (-2,), (-1, -2)]
+
+
+def tta_probs(model, clip, feat, n_tta):
+    """Mean sigmoid over `n_tta` flips of the Y/X plane.
+
+    The clip is ``(B, T, pz, H, W)``, so the flips act on the last two axes
+    only -- flipping z would reorder the slab, which is a depth axis and not a
+    symmetry of the data.
+
+    Averaging probabilities rather than logits: the flips are the *same* model
+    on the same crop, so they share a calibration and the mean is the estimator
+    we want. (The rank-vs-probability argument in `merge_fork_scores` is about
+    combining *different* models, which is the opposite case.)
+
+    Nearly free here. Cutting the crops dominates -- 8.4 s a stack for two
+    models against 5.2 s for one -- and TTA reuses tensors already in memory,
+    so four views cost four cheap forwards, not four passes.
+
+    Training already applies `flip_p 0.5` and `rot90_p 0.5`, so these views are
+    inside the distribution the model was fitted on rather than novel ones.
+    """
+    flips = TTA_FLIPS[:n_tta] if n_tta > 1 else [()]
+    out = None
+    for d in flips:
+        x = clip.flip(dims=d) if d else clip
+        p = torch.sigmoid(model(x, feat)).float()
+        out = p if out is None else out + p
+    return out / len(flips)
+
+
 def _ckpts_for(run_dir, fold):
     """The checkpoints of one run that `fold` selects."""
     if fold == "fullfit":
@@ -142,7 +173,7 @@ def _ckpts_for(run_dir, fold):
 
 
 def score_candidates(cand_path, data_dir, run_dirs, device, batch_size, workers,
-                     fold="mean", devices=None):
+                     fold="mean", devices=None, n_tta=1):
     """`{run_dir: (n,) probabilities}` for every model, in as few passes as possible.
 
     Two costs to beat, and the profile is lopsided: the network forward on the
@@ -229,7 +260,7 @@ def score_candidates(cand_path, data_dir, run_dirs, device, batch_size, workers,
                     with torch.autocast("cuda", torch.float16,
                                         enabled=str(dev).startswith("cuda")):
                         for rd, models in loaded:
-                            p = sum(torch.sigmoid(mo(clip, feat)).float()
+                            p = sum(tta_probs(mo, clip, feat, n_tta)
                                     for mo in models) / len(models)
                             acc[rd].append(p.cpu())
             for rd, parts in acc.items():
@@ -303,6 +334,15 @@ def main():
                         "model group on it")
     p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--merge", choices=("prob", "rank"), default="prob",
+                   help="how several --run_dir are combined. 'prob' averages "
+                        "the probabilities and --tau is a probability; 'rank' "
+                        "averages per-stack ranks and --tau is a quantile. "
+                        "prob measured better on every grouping tried on the "
+                        "28/0 chain (0.2884 vs 0.2095 div_J on three models)")
+    p.add_argument("--tta", type=int, choices=(1, 2, 4), default=1,
+                   help="average the probabilities over this many Y/X flips "
+                        "(see tta_probs). Nearly free: the crops are reused")
     a = p.parse_args()
 
     if a.devices:
@@ -327,12 +367,25 @@ def main():
         # geometry rather than once per model.
         scored = score_candidates(cand_path, a.data_dir, a.run_dir, a.device,
                                   a.batch_size, a.num_workers, a.fold,
-                                  devices=devices)
+                                  devices=devices, n_tta=a.tta)
         per_model = [scored[rd] for rd in a.run_dir]
         for rd, sc in zip(a.run_dir, per_model):
             print(f"  {Path(rd).name}: median {np.nanmedian(sc):.3f}", flush=True)
         if len(per_model) == 1:
             scores = per_model[0]
+        elif a.merge == "prob":
+            # The mean of the probabilities. Measured on the 28/0 harvest, three
+            # models: mean 0.2884 mean-div_J against rank's 0.2095 over the same
+            # tau range. `merge_fork_scores` prefers rank because members
+            # calibrate differently, and that was true of the 13/0-chain pool
+            # where one model saturated at 0/1 and another did not -- on pools
+            # built from the current chain the calibrations are close, so
+            # ranking discards the magnitude for nothing.
+            stack = np.vstack(per_model)
+            scores = np.nanmean(stack, axis=0)
+            scores[np.all(~np.isfinite(stack), axis=0)] = np.nan
+            print(f"-> probability-averaged {len(per_model)} models; --tau "
+                  f"{a.tau} is a probability", flush=True)
         else:
             ranked = np.vstack([rank_per_stack(cand_stems, s) for s in per_model])
             scores = np.nansum(ranked, axis=0) / len(per_model)

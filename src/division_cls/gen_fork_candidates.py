@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import io
 import sys
 from multiprocessing import Pool
@@ -310,11 +311,18 @@ def gt_fork_rows(table, geff_path, max_distance=7.0, max_dt=1):
 
 
 def _one(stem_pred):
-    stem, pred_dir, data_dir, max_dt, append_gt = stem_pred
+    stem, pred_dir, data_dir, max_dt, append_gt, pp_overrides = stem_pred
     z = np.load(Path(pred_dir) / f"{stem}.npz")
     cfg = dict(MEP.DEFAULTS)
     cfg.update(out_dir="", geff_dir="", no_score=True, assign=1)
     cfg.update(FORK_CFG)
+    if pp_overrides:
+        # The pool is whatever chain proposes it, and FORK_CFG is only *our*
+        # chain. A partner's branch reaches div_J 0.4146 against our 0.2557 on
+        # the same annotation with the ILP off and the geometric proposer wide
+        # open, so the pool has to be expressible here or it cannot be trained
+        # on or compared against.
+        cfg.update(pp_overrides)
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         coords, edges = MEP.postprocess(
             z["coords"].astype(np.float64), np.empty((0, 4)),
@@ -343,6 +351,10 @@ def main():
                         "components and never demands the same frame, so 0 "
                         "(the old behaviour) labels real divisions negative: "
                         "57 positives against 76 at 1 and 82 at 2, out of 151")
+    p.add_argument("--pp_overrides", default=None,
+                   help="JSON of main_edge_postprocess settings applied on top "
+                        "of FORK_CFG, so a pool from a different chain can be "
+                        "built and compared. Recorded in the output.")
     p.add_argument("--append_gt", action="store_true",
                    help="add a positive row for every annotated division the "
                         "chain proposes no fork for. Training signal only -- "
@@ -354,8 +366,9 @@ def main():
                    if args.embryo is None or q.stem.startswith(args.embryo))
     print(f"{len(stems)} stacks from {pred_dir}", flush=True)
 
-    jobs = [(s, str(pred_dir), str(args.data_dir), args.label_dt, args.append_gt)
-            for s in stems]
+    overrides = json.loads(args.pp_overrides) if args.pp_overrides else None
+    jobs = [(s, str(pred_dir), str(args.data_dir), args.label_dt, args.append_gt,
+             overrides) for s in stems]
     stem_col, tables = [], []
     with Pool(args.workers) as pool:
         for i, (stem, table) in enumerate(pool.imap_unordered(_one, jobs), 1):
@@ -371,7 +384,8 @@ def main():
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(out, stem=np.asarray(stem_col), table=table,
-                        columns=np.asarray(COLUMNS))
+                        columns=np.asarray(COLUMNS),
+                        pp_overrides=np.asarray(args.pp_overrides or ""))
     print(f"\n{len(table)} forks -> {out}   (label_dt={args.label_dt}, "
           f"append_gt={args.append_gt})")
     print(f"  labelled positive : {(labels == 1).sum()}")

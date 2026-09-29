@@ -33,6 +33,37 @@ from division_cls.infer import load_fold_models  # noqa: E402
 from params import TRAIN_DIR  # noqa: E402
 
 
+TTA_FLIPS = [(), (-1,), (-2,), (-1, -2)]
+
+
+def tta_probs(model, clip, feat, n_tta):
+    """Mean sigmoid over `n_tta` flips of the Y/X plane.
+
+    The clip is ``(B, T, pz, H, W)``, so the flips act on the last two axes
+    only -- flipping z would reorder the slab, which is a depth axis and not a
+    symmetry of the data.
+
+    Averaging probabilities rather than logits: the flips are the *same* model
+    on the same crop, so they share a calibration and the mean is the estimator
+    we want. (The rank-vs-probability argument in `merge_fork_scores` is about
+    combining *different* models, which is the opposite case.)
+
+    Nearly free here. Cutting the crops dominates -- 8.4 s a stack for two
+    models against 5.2 s for one -- and TTA reuses tensors already in memory,
+    so four views cost four cheap forwards, not four passes.
+
+    Training already applies `flip_p 0.5` and `rot90_p 0.5`, so these views are
+    inside the distribution the model was fitted on rather than novel ones.
+    """
+    flips = TTA_FLIPS[:n_tta] if n_tta > 1 else [()]
+    out = None
+    for d in flips:
+        x = clip.flip(dims=d) if d else clip
+        p = torch.sigmoid(model(x, feat)).float()
+        out = p if out is None else out + p
+    return out / len(flips)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--candidates", required=True, help="gen_fork_candidates .npz")
@@ -43,6 +74,11 @@ def main():
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--batch_size", type=int, default=256)
     p.add_argument("--num_workers", type=int, default=8)
+    p.add_argument("--tta", type=int, choices=(1, 2, 4), default=1,
+                   help="average the probabilities over this many Y/X flips. "
+                        "Variance reduction from the same mechanism as seed "
+                        "averaging, and nearly free: the crops are cut once "
+                        "and reused, so 4 views are 4 forwards, not 4 passes")
     args = p.parse_args()
 
     blob = np.load(args.candidates, allow_pickle=True)
@@ -89,7 +125,7 @@ def main():
                         if feat is not None and feat.numel() else None)
                 with torch.autocast("cuda", torch.float16,
                                     enabled=args.device.startswith("cuda")):
-                    got.append(torch.sigmoid(model(clip, feat)).float().cpu())
+                    got.append(tta_probs(model, clip, feat, args.tta).cpu())
                 done += len(clip)
                 if done % (args.batch_size * 40) == 0:
                     print(f"  {embryo}: {done}/{len(ds.samples)}", flush=True)
