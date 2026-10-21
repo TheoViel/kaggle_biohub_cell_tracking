@@ -11,12 +11,66 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _grad_ckpt
 
-from model_zoo.resenc_unet import anisotropic_strides, cumulative_stride
+
+def cumulative_stride(*stride_groups):
+    """
+    Per-axis product of a set of strides.
+
+    Args:
+        *stride_groups: Each argument is either one stride (a sequence, one entry per axis) or
+            a sequence of them.
+
+    Returns:
+        tuple: The combined downsampling factor per axis.
+    """
+    strides = []
+    for group in stride_groups:
+        if len(group) and isinstance(group[0], (tuple, list, np.ndarray)):
+            strides.extend(group)
+        else:
+            strides.append(group)
+    return tuple(int(np.prod(axis)) for axis in zip(*strides))
+
+
+def anisotropic_strides(n_stages, pool_stride=(1, 2, 2), n_anisotropic=2, stem_strides=True):
+    """
+    Build a stride schedule that downsamples anisotropically for the first few steps.
+
+    Volumes whose Z spacing is coarser than Y/X should not lose Z resolution until Y and X have
+    caught up, which is what `pool_stride=(1, 2, 2)` for the first `n_anisotropic` downsamplings
+    gives; everything past that is isotropic.
+
+    Args:
+        n_stages (int): Number of encoder stages.
+        pool_stride (tuple, optional): The anisotropic stride. Default is (1, 2, 2).
+        n_anisotropic (int, optional): How many downsampling steps use it. Default is 2.
+        stem_strides (bool, optional): Let the stem take the first downsampling step, so nothing
+            but its single convolution ever runs at full resolution. When False the stem keeps
+            nnU-Net's stride of 1 and the first stage downsamples instead. Default is True.
+
+    Returns:
+        tuple: Stem stride, one entry per axis.
+        tuple: Per-stage strides, one entry per axis each.
+    """
+    isotropic = tuple([max(pool_stride)] * len(pool_stride))
+    ones = tuple([1] * len(pool_stride))
+
+    stem_stride = pool_stride if stem_strides else ones
+    # The stem's step already counts towards n_anisotropic, and a non-striding stem means the
+    # first stage has to take that step instead.
+    taken = 1 if stem_strides else 0
+    strides = [ones] if stem_strides else []
+    while len(strides) < n_stages:
+        strides.append(pool_stride if taken < n_anisotropic else isotropic)
+        taken += 1
+
+    return stem_stride, tuple(strides[:n_stages])
 
 
 def _to_3tuple(v) -> tuple[int, int, int]:

@@ -1,1 +1,0 @@
-import os; os.environ.setdefault('NUMEXPR_NUM_THREADS', '1'); os.environ.setdefault('NUMEXPR_MAX_THREADS', '64')

@@ -8,7 +8,7 @@ allow-direct-references = true
 [project]
 name = "tracking-cellmot"
 version = "0.1.0"
-description = "Cell tracking utilities: I/O, metrics, and transformer-based edge prediction"
+description = "Biohub cell tracking: training code for the models of the biohub-ens-edu kernel"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 license = "BSD-3-Clause"
@@ -17,45 +17,17 @@ dependencies = [
     "tracksdata @ git+https://github.com/royerlab/tracksdata@main",
     "zarr>=3.0.10",
     "scipy",
-    "scikit-image>=0.24",
+    "scikit-learn",
+    "polars",
+    "dask",
+    "joblib",
     "tqdm",
     "kaggle>=2.2.3",
-    "python-dotenv>=1.2.2",
     "ipykernel>=6.31.0",
     "ipywidgets>=8.1",
     "matplotlib>=3.11.1",
     "pandas>=3.0.3",
-    "cellpose>=4.2.1.1",
-    "dinov3",
-    "ipywidgets",
     "timm>=1.0.28",
-    "segmentation-models-pytorch>=0.5.0",
-    "streamlit>=1.61.1",
-    "plotly>=6.9.0",
-]
-
-[project.optional-dependencies]
-dev = [
-    "pytest>=8.4.2",
-]
-viz = [
-    "napari>=0.5",
-    "pyqt5",
-]
-app = [
-    "streamlit>=1.40",
-    "plotly>=5.20",
-]
-
-[dependency-groups]
-dev = [
-    "pytest>=9.0.2",
-]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-markers = [
-    "slow: marks tests as slow — deselect with '-m \"not slow\"'",
 ]
 
 [tool.ruff]
@@ -80,13 +52,6 @@ select = [
     "TID",  # flake8-tidy-imports
 ]
 
-[tool.ruff.lint.per-file-ignores]
-"tests/*.py" = ["D", "S"]
-
 [tool.ruff.format]
 docstring-code-format = true
 skip-magic-trailing-comma = false
-
-[tool.uv.sources]
-cellpose = { git = "https://www.github.com/mouseland/cellpose.git" }
-dinov3 = { git = "https://github.com/facebookresearch/dinov3.git" }

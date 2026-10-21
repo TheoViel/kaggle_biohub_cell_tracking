@@ -7,29 +7,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from model_zoo.simple_node_transformer import SimpleNodeTransformer
-from model_zoo.temporal_resenc_unet import TemporalResEncUNet3D
 from model_zoo.temporal_unet import TemporalUNet3D
-from model_zoo.temporal_unet_v2 import TemporalUNet3Dv2
-from model_zoo.temporal_unet_v3 import TemporalUNet3Dv3
-from model_zoo.temporal_unet_v4 import TemporalUNet3Dv4
-from model_zoo.timm_25d_unet import Timm25DUNet3D
 
 
-# Backbones the tracking model can be built on, by name. "temporal" is the plain two-conv
-# U-Net; "resenc" is the nnU-Net residual encoder at the same geometry, which is deeper at
-# equal widths. "temporal_v2" keeps "temporal"'s geometry but moves the temporal interaction
-# out of the encoder and into the decoder, where it is a motion-compensated local
-# corroboration rather than a same-voxel attention -- see temporal_unet_v2. "timm25d" is
-# the CZII 4th-place 2.5D architecture: a pretrained 2D encoder run per Z slice, with the
-# depth axis reduced by pooling and a 3D U-Net decoder over it -- see timm_25d_unet. All
-# take the same geometry arguments and return (B, T, C, Z', Y', X').
+# Backbones the tracking model can be built on, by name. Only the temporal U-Net is
+# kept; it returns (B, T, C, Z', Y', X').
 UNET_BACKBONES = {
     "temporal": TemporalUNet3D,
-    "temporal_v2": TemporalUNet3Dv2,
-    "temporal_v3": TemporalUNet3Dv3,
-    "temporal_v4": TemporalUNet3Dv4,
-    "resenc": TemporalResEncUNet3D,
-    "timm25d": Timm25DUNet3D,
 }
 
 
@@ -45,7 +29,7 @@ class UNetNodeTransformer(nn.Module):
 
     def __init__(
         self,
-        unet: TemporalUNet3D | TemporalResEncUNet3D,
+        unet: TemporalUNet3D,
         unet_out_channels: int,
         pos_feat_dim: int = 0,
         hidden_dim: int = 128,
@@ -58,7 +42,7 @@ class UNetNodeTransformer(nn.Module):
         contrastive_feat_dim: int = 0,
         edge_attention: bool = True,
         edge_drift_correction: bool = False,
-        embed_unet: TemporalUNet3D | TemporalResEncUNet3D | None = None,
+        embed_unet: TemporalUNet3D | None = None,
         embed_unet_out_channels: int = 32,
         embed_dim: int = 32,
         unet_features: tuple[str, ...] = ("detection",),
@@ -451,20 +435,6 @@ def define_track_model(
     unet_n_anisotropic: int = 2,
     unet_blocks_per_stage: list[int] | None = None,
     unet_temporal_attention: bool = True,
-    # "temporal_v2" only -- see temporal_unet_v2.TemporalUNet3Dv2.
-    unet_temporal_fusion_at: tuple[str, ...] = ("head",),
-    unet_temporal_match_channels: int = 32,
-    unet_temporal_taps: tuple[int, int, int] = (5, 3, 3),
-    unet_temporal_dilation: tuple[int, int, int] | str = "auto",
-    unet_temporal_agree: str = "mean",
-    unet_temporal_max_neighbours: int | None = None,
-    # "temporal_v3" only.
-    unet_temporal_motion_prior: float = 1.0,
-    unet_temporal_flow_smooth_iters: int = 3,
-    # "temporal_v4" only.
-    unet_temporal_flow_channels: int = 8,
-    unet_temporal_flow_hidden_channels: int = 32,
-    unet_temporal_value_channels: int = 8,
     unet_spatial_attention: str = "none",
     unet_spatial_attention_stages: int = 1,
     unet_spatial_attention_heads: int = 4,
@@ -473,12 +443,6 @@ def define_track_model(
     unet_stem: str = "stride",
     unet_norm: str = "batch",
     unet_hires_fusion: bool = False,
-    # "timm25d" only.
-    unet_timm_backbone: str = "convnext_nano.in12k_ft_in1k",
-    unet_timm_slice_size: int = 5,
-    unet_timm_pretrained: bool = True,
-    unet_timm_drop_path_rate: float = 0.0,
-    unet_timm_max_levels: int | None = None,
     transformer_hidden: int = 128,
     transformer_heads: int = 4,
     transformer_blocks: int = 4,
@@ -521,17 +485,13 @@ def define_track_model(
         is kept and supervised on the target it already had, and its output is
         fed forward into the fine head.  Temporal backbone only.
     unet_arch : str
-        Which backbone to build, see ``UNET_BACKBONES``.  ``"temporal"``
-        is the plain two-conv U-Net, ``"resenc"`` the nnU-Net residual
-        encoder at the same geometry.
+        Which backbone to build, see ``UNET_BACKBONES``.
     unet_n_anisotropic : int
         How many downsampling steps use ``unet_pool_stride`` before the
         rest go isotropic.  The stem's own step counts as the first.
     unet_blocks_per_stage : list of int or None
-        Residual blocks per encoder stage.  None takes nnU-Net's
-        ``(1, 3, 4, 6, 6, ...)`` on ResEnc and the plain two-conv block on
-        ``TemporalUNet3D``; give it e.g. ``[1, 3, 4]`` to put residual depth
-        behind the temporal backbone as well.
+        Residual blocks per encoder stage.  None takes the plain two-conv
+        block; give it e.g. ``[1, 3, 4]`` for residual depth.
     unet_temporal_attention : bool
         If False, the backbone drops its temporal attention blocks and the
         frames of a window are encoded independently.
@@ -563,19 +523,6 @@ def define_track_model(
     unet_hires_fusion : bool
         Temporal backbone only: pool the encoder skips finer than the head's
         grid back into the head instead of discarding them.
-    unet_timm_backbone : str
-        ``"timm25d"`` only: the 2D timm encoder run per Z slice.
-    unet_timm_slice_size : int
-        ``"timm25d"`` only: neighbouring Z slices stacked into that encoder's
-        channel axis.
-    unet_timm_pretrained : bool
-        ``"timm25d"`` only: load the ImageNet weights, which is the whole reason
-        for the architecture. Turn it off only when a checkpoint is about to
-        overwrite them anyway.
-    unet_timm_drop_path_rate : float
-        ``"timm25d"`` only: stochastic depth in the 2D encoder.
-    unet_timm_max_levels : int or None
-        ``"timm25d"`` only: cap on the encoder's pyramid levels, deepest first.
     """
     if unet_layers is None:
         unet_layers = [32, 64, 128]
@@ -583,56 +530,18 @@ def define_track_model(
         raise ValueError(f"unknown unet_arch {unet_arch!r}, expected one of {sorted(UNET_BACKBONES)}")
 
     backbone = UNET_BACKBONES[unet_arch]
-    # Stem layout, normalisation and skip fusion are TemporalUNet3D's; the ResEnc
-    # encoder fixes all three by construction.
-    extra = (
-        {}
-        if unet_arch == "resenc"
-        else {"stem": unet_stem, "norm": unet_norm, "hires_skip_fusion": unet_hires_fusion}
-    )
-    # Both backbones take these, so they go in the shared block rather than in
-    # `extra`; "none" leaves every stage an Identity and the model unchanged.
-    extra["spatial_attention"] = unet_spatial_attention
-    extra["spatial_attention_stages"] = unet_spatial_attention_stages
-    extra["spatial_attention_heads"] = unet_spatial_attention_heads
-    extra["spatial_attention_reduction"] = unet_spatial_attention_reduction
-    extra["spatial_attention_window"] = tuple(unet_spatial_attention_window)
-
-    # v2 has no encoder temporal attention at all -- that absence is the point,
-    # since it is what makes its per-frame features cacheable across overlapping
-    # windows -- and it raises rather than ignore the flag. So the two are
-    # mutually exclusive: pass the fusion configuration instead.
-    if unet_arch in ("temporal_v2", "temporal_v3", "temporal_v4"):
-        extra["temporal_fusion_at"] = tuple(unet_temporal_fusion_at)
-        extra["temporal_match_channels"] = int(unet_temporal_match_channels)
-        extra["temporal_taps"] = tuple(unet_temporal_taps)
-        extra["temporal_dilation"] = (
-            unet_temporal_dilation
-            if isinstance(unet_temporal_dilation, str)
-            else tuple(unet_temporal_dilation)
-        )
-        extra["temporal_agree"] = unet_temporal_agree
-        extra["temporal_max_neighbours"] = unet_temporal_max_neighbours
-        if unet_arch == "temporal_v3":
-            extra["temporal_motion_prior"] = float(unet_temporal_motion_prior)
-            extra["temporal_flow_smooth_iters"] = int(unet_temporal_flow_smooth_iters)
-        elif unet_arch == "temporal_v4":
-            extra["temporal_flow_channels"] = int(unet_temporal_flow_channels)
-            extra["temporal_flow_hidden_channels"] = int(
-                unet_temporal_flow_hidden_channels
-            )
-            extra["temporal_value_channels"] = int(unet_temporal_value_channels)
-    else:
-        extra["temporal_attention"] = unet_temporal_attention
-
-    if unet_arch == "timm25d":
-        extra["timm_backbone"] = unet_timm_backbone
-        extra["timm_slice_size"] = int(unet_timm_slice_size)
-        extra["timm_pretrained"] = bool(unet_timm_pretrained)
-        extra["timm_drop_path_rate"] = float(unet_timm_drop_path_rate)
-        extra["timm_max_levels"] = (
-            None if unet_timm_max_levels is None else int(unet_timm_max_levels)
-        )
+    extra = {
+        "stem": unet_stem,
+        "norm": unet_norm,
+        "hires_skip_fusion": unet_hires_fusion,
+        # "none" leaves every stage an Identity and the model unchanged.
+        "spatial_attention": unet_spatial_attention,
+        "spatial_attention_stages": unet_spatial_attention_stages,
+        "spatial_attention_heads": unet_spatial_attention_heads,
+        "spatial_attention_reduction": unet_spatial_attention_reduction,
+        "spatial_attention_window": tuple(unet_spatial_attention_window),
+        "temporal_attention": unet_temporal_attention,
+    }
 
     unet = backbone(
         in_channels=1,

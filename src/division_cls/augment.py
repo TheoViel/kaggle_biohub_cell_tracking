@@ -6,7 +6,7 @@ survives. Those are the right defaults and `dataset.py` still uses them. What is
 here is the part that is specific to this task, and it exists because of what
 the task is short of: 151 positives across two embryos, 26 of them in fold 1.
 Synthetic divisions were tried three times and degraded every configuration
-(see `synthetic.py`), so the labels are not going to be more numerous -- the
+(see README.md), so the labels are not going to be more numerous -- the
 only lever left is making each one count for more.
 
 Two rules decide what may go in here.

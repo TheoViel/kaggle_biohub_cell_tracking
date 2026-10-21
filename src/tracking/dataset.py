@@ -20,7 +20,6 @@ from tracking.data import (
     _pad_window,
 )
 from tracking.weak_positives import compute_weak_positives
-from tracking.weak_positives_new import compute_weak_positives as compute_weak_positives_v2
 
 
 def _valid(points: torch.Tensor) -> torch.Tensor:
@@ -344,28 +343,15 @@ class TrackDataset(Dataset):
         name = f"{sample_name}_t{frame}_{strategy}"
         cached = self._weak_cache.get(name)
         if cached is None:
-            if strategy == "v2":
-                weak_positives, ignore_positives = compute_weak_positives_v2(
-                    imgs,
-                    coords,
-                    masks,
-                    voxel_size,
-                    nms_um=cfg["nms_um"],
-                    threshold=cfg["threshold"],
-                    ignore_threshold=cfg.get("ignore_threshold", 0.0),
-                    ignore_nms_um=cfg.get("ignore_nms_um"),
-                    ignore_floor=cfg.get("ignore_floor", 0.0),
-                )
-            else:
-                weak_positives = compute_weak_positives(
-                    imgs,
-                    coords,
-                    masks,
-                    voxel_size,
-                    nms_um=cfg["nms_um"],
-                    threshold=cfg["threshold"],
-                )
-                ignore_positives = None
+            weak_positives = compute_weak_positives(
+                imgs,
+                coords,
+                masks,
+                voxel_size,
+                nms_um=cfg["nms_um"],
+                threshold=cfg["threshold"],
+            )
+            ignore_positives = None
 
             weak_coords, _ = self._weak_to_coords(weak_positives)
             # Cache the coordinates, not the dense mask: the mask is ~8 MB per
