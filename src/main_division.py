@@ -48,7 +48,7 @@ DEFAULTS = {
     # Global
     "data_dir": TRAIN_DIR,
     "selected_folds": [0, 1],
-    "fullfit": False,
+    "fullfit": True,
 
     # Data. 32 voxels is 13 um in y/x, so the cell (~8.5 um) plus the sliver of
     # neighbourhood that says whether it just split; 3 z-slices become the
@@ -79,19 +79,11 @@ DEFAULTS = {
     "candidates": None,
     # Fuse the fork's own geometry (parent/sister distance, the two edge
     # probabilities, split size) into the head. Only read in candidate mode.
-    "fuse_features": True,
+    "fuse_features": False,
     # Centre and/or orient the crop on the proposed daughter pair instead of the
     # parent: "" (off), "centre", "rotate", "both". Needs a candidates file with
     # child coordinates -- regenerate with gen_fork_candidates.py.
     "fork_align": "",
-
-    # Generated divisions. Fold 1 trains on 44b6's 26 and reaches AP 0.449 where
-    # fold 0, with 125, reaches 0.705 -- the gap is labels, and the generator
-    # has thousands. Build the cache once with `main_division_cache.py`; the
-    # proportion is the share of *training* samples drawn from it, validation
-    # is always the annotation alone.
-    "synthetic_cache": None,
-    "synthetic_proportion": 0.0,
 
     # Frame-wide draws come from `embeddings/augment.py`, clip-level ones from
     # `division_cls/augment.py`; both are set here in one flat dict and split by

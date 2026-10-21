@@ -24,3 +24,5 @@ public/
 dataset_preds*
 kaggle-czii-4th/
 zebrahub_raw/
+input_smoke/
+logs_smoke/

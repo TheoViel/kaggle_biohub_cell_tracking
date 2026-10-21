@@ -22,7 +22,6 @@ from tracking.synthetic import (
     find_embryo_sequences,
     find_sequences,
 )
-from tracking.contrastive import fit_contrastive
 from tracking.fit_utils import resolve_run_path
 from tracking.train import fit
 from tracking_cellmot.io import list_datasets
@@ -232,28 +231,6 @@ def build_model(args, ctx):
         unet_n_decode_steps=getattr(args, "unet_n_decode_steps", None),
         unet_n_extra_decode_steps=int(getattr(args, "unet_n_extra_decode_steps", 0) or 0),
         unet_temporal_attention=bool(getattr(args, "unet_temporal_attention", True)),
-        # "temporal_v2" only; ignored by the other backbones.
-        unet_temporal_fusion_at=tuple(
-            getattr(args, "unet_temporal_fusion_at", ("head",))
-        ),
-        unet_temporal_match_channels=int(getattr(args, "unet_temporal_match_channels", 32)),
-        unet_temporal_taps=tuple(getattr(args, "unet_temporal_taps", (5, 3, 3))),
-        unet_temporal_dilation=getattr(args, "unet_temporal_dilation", "auto"),
-        unet_temporal_agree=getattr(args, "unet_temporal_agree", "mean"),
-        unet_temporal_max_neighbours=getattr(args, "unet_temporal_max_neighbours", None),
-        unet_temporal_motion_prior=float(getattr(args, "unet_temporal_motion_prior", 1.0)),
-        unet_temporal_flow_smooth_iters=int(
-            getattr(args, "unet_temporal_flow_smooth_iters", 3)
-        ),
-        unet_temporal_flow_channels=int(
-            getattr(args, "unet_temporal_flow_channels", 8)
-        ),
-        unet_temporal_flow_hidden_channels=int(
-            getattr(args, "unet_temporal_flow_hidden_channels", 32)
-        ),
-        unet_temporal_value_channels=int(
-            getattr(args, "unet_temporal_value_channels", 8)
-        ),
         unet_spatial_attention=getattr(args, "unet_spatial_attention", "none"),
         unet_spatial_attention_stages=int(
             getattr(args, "unet_spatial_attention_stages", 1)
@@ -271,14 +248,6 @@ def build_model(args, ctx):
         unet_stem=getattr(args, "unet_stem", "stride"),
         unet_norm=getattr(args, "unet_norm", "batch"),
         unet_hires_fusion=bool(getattr(args, "unet_hires_fusion", False)),
-        # "timm25d" only; ignored by the other backbones.
-        unet_timm_backbone=getattr(
-            args, "unet_timm_backbone", "convnext_nano.in12k_ft_in1k"
-        ),
-        unet_timm_slice_size=int(getattr(args, "unet_timm_slice_size", 5)),
-        unet_timm_pretrained=bool(getattr(args, "unet_timm_pretrained", True)),
-        unet_timm_drop_path_rate=float(getattr(args, "unet_timm_drop_path_rate", 0.0)),
-        unet_timm_max_levels=getattr(args, "unet_timm_max_levels", None),
         transformer_hidden=args.transformer_hidden,
         transformer_heads=args.transformer_heads,
         transformer_blocks=args.transformer_blocks,
@@ -930,62 +899,6 @@ def _train_one(
             )
 
         del seg_loader, seg_sampler
-        if ctx.device.type == "cuda":
-            torch.cuda.empty_cache()
-
-    # --- Stage 2: contrastive embedding UNet, on the frozen detections ---
-    contrastive = getattr(args, "contrastive", {}) or {}
-    use_contrastive = bool(contrastive.get("enabled", True)) and "contrastive" in (
-        getattr(args, "unet_features", ()) or ()
-    )
-
-    weights = contrastive.get("weights") if use_contrastive else None
-    if weights:
-        # Initialise the embedding UNet from a previous run; the stage still
-        # trains on top of it below.
-        load_weights(
-            model,
-            weights,
-            fold,
-            ctx,
-            prefixes=("embed_unet.", "embed_head."),
-            run_name=run["name"],
-        )
-    if use_contrastive:
-        _, emb_loader, emb_sampler = build_loader(
-            args.data_dir,
-            embryos=train_embryos,
-            window_size=args.window_size,
-            batch_size=contrastive["batch_size"],
-            num_workers=args.num_workers,
-            downscale_factor=downscale,
-            augment=contrastive.get("augment", True),
-            video_data=train_video_data,  # save reloading the videos
-            weak_positives_cfg={},  # detection is frozen here
-            aug_cfg=_stage_aug(args, "contrastive"),
-            normalization=getattr(args, "normalization", None),
-            crop_size=contrastive.get("crop_size"),
-            ctx=ctx,
-            seed=getattr(args, "seed", 0),
-            stable_shard=True,  # node coords are cached per rank
-        )
-        if ctx.is_main:
-            print(
-                f"\n-> Stage 2: Contrastive training the embedding UNet on "
-                f"{contrastive['crop_size']} crops, "
-                f"{len(emb_loader.dataset)} windows, "
-                f"{contrastive['epochs']} epochs\n"
-            )
-        args.stage = "contrastive"
-        fit_contrastive(
-            model,
-            emb_loader,
-            args,
-            ctx,
-            train_sampler=emb_sampler,
-            val_loader=val_loader,
-        )
-        del emb_loader, emb_sampler
         if ctx.device.type == "cuda":
             torch.cuda.empty_cache()
 

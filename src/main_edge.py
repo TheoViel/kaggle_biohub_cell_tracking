@@ -47,19 +47,13 @@ from utils.logger import create_logger, prepare_log_folder
 
 DEFAULTS = {
     # Global
-    # The best chain to date: this node set + the 2026-09-09_1 embeddings is
-    # `edge_run/2026-09-13/0`, cv 0.8719 at `preds_0.45_pp_ilp` -- the top row
-    # of Experiments.md. Its detector is `logs/2026-09-13/1`, whose own defaults
-    # main_track.py now carries.
-    "nodes_folder": "../logs/2026-09-13/1/preds_r6_0.40/",   # <- cv 0.8719
-    # "nodes_folder": "../logs/2026-09-14/4/preds_r6_0.40/",   # bigger crops
-
-    # "embeddings_key": "embeddings_contrastive_2026-09-09_1",
+    # Detections + NETr embeddings: scripts/ensemble_detectors.py, then
+    # inference_contrastive.py over the same folder.
+    "nodes_folder": "../ensemble/v16_2026-09-26_1_eduardo_current_mean3_append_b0.45_a0.35_d7",
     "embeddings_key": "embeddings_contrastive_2026-09-26_0",
-    # "embeddings_key": "embeddings_contrastive_2026-09-14_0",  # 3 frames, 2026-09-13/1/preds_r6_0.40
-    
+
     "data_dir": TRAIN_DIR,
-    "selected_folds": [0, 1] , # [0, 1],
+    "selected_folds": [0, 1],
     "fullfit": True,
 
     # Data

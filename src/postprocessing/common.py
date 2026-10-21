@@ -25,7 +25,7 @@ warnings.filterwarnings("ignore")
 import pandas as pd  # noqa: E402
 import tracksdata as td  # noqa: E402
 
-from params import SCALE, TRAIN_DIR  # noqa: E402
+from params import INPUT_FOLDER, SCALE, TRAIN_DIR  # noqa: E402
 from tracking.post_process import build_graph  # noqa: E402
 from tracking_cellmot.metrics import (  # noqa: E402
     evaluate,
@@ -62,7 +62,7 @@ def load_gt_graph(sample: str):
     result = td.graph.IndexedRXGraph.from_geff(Path(TRAIN_DIR) / f"{sample}.geff")
     gt_graph = result[0] if isinstance(result, tuple) else result
 
-    meta = pd.read_csv("../input/metadata.csv")
+    meta = pd.read_csv(INPUT_FOLDER + "metadata.csv")
     n_total = float(meta.loc[meta["sample_name"] == sample, "estimated_number_of_nodes"].iloc[0])
     return gt_graph, n_total
 

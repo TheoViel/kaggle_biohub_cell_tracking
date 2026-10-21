@@ -134,8 +134,7 @@ DEFAULTS = {
     "fullfit_n_val_videos": 1,     # leaky either way, so keep the eval cheap
 
     # Model
-    # "temporal" (two-conv), "resenc" (nnU-Net ResEnc), "timm25d", or a temporal_v* model.
-    "unet_arch": "temporal",  # "temporal"
+    "unet_arch": "temporal",
     "unet_out_channels": 32,
     "unet_layers": (64, 128, 256),  # (32, 64, 128),
     "unet_pool_stride": (1, 2, 2),    # pool Y/X only; full-scale Z preserved
@@ -144,34 +143,6 @@ DEFAULTS = {
     "unet_n_decode_steps": 1,         # 1 decoder stage → node features at 1/4 Y/X, full-scale Z
     "unet_n_extra_decode_steps": 1,  # Extra decoder stage for the detection head
     "unet_temporal_attention": True,  # False = encode each frame independently
-    # "temporal_v2" only, and mutually exclusive with unet_temporal_attention.
-    # Where the frames meet: "head" is the features the detection head reads,
-    # which is where a suppressed voxel is actually suppressed in the output;
-    # "bottleneck" is far cheaper but its verdict is blurred by the upsampling
-    # before the head sees it. "auto" dilation sizes the correlation window per
-    # site from the measured p99 frame-to-frame displacement.
-    "unet_temporal_fusion_at": ("head",),
-    "unet_temporal_match_channels": 32,
-    "unet_temporal_taps": (5, 3, 3),
-    "unet_temporal_dilation": "auto",
-    "unet_temporal_agree": "mean",    # "min" = corroborated by *every* frame
-    "unet_temporal_max_neighbours": None,
-    # "temporal_v3" only: the FN-recovery block. The prior costs one logit per
-    # median-length step; the smoothing spreads the displacement field out of the
-    # cells that matched and into the voxels that did not (0 = ablation).
-    "unet_temporal_motion_prior": 1.0,
-    "unet_temporal_flow_smooth_iters": 3,
-    # "temporal_v4": motion is estimated on the bottleneck and low-rank
-    # neighbour features are warped onto the coarse and fine output grids.
-    "unet_temporal_flow_channels": 8,
-    "unet_temporal_flow_hidden_channels": 32,
-    "unet_temporal_value_channels": 8,
-    # "timm25d" for CZII 4th
-    "unet_timm_backbone": "convnext_nano.in12k_ft_in1k",
-    "unet_timm_slice_size": 5,  # how many neighbouring slices are stacked into its channel axis. The Y/X
-    "unet_timm_pretrained": True,
-    "unet_timm_drop_path_rate": 0.0,
-    "unet_timm_max_levels": None,   # cap the encoder pyramid, deepest dropped first
     # Attention
     "unet_spatial_attention": "none",   # "none" / "pooled" / "window" / "cbam"
     "unet_spatial_attention_stages": 1,   # deepest N encoder stages, 0 = off
@@ -217,25 +188,16 @@ DEFAULTS = {
     # Aux heads
     "offset_head": False,
     "offset_radius": 2,       # grid voxels a cell's vote reaches
-    "annot_head": False,  # True,  # A second head asking "would an annotator have labelled this cell"
-    # A third head asking "does this cell divide into the next frame". Off by
-    # default and unproven: it is the first attempt to move divisions upstream
-    # of the proposal stage. The chain converts ~50 of 151 annotated divisions
-    # and the 98 it misses were never proposed as forks, so the downstream
-    # gates -- which can only ever delete -- cannot reach them; see
-    # division_cls/README.md. Labels come free from the transition matrices
-    # (a dividing parent's row sums to >= 2), so this costs one 1x1 conv pair
-    # and no new data. `loss_config.div_loss_weight` bounds how far it may
-    # pull the shared trunk.
-    "div_head": True,
+    "annot_head": True,  # A second head asking "would an annotator have labelled this cell"
+    "div_head": False,  # A third head asking "does this cell divide into the next frame"
 
     # Stage 1 - Synthetic data pretraining
     "synthetic_pretraining": {
         "enabled": False,
-        "synthetic_dir": "../input/synthetic/v5/",
+        "synthetic_dir": INPUT_FOLDER + "synthetic/v5/",
         "synthetic_proportion": 1,
         # Real zebrahub crops
-        "zebrahub_dir": "../input/zebrahub_crops/",
+        "zebrahub_dir": INPUT_FOLDER + "zebrahub_crops/",
         "zebrahub_embryos": [],   # e.g. ["ZSNS001_tail", "ZSNS003"]
         "zebrahub_proportion": 0.,
         "weights": None,
@@ -268,24 +230,16 @@ DEFAULTS = {
         "threshold": 0.25,  # Multiplication factor for the image intensity peak threshold
         "nms_um": 5.0,
         "dir": None,
-        # Which image-peak implementation to use.
-        "strategy": "legacy",  # "v2" "legacy"  # v2 requires a lower threshold !
-        "ignore_threshold": 0.25,  # v2 only - multiplier for the ignore bar
-        "ignore_nms_um": 5.0,   # v2 only - exclusion radius for the ignore pass
-        "ignore_floor": 0.0,    # v2 only - absolute floor on the ignore bar; not fold-symmetric
         # Weak positives from FOCUS-3D segmentation (pl_focus_3D.py).
         # Override the image peaks above; combined with pl_folder when both are
         # set, the pl_folder point winning any duplicate. A stack the folder does
         # not cover or that fails a gate below falls back to the image peaks.
-        "use_focus_3d": True,
+        "use_focus_3d": False,
         "focus_3d_dir": OUTPUT_FOLDER + "focus3d/",
         "focus_3d_min_recall": 0.5,   # drop a stack that misses annotated cells
         "focus_3d_max_ratio": 1.25,    # drop a stack predicting far too many cells
-        # Weak positives from pl_folder - V1
-        # "pl_folder": "../logs/2026-09-01/9/preds_pl_pp/",  # 2nd round PL + PP  --  BEST
-        "pl_folder": "../logs/2026-09-23/5/preds_pl_pp/",  # Round 2
-        # Weak positives from pl_folder - V2
-        # "pl_folder": "../logs/2026-09-13/1/preds_pl_0.60_annot_head/",  # 2nd round PL + PP
+        # Weak positives from pl_folder: main_predict.py --pl, then main_postprocess.py --pl
+        "pl_folder": LOG_FOLDER + "2026-09-01/9/preds_pl_pp/",
         # Ignore regions from a second folder. Run 10 (0.7632) turned this on
         # against run 6's 0.7693 and lost; off is run 6's setting.
         # "pl_ignore_folder": "../logs/2026-09-01/9/preds_pl_pp/",  # Expects lower threshold coords
@@ -296,25 +250,18 @@ DEFAULTS = {
     # Stage 1.5 - Pretraining
     "pretraining": {
         "enabled": True,
-        # "weights": "../logs/2026-09-13/1/fold_0/ckpt_synthetic.pt",  # temporal wide 13/1
-        "weights": "../logs/2026-09-22/10/fold_0/ckpt_synthetic.pt",  # temporal wide new
-        # "weights": None,
+        # The output of Stage 1 (synthetic_pretraining) of an earlier run.
+        "weights": LOG_FOLDER + "2026-09-13/1/fold_0/ckpt_synthetic.pt",
         # Data
         "crop_size": (32, 128, 128),  # (48, 192, 192)
         "aug_strength": 3,
-        "synthetic_dir": "../input/synthetic/v4/",
-        "synthetic_proportion": 0.4,
-        "zebrahub_dir": "../input/zebrahub_crops/",
+        "synthetic_dir": INPUT_FOLDER + "synthetic/v4/",
+        "synthetic_proportion": 0.5,
+        "zebrahub_dir": INPUT_FOLDER + "zebrahub_crops/",
         "zebrahub_embryos": ["ZSNS001_tail", "ZSNS003", "ZSNS004", "ZSNS005"],  # ["ZSNS001", "ZSNS001_tail", "ZSNS003", "ZSNS004", "ZSNS005"]
-        # 0.1 is run 6's (0.7693). 0.0 is run 10 (0.7632) and 0.2 is run 9
-        # (0.7494), so the mix has an interior optimum rather than being a
-        # straight cost -- but the 0.0 and 0.1 arms are one run each and sit
-        # inside the run-to-run spread, so this is the weakest of the three.
-        "zebrahub_proportion": 0.1,
+        "zebrahub_proportion": 0.0,
         # Training
-        # 2500 is run 6 (0.7693); 2000 run 7 (0.7562), 4000 run 8 (0.7686) --
-        # non-monotonic, so 2500 vs 4000 is a coin flip and 2000 is short.
-        "iterations": 3000,
+        "iterations": 5000,
         "epochs": None,
         "batch_size": 16,
         # Eval
@@ -351,7 +298,7 @@ DEFAULTS = {
         # Data
         "crop_size": None,
         "synthetic_proportion": 0.,
-        "synthetic_dir": "../input/synthetic/v4/",
+        "synthetic_dir": INPUT_FOLDER + "synthetic/v4/",
         # Only the proportion has to be set here; the directory and embryo list
         # fall back to the synthetic_pretraining / pretraining blocks.
         "zebrahub_proportion": 0.,
@@ -384,7 +331,7 @@ DEFAULTS = {
         "det_use_weak_positives": True,
         "det_loss_weight": 1,
         "det_neg_weight": 0.05,
-        "det_weak_weight": 0.5,        # To balance GT share of positive weight 
+        "det_weak_weight": 0.2,        # To balance GT share of positive weight
         "det_weak_smoothing": 0.01,      # smoothing factor for weak positives
         "det_gaussian_sigma": 1.0,
         # How that scalar sigma is restated per axis on the fine (1,2,2)
@@ -397,7 +344,7 @@ DEFAULTS = {
         # since shows a threshold-0.50 collapse (-0.03..-0.18 against
         # -0.01..-0.04 before) that the two changes are confounded in.
         # "grid" is what every run up to that point trained with.
-        "det_sigma_anchor": "coarse",  # "fine" / "grid" / "coarse"
+        "det_sigma_anchor": "grid",  # "fine" / "grid" / "coarse"
         "det_ds_weight": 1.0,          # deep-supervision heatmap, relative to the fine one
         # The annotation head. Its positives are the ~3 annotated cells a frame
         # rather than the ~500 the detector sees, and the focal loss normalises

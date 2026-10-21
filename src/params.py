@@ -1,5 +1,9 @@
-INPUT_FOLDER = "../input/"
-LOG_FOLDER = "../logs/"
+import os
+
+# Relative to src/, where every entry point runs. Overridable to run the whole
+# pipeline on another data copy or log root (see train.sh, SMOKE=1).
+INPUT_FOLDER = os.environ.get("BIOHUB_INPUT", "../input/")
+LOG_FOLDER = os.environ.get("BIOHUB_LOGS", "../logs/")
 OUTPUT_FOLDER = "../output/"
 
 IMG_FOLDER = INPUT_FOLDER + "processed/images/"
