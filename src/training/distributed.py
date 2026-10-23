@@ -97,21 +97,6 @@ def all_reduce_mean(values, device):
     return dict(zip(keys, tensor.tolist()))
 
 
-def all_gather_lists(items):
-    """Concatenate every rank's list, in rank order. A no-op off DDP.
-
-    For gathering evaluation records, which are a handful of small dicts per
-    rank -- ``all_gather_object`` pickles, so it is the wrong tool for tensors
-    but the right one for this. Every rank must call it or the collective
-    hangs, so it must not sit behind ``if ctx.is_main``.
-    """
-    if not (dist.is_available() and dist.is_initialized()):
-        return list(items)
-
-    gathered = [None] * dist.get_world_size()
-    dist.all_gather_object(gathered, list(items))
-    return [record for part in gathered for record in part]
-
 
 def seed_everything(seed, rank=0):
     """Seed with a rank offset so ranks draw different augmentations."""

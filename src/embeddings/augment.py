@@ -167,24 +167,6 @@ def sample_geometry(
     }
 
 
-def sample_view(
-    coords: np.ndarray,
-    cfg: dict,
-    rng: np.random.Generator,
-    voxel_size: tuple[float, float, float],
-    shape_yx: tuple[int, int],
-) -> dict:
-    """One whole view: ``sample_geometry`` and ``sample_cells`` together.
-
-    Returns a dict with the jittered ``coords`` (image voxels), the boolean
-    ``keep`` mask, and the per-view photometric and geometric parameters the
-    patch extractor needs.
-    """
-    return {
-        **sample_geometry(cfg, rng, voxel_size, shape_yx),
-        **sample_cells(coords, cfg, rng, voxel_size),
-    }
-
 
 def _elastic_field(shape_yx, cfg, rng, vs_yx):
     """A smooth random displacement field over the frame, in voxels.

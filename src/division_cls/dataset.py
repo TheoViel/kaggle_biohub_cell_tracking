@@ -2,8 +2,7 @@
 
 The unit is one **annotated cell at one frame**: a short stack of crops centred
 on it, spanning `n_frames` frames of time, labelled 1 when the ground truth has
-that cell dividing at the centre frame. `notebooks/Divisions.ipynb` draws
-exactly this picture, one panel per frame.
+that cell dividing at the centre frame.
 
 Two choices decide whether this is learnable at all, and both are about the
 negatives rather than the positives.

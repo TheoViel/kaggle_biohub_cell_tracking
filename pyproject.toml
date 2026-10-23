@@ -8,10 +8,10 @@ allow-direct-references = true
 [project]
 name = "tracking-cellmot"
 version = "0.1.0"
-description = "Biohub cell tracking: training code for the models of the biohub-ens-edu kernel"
+description = "Biohub cell tracking: training code for the models of the Inference kernel"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
-license = "BSD-3-Clause"
+license = "Apache-2.0"
 dependencies = [
     "torch>=2.9.1",
     "tracksdata @ git+https://github.com/royerlab/tracksdata@main",

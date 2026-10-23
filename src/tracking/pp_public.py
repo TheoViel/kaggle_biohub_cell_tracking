@@ -1,17 +1,11 @@
 import os
 import tracksdata as td
 import numpy as np
-import blosc2
 import math
 from scipy.optimize import linear_sum_assignment
-import json
 from pathlib import Path
-import csv
-import pandas as pd
 
 
-SUBMISSION_COLUMNS = ["dataset", "row_type", "node_id", "t", "z", "y", "x", "source_id", "target_id"]
-CSV_COLUMNS = ["id", *SUBMISSION_COLUMNS]
 VOXEL_SCALE_UM = (1.625, 0.40625, 0.40625)
 
 # Output-level graph post-processing.
@@ -38,10 +32,6 @@ GAP_CLOSE_REUSE_EXISTING = os.environ.get("BIOHUB_GAP_CLOSE_REUSE_EXISTING", "1"
 GAP_CLOSE_REUSE_UM = float(os.environ.get("BIOHUB_GAP_CLOSE_REUSE_UM", "3.1"))
 GAP_CLOSE_MAX_ADDED_FRAC = float(os.environ.get("BIOHUB_GAP_CLOSE_MAX_ADDED_FRAC", "0.045"))
 GAP_CLOSE_MAX_ADDED_ABS = int(os.environ.get("BIOHUB_GAP_CLOSE_MAX_ADDED_ABS", "1900"))
-GAP_REFINE_SYNTHETIC = os.environ.get("BIOHUB_GAP_REFINE_SYNTHETIC", "1") != "0"
-GAP_REFINE_WIN_Z = int(os.environ.get("BIOHUB_GAP_REFINE_WIN_Z", "1"))
-GAP_REFINE_WIN_YX = int(os.environ.get("BIOHUB_GAP_REFINE_WIN_YX", "3"))
-GAP_REFINE_MAX_SHIFT_UM = float(os.environ.get("BIOHUB_GAP_REFINE_MAX_SHIFT_UM", "3.2"))
 
 OUTPUT_FILTER_SHORT_TRACKS = os.environ.get("BIOHUB_OUTPUT_FILTER_SHORT_TRACKS", "0") != "0"
 OUTPUT_MIN_TRACK_LEN = int(os.environ.get("BIOHUB_OUTPUT_MIN_TRACK_LEN", "4"))
@@ -101,79 +91,14 @@ def _next_node_id(nodes_by_id: dict[int, dict[str, object]]) -> int:
 
 
 
-def read_test_frame(dataset: str, t: int, frame_cache: dict[int, np.ndarray]) -> np.ndarray:
-    if t in frame_cache:
-        return frame_cache[t]
-    zarr_path = TEST_DIR / f"{dataset}.zarr"
-    meta = json.loads((zarr_path / "0" / "zarr.json").read_text())
-    shape = tuple(int(v) for v in meta["shape"])
-    dtype = np.dtype(meta["data_type"])
-    frame_shape = shape[1:]
-    chunk_path = zarr_path / "0" / "c" / str(t) / "0" / "0" / "0"
-    try:
-        raw = chunk_path.read_bytes()
-        arr = np.frombuffer(blosc2.decompress(raw), dtype=dtype)
-        if arr.size == int(np.prod(frame_shape)):
-            frame = arr.reshape(frame_shape).copy()
-            frame_cache[t] = frame
-            return frame
-    except Exception:
-        pass
-    import zarr
-    frame = np.asarray(zarr.open(zarr_path / "0", mode="r")[t])
-    frame_cache[t] = frame
-    return frame
-
-
-def refine_synthetic_midpoint(
-    dataset: str | None,
-    t: int,
-    midpoint: tuple[float, float, float],
-    frame_cache: dict[int, np.ndarray],
-    stats: dict[str, int],
-) -> tuple[float, float, float]:
-    if not GAP_REFINE_SYNTHETIC or dataset is None:
-        return midpoint
-    try:
-        frame = read_test_frame(dataset, t, frame_cache)
-        z, y, x = [int(round(v)) for v in midpoint]
-        z0 = max(0, z - GAP_REFINE_WIN_Z)
-        z1 = min(frame.shape[0], z + GAP_REFINE_WIN_Z + 1)
-        y0 = max(0, y - GAP_REFINE_WIN_YX)
-        y1 = min(frame.shape[1], y + GAP_REFINE_WIN_YX + 1)
-        x0 = max(0, x - GAP_REFINE_WIN_YX)
-        x1 = min(frame.shape[2], x + GAP_REFINE_WIN_YX + 1)
-        patch = frame[z0:z1, y0:y1, x0:x1].astype(np.float64)
-        if patch.size == 0:
-            stats["gap_refine_failed"] += 1
-            return midpoint
-        baseline = float(np.percentile(patch, 20.0))
-        weights = np.maximum(patch - baseline, 0.0)
-        total = float(weights.sum())
-        if total <= 0:
-            stats["gap_refine_failed"] += 1
-            return midpoint
-        zz = np.arange(z0, z1, dtype=np.float64)[:, None, None]
-        yy = np.arange(y0, y1, dtype=np.float64)[None, :, None]
-        xx = np.arange(x0, x1, dtype=np.float64)[None, None, :]
-        refined = (
-            float((weights * zz).sum() / total),
-            float((weights * yy).sum() / total),
-            float((weights * xx).sum() / total),
-        )
-        if point_distance_um(refined, midpoint) > GAP_REFINE_MAX_SHIFT_UM:
-            stats["gap_refine_rejected_shift"] += 1
-            return midpoint
-        stats["gap_refined_synthetic"] += 1
-        return refined
-    except Exception:
-        stats["gap_refine_failed"] += 1
-        return midpoint
-
 
 def _position_um(node: dict[str, object]) -> np.ndarray:
     return np.array(
-        [float(node["z"]) * VOXEL_SCALE_UM[0], float(node["y"]) * VOXEL_SCALE_UM[1], float(node["x"]) * VOXEL_SCALE_UM[2]],
+        [
+            float(node["z"]) * VOXEL_SCALE_UM[0],
+            float(node["y"]) * VOXEL_SCALE_UM[1],
+            float(node["x"]) * VOXEL_SCALE_UM[2],
+        ],
         dtype=np.float64,
     )
 
@@ -328,7 +253,6 @@ def close_single_frame_gaps(
         max(1, int(round(len(nodes_by_id) * GAP_CLOSE_MAX_ADDED_FRAC))) if GAP_CLOSE_MAX_ADDED_FRAC > 0 else 0,
     )
     next_id = _next_node_id(nodes_by_id)
-    frame_cache: dict[int, np.ndarray] = {}
     used_starts: set[int] = set()
     used_isolated: set[int] = set()
     synthetic_added = 0
@@ -390,7 +314,7 @@ def close_single_frame_gaps(
                         continue
                     middle_id = next_id
                     next_id += 1
-                    refined_point = refine_synthetic_midpoint(dataset, mid_t, mid_point, frame_cache, stats)
+                    refined_point = mid_point
                     nodes_by_id[middle_id] = {
                         "node_id": middle_id,
                         "t": mid_t,
@@ -473,7 +397,8 @@ def recover_strict_gap2(
 
     def pos_um(node_id: int) -> np.ndarray:
         node = nodes_by_id[node_id]
-        return np.array([float(node["z"]), float(node["y"]), float(node["x"])], dtype=np.float64) * np.array(VOXEL_SCALE_UM)
+        zyx = np.array([float(node["z"]), float(node["y"]), float(node["x"])], dtype=np.float64)
+        return zyx * np.array(VOXEL_SCALE_UM)
 
     for t, end_ids in sorted(ends_by_t.items()):
         start_ids = starts_by_t.get(t + 3, [])
@@ -546,7 +471,6 @@ def recover_strict_gap2(
         return nodes_by_id, edges
 
     next_node_id = _next_node_id(nodes_by_id)
-    frame_cache: dict[int, np.ndarray] = {}
     new_edges: list[dict[str, object]] = []
     for _, end_id, start_id, t, _ in selected:
         source = nodes_by_id[end_id]
@@ -561,7 +485,7 @@ def recover_strict_gap2(
                 float(source["y"]) + (float(target["y"]) - float(source["y"])) * frac,
                 float(source["x"]) + (float(target["x"]) - float(source["x"])) * frac,
             )
-            refined_point = refine_synthetic_midpoint(dataset, mid_t, midpoint, frame_cache, stats)
+            refined_point = midpoint
             node_id = next_node_id
             next_node_id += 1
             nodes_by_id[node_id] = {
@@ -623,7 +547,10 @@ def add_safe_divisions_postlink(
         if not child_frame_ids:
             continue
         source_ids = [node_id for node_id in ids_by_t[t] if len(out_by_source.get(node_id, [])) == 1]
-        candidate_ids = [node_id for node_id in child_frame_ids if node_id not in incoming and node_id not in used_targets]
+        candidate_ids = [
+            node_id for node_id in child_frame_ids
+            if node_id not in incoming and node_id not in used_targets
+        ]
         if not source_ids or not candidate_ids:
             continue
 
@@ -835,9 +762,6 @@ def filter_output_graph(
         "gap_added_nodes": 0,
         "gap_added_edges": 0,
         "gap_skipped_node_cap": 0,
-        "gap_refined_synthetic": 0,
-        "gap_refine_failed": 0,
-        "gap_refine_rejected_shift": 0,
         "pruned_isolated_nodes": 0,
         "motion_relink_edges": 0,
         "motion_relink_tight_edges": 0,
@@ -964,7 +888,10 @@ def filter_output_graph(
             kept_nodes = {node_id: node for node_id, node in nodes_by_id.items() if node_id in incident}
             stats["pruned_isolated_nodes"] = len(nodes_by_id) - len(kept_nodes)
             nodes_by_id = kept_nodes
-            edges = [edge for edge in edges if int(edge["source_id"]) in nodes_by_id and int(edge["target_id"]) in nodes_by_id]
+            edges = [
+                edge for edge in edges
+                if int(edge["source_id"]) in nodes_by_id and int(edge["target_id"]) in nodes_by_id
+            ]
 
     nodes_by_id, edges = filter_short_track_components(nodes_by_id, edges, stats)
     nodes_by_id = linefit_smooth_output_graph(nodes_by_id, edges, stats)
@@ -993,115 +920,6 @@ def postprocess_graph(graph: td.graph.IndexedRXGraph, dataset="") -> dict[str, o
             "edge_prob": None if edge_prob is None else float(edge_prob),
         })
 
-    raw_node_count = len(nodes_by_id)
     nodes_by_id, edges, filter_stats = filter_output_graph(nodes_by_id, raw_edges, dataset=dataset)
 
     return nodes_by_id.values(), edges, filter_stats
-
-
-    # if not nodes_by_id:
-    #     raise AssertionError(f"{dataset}: post-processing removed every node")
-
-    # for node_id in sorted(nodes_by_id):
-    #     node = nodes_by_id[node_id]
-    #     writer.writerow({
-    #         "id": row_id,
-    #         "dataset": dataset,
-    #         "row_type": "node",
-    #         "node_id": int(node["node_id"]),
-    #         "t": int(node["t"]),
-    #         "z": int(round(float(node["z"]))),
-    #         "y": int(round(float(node["y"]))),
-    #         "x": int(round(float(node["x"]))),
-    #         "source_id": -1,
-    #         "target_id": -1,
-    #     })
-    #     row_id += 1
-
-    # division_sources: dict[int, int] = {}
-    # for edge in edges:
-    #     source_id = int(edge["source_id"])
-    #     target_id = int(edge["target_id"])
-    #     if source_id not in nodes_by_id or target_id not in nodes_by_id:
-    #         raise AssertionError(f"{dataset}: dangling edge after filtering")
-    #     writer.writerow({
-    #         "id": row_id,
-    #         "dataset": dataset,
-    #         "row_type": "edge",
-    #         "node_id": -1,
-    #         "t": -1,
-    #         "z": -1,
-    #         "y": -1,
-    #         "x": -1,
-    #         "source_id": source_id,
-    #         "target_id": target_id,
-    #     })
-    #     row_id += 1
-    #     division_sources[source_id] = division_sources.get(source_id, 0) + 1
-
-    # node_count = len(nodes_by_id)
-    # edge_count = len(edges)
-    # total_nodes += node_count
-    # total_edges += edge_count
-
-    # return {
-    #     "dataset": dataset,
-    #     "raw_nodes": raw_node_count,
-    #     "nodes": node_count,
-    #     "raw_edges": filter_stats["raw_edges"],
-    #     "edges": edge_count,
-    #     "division_like_sources": sum(1 for count in division_sources.values() if count >= 2),
-    #     "edge_to_node_ratio": edge_count / max(node_count, 1),
-    #     "gap_added_nodes_frac": filter_stats.get("gap_added_nodes", 0) / max(raw_node_count, 1),
-    #     **filter_stats,
-    # }
-            
-# if __name__ == "__main__":
-
-        
-#     geffs = sorted((REPO_DIR / "predictions").glob(f"*/{METHOD}/split_0/*.geff"))
-#     print(f"Found {len(geffs)} prediction graphs")
-#     if len(geffs) != len(test_stems):
-#         found = {path.stem for path in geffs}
-#         missing = sorted(set(test_stems) - found)
-#         raise RuntimeError(f"Expected {len(test_stems)} graphs, found {len(geffs)}. Missing: {missing[:10]}")
-
-#     stats_rows: list[dict[str, object]] = []
-#     seen_datasets: set[str] = set()
-#     row_id = 0
-#     total_nodes = 0
-#     total_edges = 0
-
-#     with SUBMISSION_PATH.open("w", newline="") as f:
-#         writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
-#         writer.writeheader()
-
-#         for geff_path in geffs:
-#             dataset = geff_path.stem
-#             seen_datasets.add(dataset)
-#             graph = graph_from_geff(geff_path)
-
-#             starts 
-#             stats_rows.append(postprocess_graph(graph, dataset=dataset))
-
-#     expected_datasets = set(test_stems)
-#     missing_datasets = sorted(expected_datasets - seen_datasets)
-#     extra_datasets = sorted(seen_datasets - expected_datasets)
-#     if missing_datasets or extra_datasets:
-#         raise AssertionError({"missing": missing_datasets[:10], "extra": extra_datasets[:10]})
-#     assert row_id == total_nodes + total_edges, "Internal row counter mismatch"
-#     assert total_nodes > 0, "No node rows produced"
-
-#     header = SUBMISSION_PATH.open().readline().strip().split(",")
-#     assert header == CSV_COLUMNS, f"Bad CSV header: {header}"
-
-#     stats = pd.DataFrame(stats_rows).sort_values("dataset").reset_index(drop=True)
-#     stats["predict_minutes_total"] = predict_seconds / 60.0
-#     stats["experiment_tag"] = EXPERIMENT_TAG
-#     stats.to_csv(RUN_STATS_PATH, index=False)
-
-#     print(f"Wrote {SUBMISSION_PATH} with {row_id:,} rows")
-#     print(f"Node rows: {total_nodes:,} | edge rows: {total_edges:,}")
-#     print(f"Wrote {RUN_STATS_PATH}")
-#     display(stats.describe(include="all"))
-#     display(pd.read_csv(SUBMISSION_PATH, nrows=8))

@@ -379,7 +379,7 @@ def main():
         print(f"-> nodes_folder   : {nodes_folder}"
               + ("" if args.nodes_folder else "   (from the run's args.json)"))
         print(f"-> folds          : {folds}")
-        print(f"-> writing to     : "
+        print("-> writing to     : "
               + ", ".join(str(d) for d in out_dirs.values()))
         if ctx.distributed:
             print(f"-> distributed    : {ctx.world_size} processes")

@@ -56,13 +56,12 @@ from tracking_cellmot.metrics import (  # noqa: E402
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # Tuned on 16 of the 71 fold-0 stacks spanning the node-excess range, then
-# checked on all 71 -- see postprocessing/README_edge.md, including the two
-# settings that won on the subset and lost on the fold.
+# checked on all 71: two settings that won on the subset lost on the fold.
 #
 # `min_track` and `recover_min_dup` were re-tuned again for
 # `logs/edge_run/2026-09-07/2/preds_0.45` -- a newer, more over-detected
 # checkpoint (node ratio 1.157 raw against the 1.081 the block above was tuned
-# on) -- see README_edge.md's "Retuned again for preds_0.45". min_track went
+# on). min_track went
 # 2 -> 5 and recover_min_dup 4.0 -> 3.0; everything else held.
 #
 # Retuned once more on the 199 out-of-fold stacks of
@@ -70,11 +69,11 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # detection head. The whole `recover` block tightened and `min_track` rose:
 # together +0.0131 (0.8374 -> 0.8506 without the ILP), gaining on both embryos
 # (+0.0111 on 44b6, +0.0152 on 6bba). Every one of the four was positive on both
-# embryos on its own as well, which is the bar README_edge.md sets. The four sit
+# embryos on its own as well, which is the bar for a change. The four sit
 # on a plateau -- gap 2 scores 0.8507 to gap 3's 0.8506, min_track 6/7/8 span
 # 0.0011 -- so read the values as "somewhere in here", not as a peak.
 #
-# Retuned again, with `postprocessing/tune_edge_pp.py`, on the 199 out-of-fold
+# Retuned again on the 199 out-of-fold
 # stacks of `logs/edge_run/2026-09-11/0/preds_0.45` -- nodes from the
 # `annot_head` detector `logs/2026-09-11/1/preds_r7_0.40`. Four knobs moved and
 # together they are worth +0.0046 (0.8568 -> 0.8614): `min_track` 7 -> 5,
@@ -84,7 +83,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 #
 # Read that gain as one embryo's worth, not two: it is +0.0097 on 44b6 and
 # -0.0006 on 6bba. The second number is flat rather than a loss, but the bar
-# README_edge.md sets is a gain on both and this does not clear it.
+# for a change is a gain on both and this does not clear it.
 #
 # These values are *not* portable backwards. On the older
 # `logs/edge_run/2026-09-09/0/preds_0.45` the same four cost -0.0066 (0.8506 ->
@@ -92,7 +91,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # checkpoint and this one is right for this one; the knobs trade against how
 # much the detector over-detects and how well its probabilities separate a
 # fork, and neither is a property of the post-processing. So retune on every
-# new checkpoint -- that is what `tune_edge_pp.py` is for -- and do not read a
+# new checkpoint, and do not read a
 # scores json written under one set of defaults against one written under
 # another.
 #
@@ -153,8 +152,7 @@ DEFAULTS = dict(
     # The ILP node filter -- see `ilp_filter_nodes`. **On** as of the nine-config
     # survey: every one of the five best CV-ranked runs and all four fold-0-tuned
     # ones sets it, at the same 0.75 / 0.40. It costs ~9-16 s a stack against ~1 s
-    # for the rest of the chain, so `postprocessing/ilp_cache.py` exists to freeze
-    # the solve when sweeping the cheap knobs behind it.
+    # for the rest of the chain.
     #
     # The history below is kept because it is the reasoning, and because it
     # records the one thing that has to be re-checked on a new checkpoint: the
@@ -254,9 +252,7 @@ DEFAULTS = dict(
     # Left off here because it is still 9-16 s a stack. For a final run:
     #   --ilp --ilp_disappearance 0.75 --ilp_threshold 0.4 \
     #   --div_max_sister_um 12 --div_diverge_um 4.5
-    # `postprocessing/ilp_cache.py` freezes the solve so the rest of the chain
-    # can be swept over it at 1 s a stack.
-    # Fixed by the nine-config survey in Experiments.md: this value is
+    # Fixed by a nine-config survey: this value is
     # identical in every one of the five best CV-ranked runs and all four
     # fold-0-tuned ones, so it is a default rather than a knob.
     ilp=1,
@@ -274,13 +270,13 @@ DEFAULTS = dict(
     # Division weight for the fork-harvesting solve only. Must be < 1.0 or the
     # solver never forks; 0.3 is where fork recall saturates.
     ilp_fork_division=0.3,
-    # Fixed by the nine-config survey in Experiments.md: this value is
+    # Fixed by a nine-config survey: this value is
     # identical in every one of the five best CV-ranked runs and all four
     # fold-0-tuned ones, so it is a default rather than a knob.
     ilp_threshold=0.40,
     ilp_edge_weight=-1.0,
     ilp_appearance=0.0,
-    # Fixed by the nine-config survey in Experiments.md: this value is
+    # Fixed by a nine-config survey: this value is
     # identical in every one of the five best CV-ranked runs and all four
     # fold-0-tuned ones, so it is a default rather than a knob.
     ilp_disappearance=0.75,
@@ -303,16 +299,15 @@ DEFAULTS = dict(
     # filter keeps almost everything it is given, and why feeding it more nodes
     # would mostly mean keeping more of them. With a positive weight a node has
     # to earn its place out of the edges it carries. Ultrack's node term; the
-    # knob `multi_hypothesis.py` drives from detector confidence.
+    # knob, which could be driven from detector confidence.
     ilp_node_weight=0.0,
     # Divisions. The score is `adj_edge_jaccard + 0.1 * division_jaccard` and
     # this chain scored a flat 0 on the second term -- `division_fp` was 0 too,
     # so it was not proposing them and getting them wrong, it was not proposing
     # them at all: the one-to-one assignment cannot express a fork. The gates
-    # are the public "safe division" repair (PublicChanges.md, 946 Harmonic
-    # Fusion) plus a `div_min_prob` gate that notebook has no way to apply,
+    # are the public "safe division" repair (the 946 Harmonic Fusion public
+    # notebook) plus a `div_min_prob` gate that notebook has no way to apply,
     # since it works from geometry with no scored candidate graph.
-    # See README_edge.md, "Divisions".
     divisions=1,
     # 0.30 on the 09-11 checkpoint, down from the 0.40 that was the conservative
     # end of a tie on 09-09/0. This detector's division term starts far weaker
@@ -382,7 +377,7 @@ def parse_args():
                    help="default: <preds_dir>_pp, bumped to _pp2, _pp3 ... "
                         "while anything would be overwritten")
     p.add_argument("--geff_dir", default=None,
-                   help="default: <out_dir> with 'preds' replaced by 'geff'")    
+                   help="default: <out_dir> with 'preds' replaced by 'geff'")
     p.add_argument("--name", default=None,
                    help="label this version: <preds_dir>_pp_<name>. Worth using "
                         "-- _pp2 vs _pp7 says nothing about what was changed")
@@ -473,7 +468,7 @@ def parse_args():
                         "sisters by t+2 (default %(default)s)")
     p.add_argument("--div_no_divergence", action="store_true",
                    help="drop the divergence requirement (measured: 10x the "
-                        "false positives -- see README_edge.md)")
+                        "false positives)")
     p.add_argument("--div_no_mutual_nn", action="store_true")
     p.add_argument("--ilp_div_forks", action="store_true",
                    help="harvest the ILP's own division forks as the proposal "
@@ -818,8 +813,8 @@ def postprocess(coords, edges, cand, cfg):
 # and every stage below reads only `div_*`, `min_track` and `linefit*`. So for
 # any two configs that agree on the first group, the first half produces the
 # same graph twice -- which is exactly what a sweep of the division gates or of
-# `min_track` does, and they are the majority of the arms. `tune_edge_pp.py`
-# caches the halfway point on that basis; the split lives here so there is one
+# `min_track` does, and they are the majority of the arms. A sweep can
+# cache the halfway point on that basis; the split lives here so there is one
 # chain rather than the tuner's copy of it drifting from this one.
 def postprocess_prefix(coords, edges, cand, cfg):
     """ilp -> assign -> recover -> through. `-> (coords, edges, cand)`.

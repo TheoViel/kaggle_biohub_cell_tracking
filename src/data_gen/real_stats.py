@@ -6,11 +6,9 @@ the microscope produces, so both are measured rather than guessed."""
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 import numpy as np
-import zarr
 from scipy.ndimage import gaussian_filter, maximum_filter
 
 from data_gen.constants import DOWNSAMPLE, EFF_VOXEL, POOL
@@ -56,27 +54,6 @@ def norm(f):
     lo, hi = np.percentile(f, 1), np.percentile(f, 99.5)
     return np.clip((f - lo) / max(hi - lo, 1e-6), 0, 1).astype(np.float32)
 
-
-def geff_for(td_, name):
-    for c in [td_ / f"{name}.geff", td_ / "gt" / f"{name}.geff"]:
-        if c.exists():
-            return c
-    h = list(td_.rglob(f"{name}*.geff"))
-    return h[0] if h else None
-
-
-def read_geff_nodes(gp):
-    import tracksdata as td
-
-    g = td.graph.IndexedRXGraph.from_geff(gp)
-    g = g[0] if isinstance(g, tuple) else g
-    na = g.node_attrs(attr_keys=["t", "z", "y", "x"])
-    by_t = {}
-    for r in na.iter_rows(named=True):
-        by_t.setdefault(int(r["t"]), []).append(
-            [float(r["z"]), float(r["y"]), float(r["x"])]
-        )
-    return {t: np.array(v) for t, v in by_t.items()}
 
 
 def pool_xy(f):

@@ -9,17 +9,12 @@ to
     dataset/tracking_<date>_<exp>/
     dataset/contrastive_<date>_<exp>/
     dataset/edge_<date>_<exp>/
-    dataset/division_<name>/          (one per --division)
+    dataset/division_<date>_<exp>/    (one per --division)
 
 Usage:
-    python scripts/copy_to_dataset.py logs/edge_run/2026-09-28/0 \
-        --division pool28_ours=logs/division/2026-09-28/0 \
-        --division pool28_edu=logs/division/2026-09-28/1 \
-        --division pool28_union=logs/division/2026-09-28/2
-    python scripts/copy_to_dataset.py --dry-run logs/edge_run/2026-09-28/0
-
-A detector without an args.json (the teammate's predictions) is reported and
-skipped: its weights ship as their own Kaggle dataset.
+    python scripts/copy_to_dataset.py logs/edge_run/2026-09-24/4 \
+        --division logs/division/2026-09-16/0
+    python scripts/copy_to_dataset.py --dry-run logs/edge_run/2026-09-24/4
 """
 from __future__ import annotations
 
@@ -43,7 +38,7 @@ def from_src(path: str) -> Path:
 
 
 def run_tag(run: Path) -> str:
-    """logs/<...>/2026-09-26/1 -> 2026-09-26_1."""
+    """logs/<...>/2026-09-13/1 -> 2026-09-13_1."""
     return f"{run.parent.name}_{run.name}"
 
 
@@ -60,7 +55,7 @@ def detector_runs(nodes_folder: Path) -> list[Path]:
 
 
 def contrastive_run(embeddings_key: str) -> Path:
-    """embeddings_contrastive_2026-09-26_0 -> <logs>/contrastive/2026-09-26/0."""
+    """embeddings_contrastive_2026-09-09_1 -> <logs>/contrastive/2026-09-09/1."""
     m = re.fullmatch(r"embeddings_contrastive_(\d{4}-\d{2}-\d{2})_(\d+)", embeddings_key)
     if not m:
         raise ValueError(f"cannot parse a contrastive run from {embeddings_key!r}")
@@ -90,8 +85,8 @@ def main() -> int:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("edge_run", help="edge run folder, e.g. logs/edge_run/2026-09-28/0")
-    p.add_argument("--division", action="append", default=[], metavar="NAME=RUN",
-                   help="a division classifier run, copied to division_<NAME>")
+    p.add_argument("--division", action="append", default=[], metavar="RUN",
+                   help="a division classifier run, e.g. logs/division/2026-09-16/0")
     p.add_argument("--dest", default=str(ROOT / "dataset"))
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
@@ -101,16 +96,13 @@ def main() -> int:
     cfg = json.loads((edge / "args.json").read_text())
 
     for run in detector_runs(from_src(cfg["nodes_folder"])):
-        if (run / "args.json").is_file():
-            copy_run(run, dest / f"tracking_{run_tag(run)}", args.dry_run)
-        else:
-            print(f"  {run}: external detector, not copied")
+        copy_run(run, dest / f"tracking_{run_tag(run)}", args.dry_run)
     ctr = contrastive_run(cfg["embeddings_key"])
     copy_run(ctr, dest / f"contrastive_{run_tag(ctr)}", args.dry_run)
     copy_run(edge, dest / f"edge_{run_tag(edge)}", args.dry_run)
-    for spec in args.division:
-        name, run = spec.split("=", 1)
-        copy_run(Path(run).resolve(), dest / f"division_{name}", args.dry_run)
+    for run in args.division:
+        run = Path(run).resolve()
+        copy_run(run, dest / f"division_{run_tag(run)}", args.dry_run)
 
     print("\nDry run, nothing written." if args.dry_run else f"\nCopied to {dest}")
     return 0

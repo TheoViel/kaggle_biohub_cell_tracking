@@ -1,18 +1,8 @@
 import os
 import re
 import sys
-import copy
-import math
-import json
-import shutil
 import datetime
-import subprocess
 import numpy as np
-
-try:
-    import neptune
-except ImportError:
-    pass
 
 
 class Config:
@@ -182,120 +172,5 @@ def get_last_log_folder(log_path, contains="args.json"):
     )
 
 
-def save_config(config, path):
-    """
-    Save configuration parameters to a JSON file.
-
-    This function serializes a configuration object to JSON format, excluding
-    internal Python attributes. It can handle both absolute and relative paths,
-    automatically appending .json extension if not present.
-
-    Args:
-        config (Config): Configuration object to save.
-        path (str): Path where the configuration should be saved.
-    """
-    dic = config.__dict__.copy()
-    del (dic["__doc__"], dic["__module__"], dic["__dict__"], dic["__weakref__"])
-
-    if not path.endswith(".json"):
-        path += ".json"
-
-    with open(path, "w") as f:
-        json.dump(dic, f)
 
 
-def get_size(folder):
-    """
-    Calculate the total size of a folder and its contents in gigabytes.
-
-    Args:
-        folder (str): Path to the folder to calculate size for.
-
-    Returns:
-        float: Total size of the folder and its contents in gigabytes.
-    """
-    total_size = 0
-    for dirpath, dirnames, filenames in os.walk(folder):
-        for f in filenames:
-            fp = os.path.join(dirpath, f)
-            # skip if it is symbolic link
-            if not os.path.islink(fp):
-                total_size += os.path.getsize(fp)
-
-    total_size = total_size / math.pow(1024, 3)
-    return total_size
-
-
-def upload_to_kaggle(folders, directory, dataset_name, update_folders=True):
-    """
-    Uploads folders to Kaggle as a dataset.
-
-    This function copies the specified folders to a target directory, creates or updates
-    a Kaggle dataset, and uploads it to Kaggle. It handles both new dataset creation and
-    version updates of existing datasets.
-
-    Args:
-        folders (list): List of folder paths to be included in the dataset.
-        directory (str): Target directory where the dataset will be prepared.
-        dataset_name (str): Name of the Kaggle dataset.
-        update_folders (bool, optional): Whether to update existing folders. Defaults to True.
-
-    Note:
-        - Requires Kaggle API credentials to be configured.
-        - Creates a dataset-metadata.json file if it doesn't exist.
-        - Removes validation feature files (fts_val_*.npy) from the dataset.
-        - Handles both new dataset creation and version updates.
-    """
-    os.makedirs(directory, exist_ok=True)
-    for folder in folders:
-        print(f"- Copying {folder} ...")
-        name = "_".join(folder[:-1].split("/")[-2:])
-        try:
-            shutil.copytree(
-                folder,
-                directory + name,
-                ignore=lambda src, names: [n for n in names if "feature" in n],
-            )
-        except FileExistsError:
-            if update_folders:
-                shutil.rmtree(directory + name)
-                shutil.copytree(
-                    folder,
-                    directory + name,
-                    ignore=lambda src, names: [n for n in names if "feature" in n],
-                )
-        for i in range(4):
-            try:
-                os.remove(f"{directory + name}/fts_val_{i}.npy")
-            except Exception:
-                pass
-
-    print(f"\nDataset size : {get_size(directory):.3f} Go")
-
-    if os.path.exists(directory + "dataset-metadata.json"):
-        # Update version
-        print("- Update existing dataset !")
-        command = f'kaggle d version -m "update" -p {directory} --dir-mode zip'
-    else:
-        print("- Create new dataset ! ")
-        # Create dataset-metadata.json
-        with open(directory + "dataset-metadata.json", "w") as f:
-            slug = re.sub(" ", "-", dataset_name.lower())
-            dic = {
-                "title": f"{dataset_name}",
-                "id": f"theoviel/{slug}",
-                "licenses": [{"name": "CC0-1.0"}],
-            }
-            json.dump(dic, f)
-
-        command = f"kaggle d create -p {directory} --dir-mode zip"
-
-    # Upload dataset
-    print("- Uploading ...")
-    try:
-        process = subprocess.Popen(command.split(), stdout=subprocess.PIPE)
-        output, error = process.communicate()
-        print("\nOutput :\n", output)
-        print("\nError :\n", error)
-    except Exception:
-        print("\nUpload failed, Run command manually :\n", command)

@@ -9,7 +9,12 @@ distinguishes them.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import numpy as np
+
+if TYPE_CHECKING:
+    import torch
 
 # The paper's patch, in (z, y, x). The three z-slices become the backbone's
 # input channels; 64 y/x voxels is 26 um here, so a cell (~8.5 um) sits inside

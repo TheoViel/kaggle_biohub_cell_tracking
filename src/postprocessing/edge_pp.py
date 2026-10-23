@@ -29,13 +29,11 @@ Everything runs from the npz alone: no model, no images, no GPU.
 from __future__ import annotations
 
 import itertools
-from pathlib import Path
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial import cKDTree
 
-from embeddings.match import dynamic_threshold
 from params import SCALE
 
 SCALE_ARR = np.asarray(SCALE)
@@ -114,29 +112,6 @@ def _log_odds(p, threshold, kind="logit"):
     return logit_th - (np.log(p) - np.log1p(-p))
 
 
-def load_embeddings(path):
-    """The L2-normalised node embeddings for a sample, or None.
-
-    `notebooks/CompareCV.ipynb` links on the cosine between these and gains
-    +0.05 cv over the *node* transformer's own edges. They are worth having
-    here for the same reason -- except that this model already reads them as
-    node features, which is what `emb_weight` below is for measuring.
-
-    The embeddings npz and the prediction npz are built from the same detection
-    set, so row `i` is the same node in both; this checks that rather than
-    assuming it.
-    """
-    path = Path(path)
-    if not path.exists():
-        return None
-    with np.load(path) as d:
-        if "embeddings" not in d.files:
-            return None
-        emb = d["embeddings"].astype(np.float32)
-        coords = d["coords"]
-    emb /= np.clip(np.linalg.norm(emb, axis=1, keepdims=True), 1e-8, None)
-    return emb, np.asarray(coords)
-
 
 def assign(coords, cand, threshold=0.4, flow_weight=0.0, flow_k=30,
            flow_passes=2, max_residual=np.inf, emb=None, emb_weight=0.0,
@@ -162,7 +137,7 @@ def assign(coords, cand, threshold=0.4, flow_weight=0.0, flow_k=30,
     flow_weight : float
         Microns of flow-corrected residual, converted to log-odds at this rate
         and added to the cost. 0 leaves the decision entirely to the model,
-        which is what the sweep chose -- see README_edge.md.
+        which is what the sweep chose.
     flow_k : int
         Links in the neighbourhood the local flow is the median of.
     flow_passes : int
@@ -174,8 +149,8 @@ def assign(coords, cand, threshold=0.4, flow_weight=0.0, flow_k=30,
         L2-normalised node embeddings, from `load_embeddings`.
     emb_weight : float
         Blend the cosine into the link probability, as
-        `(1 - w) * p + w * (cos + 1) / 2` -- `CompareCV.ipynb`'s
-        `w_emb * sim_emb + w_trans * p_trans`, in probability space so that the
+        `(1 - w) * p + w * (cos + 1) / 2`, the blend
+        `w_emb * sim_emb + w_trans * p_trans` in probability space so that the
         threshold keeps meaning. 0 leaves the decision to the model.
     emb_momentum : float
         Carry an EMA of each track's embedding forward instead of comparing
@@ -494,8 +469,8 @@ def propose_divisions(
     pipeline was scoring a flat 0 on the second term, with `division_fp` at 0 --
     not wrong divisions, *no* divisions. This is the stage that proposes them.
 
-    The gate stack is the public "safe division" repair (see PublicChanges.md,
-    the 946 Harmonic Fusion notebook), which reached the strongest public score
+    The gate stack is the public "safe division" repair (the 946 Harmonic
+    Fusion public notebook), which reached the strongest public score
     of the family. A parent already holding exactly one committed child may take
     a second one when every one of these holds:
 
@@ -522,12 +497,12 @@ def propose_divisions(
       one of them: ``|d1 - d2| / mean(d1, d2) <= tau``.
 
     ``div_prob`` is the division classifier's opinion of the *parent*, one entry
-    per node from `main_division_predict.py` (`nan` where unscored). It enters
+    per node (`nan` where unscored). It enters
     twice and both matter:
 
     * as a gate, ``div_prob_min`` -- and this is the only signal here that is
       not geometry or the edge model's link probability, which is why it is
-      worth the extra pass. `README_edge.md` establishes that precision is the
+      worth the extra pass. Precision is the
       binding constraint and that no rearrangement of the existing features
       supplies it; the classifier reads the image, where the mitotic figure
       actually is.
@@ -616,7 +591,7 @@ def propose_divisions(
     if cls is not None and len(cls) != len(coords):
         raise ValueError(
             f"div_prob covers {len(cls)} of {len(coords)} nodes; it must be the "
-            "array main_division_predict.py wrote for *this* prediction npz"
+            "array scored for *this* prediction npz"
         )
     if len(edges) == 0 or len(coords) == 0:
         return (edges, stats) if return_stats else edges
@@ -809,372 +784,6 @@ def propose_divisions(
     return (edges, stats) if return_stats else edges
 
 
-def merge_shadow_forks(
-    coords,
-    edges,
-    radius=7.0,
-    min_shadow=3,
-    shadow_frac=0.6,
-    max_sister_um=14.0,
-    global_frac_cap=0.00375,
-    return_stats=False,
-):
-    """Rejoin a division that the detector split into two parallel tracks.
-
-    `merge_duplicate_parents` had the right diagnosis and the wrong instrument.
-    In 34 of the 151 annotated divisions the second daughter is already claimed
-    by a *duplicate detection of the same parent cell*, so the fork exists in
-    the graph but no node carries it -- and a one-frame distance test cannot
-    tell that duplicate from an ordinary neighbour, because both sit at 6-11 um.
-    Merging on distance alone fired 10 508 times for 34 opportunities.
-
-    Time tells them apart. A cell found twice produces two tracks that **shadow
-    each other** -- within a cell's width, frame after frame, for as long as both
-    detections survive. That is `dedup.suppress_parallel`'s signature, and it is
-    the one this uses.
-
-    What makes it a *division* rather than a plain duplicate is how the
-    shadowing **ends**. When the cell divides, one copy follows one daughter and
-    the other copy follows the other, and the two tracks separate for good. So:
-
-        ...a-a-a-a-a          two tracks within `radius` for >= min_shadow
-        ...b-b-b-b-b          consecutive frames, then at t+1
-                   \\
-                    a'         they part, and a' and b' are within
-                    b'         max_sister_um of each other
-
-    `shadow_frac` is what keeps that from firing on any two neighbours that
-    happen to drift together: the run has to be most of the shorter track's
-    life, not merely `min_shadow` frames of it.
-
-    The last shadowed frame is the division. The loser's child link is re-pointed
-    onto the winner, which then forks; the loser's own history is left dangling
-    and `prune_short` collects it, which also removes the duplicate detections
-    from the node count.
-
-    Nothing is invented: both edges keep the probability the model gave them.
-    """
-    coords = np.asarray(coords)
-    edges = np.asarray(edges, float).reshape(-1, 4)
-    stats = {k: 0 for k in ("shadow_pairs", "too_short", "no_split",
-                            "sister_rejected", "merged")}
-    if len(edges) == 0 or len(coords) == 0:
-        return (edges, stats) if return_stats else edges
-
-    p_um = pos_um(coords)
-    frame_of = coords[:, 0].astype(int)
-    src, tgt = edges[:, 0].astype(int), edges[:, 1].astype(int)
-    label = _components(len(coords), edges)
-    track_len = np.bincount(label, minlength=len(coords))[label]
-
-    n_children = np.bincount(src, minlength=len(coords))
-    only_child = np.full(len(coords), -1, np.int64)
-    single = n_children[src] == 1
-    only_child[src[single]] = tgt[single]
-    edge_of_parent = np.full(len(coords), -1, np.int64)
-    edge_of_parent[src[single]] = np.flatnonzero(single)
-
-    by_frame = rows_by_frame(coords)
-    # Which frames each pair of tracks shadows in, and which nodes carried it.
-    shadow: dict[tuple[int, int], dict[int, tuple[int, int]]] = {}
-    for t, rows in by_frame.items():
-        if len(rows) < 2:
-            continue
-        pairs = cKDTree(p_um[rows]).query_pairs(radius, output_type="ndarray")
-        for i, j in pairs:
-            u, v = int(rows[i]), int(rows[j])
-            lu, lv = int(label[u]), int(label[v])
-            if lu == lv:
-                continue
-            key = (lu, lv) if lu < lv else (lv, lu)
-            shadow.setdefault(key, {})[t] = (u, v) if lu < lv else (v, u)
-
-    global_cap = max(1, int(round(len(coords) * global_frac_cap)))
-    moved: dict[int, int] = {}
-    spent: set[int] = set()
-
-    for (la, lb), frames in sorted(shadow.items(), key=lambda kv: -len(kv[1])):
-        if len(moved) >= global_cap:
-            break
-        stats["shadow_pairs"] += 1
-        ts = sorted(frames)
-        # the run of consecutive shadowed frames that ends the shadowing
-        run_end = ts[-1]
-        run = 1
-        while run < len(ts) and ts[-1 - run] == run_end - run:
-            run += 1
-        # The run must also be most of the pair's shared life. Two unrelated
-        # neighbours drift within `radius` for a few frames all the time; a
-        # duplicate shadows its original for essentially the whole overlap.
-        span_a = int(track_len[frames[ts[0]][0]])
-        span_b = int(track_len[frames[ts[0]][1]])
-        if run < min_shadow or run < shadow_frac * min(span_a, span_b):
-            stats["too_short"] += 1
-            continue
-        t = run_end
-        a_t, b_t = frames[t]
-        if la in spent or lb in spent:
-            continue
-        ca, cb = int(only_child[a_t]), int(only_child[b_t])
-        # Both copies must carry the parent forward, into different nodes, and
-        # those must be the frame after -- that pair is the division.
-        if ca < 0 or cb < 0 or ca == cb:
-            stats["no_split"] += 1
-            continue
-        if frame_of[ca] != t + 1 or frame_of[cb] != t + 1:
-            stats["no_split"] += 1
-            continue
-        sister = float(np.linalg.norm(p_um[ca] - p_um[cb]))
-        if sister > max_sister_um or sister <= radius:
-            # <= radius means they never actually parted: a plain duplicate,
-            # not a division, and dropping one is `prune_short`'s business.
-            stats["sister_rejected"] += 1
-            continue
-        keep_node, drop_node = (a_t, b_t)
-        if track_len[b_t] > track_len[a_t]:
-            keep_node, drop_node = b_t, a_t
-        row = int(edge_of_parent[drop_node])
-        if row < 0:
-            continue
-        moved[row] = keep_node
-        spent.update((la, lb))
-        stats["merged"] += 1
-
-    if moved:
-        edges = edges.copy()
-        for row, keep in moved.items():
-            edges[row, 0] = keep
-            edges[row, 3] = float(np.linalg.norm(
-                p_um[keep] - p_um[int(edges[row, 1])]))
-    return (edges, stats) if return_stats else edges
-
-
-def merge_duplicate_parents(
-    coords,
-    edges,
-    max_dup_um=7.0,
-    max_parent_um=9.0,
-    max_sister_um=14.0,
-    symmetry_tau=0.6,
-    diverge_um=3.0,
-    require_divergence=True,
-    require_mutual=True,
-    global_frac_cap=0.00375,
-    return_stats=False,
-):
-    """Pull a division that got split across two duplicate detections onto one node.
-
-    `propose_divisions` can only use a second daughter nothing has claimed, and
-    `diag_divisions.py` says that is where most of the recall goes: of 151
-    annotated divisions, 59 fail because the second daughter already has a
-    parent. Those are not assignment mistakes -- the model gives the rival a
-    median probability of 0.719 for her against our parent's 0.016 -- and in
-    **34 of the 59 the rival is itself a detection of the same annotated parent
-    cell**. The graph is over-detected, the dividing cell was found twice, and
-    the two copies took one daughter each. The fork is already there; it is just
-    spread over two nodes, and the metric wants one node of out-degree 2.
-
-    So this moves the second copy's child onto the first copy rather than
-    inventing a link. Both parents keep the probability the model gave their own
-    child, which is the point: no link here is a guess.
-
-    **Measured, and it does not work -- off by default.** The premise is sound
-    and the execution is not: "the same cell, found twice" is not recoverable
-    from geometry at these radii. The rival pairs sit at p25 6.3 um and median
-    8.1, and so do thousands of genuinely distinct neighbours, so a 7 um merge
-    fires 10 508 times across 199 stacks for 34 reachable divisions. Requiring
-    both parents *and* both daughters to be mutual nearest neighbours cuts that
-    to 6 324 and division false positives from 114 to 85, still 200x too loose.
-    On the fold: the stage alone is -0.0001, and in front of `propose_divisions`
-    it takes +0.0114 down to +0.0077. Kept because the diagnosis behind it is
-    solid and a real duplicate test -- `dedup.suppress_parallel`'s shadow-track
-    signature, which watches a pair over its whole life rather than one frame --
-    could still make it pay. Do not switch it on without one.
-
-    ``max_dup_um`` is what makes a pair of parents "the same cell". It should sit
-    near the detector's NMS radius -- two peaks it left standing are, by
-    construction, at least that far apart -- and the measured separation of these
-    rival pairs is p25 6.3 um, median 8.1.
-
-    The loser keeps its own history and simply ends there; `prune_short` removes
-    it if what is left is a fragment, which also takes a duplicate detection out
-    of the node count.
-
-    Returns the edges with those child links re-pointed. Runs before
-    `propose_divisions`, which then works on what is genuinely unclaimed.
-    """
-    coords = np.asarray(coords)
-    edges = np.asarray(edges, float).reshape(-1, 4)
-    stats = {k: 0 for k in (
-        "pairs_considered", "not_mutual", "sister_rejected", "parent_rejected",
-        "divergence_rejected", "symmetry_rejected", "merged",
-    )}
-    if len(edges) == 0 or len(coords) == 0:
-        return (edges, stats) if return_stats else edges
-
-    p_um = pos_um(coords)
-    frame_of = coords[:, 0].astype(int)
-    src = edges[:, 0].astype(int)
-    tgt = edges[:, 1].astype(int)
-
-    n_children = np.bincount(src, minlength=len(coords))
-    only_child = np.full(len(coords), -1, np.int64)
-    single = n_children[src] == 1
-    only_child[src[single]] = tgt[single]
-    # Which edge row carries each parent's single child, so it can be re-pointed.
-    edge_of_parent = np.full(len(coords), -1, np.int64)
-    edge_of_parent[src[single]] = np.flatnonzero(single)
-
-    by_frame = rows_by_frame(coords)
-    global_cap = max(1, int(round(len(coords) * global_frac_cap)))
-    moved, spent = {}, set()
-
-    for t in sorted(by_frame):
-        if len(moved) >= global_cap:
-            break
-        parents = [int(r) for r in by_frame[t]
-                   if only_child[r] >= 0 and frame_of[only_child[r]] == t + 1]
-        if len(parents) < 2:
-            continue
-        pairs = cKDTree(p_um[parents]).query_pairs(max_dup_um, output_type="ndarray")
-        # "Same cell, found twice" is not a distance -- at these radii thousands
-        # of genuinely distinct cells qualify, and merging on distance alone
-        # costs 114 division false positives for 7 true ones (README_edge.md).
-        # Both copies must be each other's nearest neighbour among *all* nodes of
-        # the frame, and so must the two daughters, which is what a duplicated
-        # detection and its sister pair look like and a crowded neighbourhood
-        # does not.
-        nn_at = {}
-        if require_mutual and pairs.size:
-            for tt in (t, t + 1):
-                rows_tt = by_frame.get(tt)
-                if rows_tt is None or len(rows_tt) < 2:
-                    nn_at[tt] = {}
-                    continue
-                dists, near = cKDTree(p_um[rows_tt]).query(p_um[rows_tt], k=2)
-                nn_at[tt] = {int(rows_tt[i]): int(rows_tt[near[i, 1]])
-                             for i in range(len(rows_tt))}
-
-        cand_pairs = []
-        for i, j in pairs:
-            a, b = parents[i], parents[j]
-            ca, cb = int(only_child[a]), int(only_child[b])
-            if ca == cb:
-                continue
-            if require_mutual:
-                if nn_at.get(t, {}).get(a) != b or nn_at.get(t, {}).get(b) != a:
-                    stats["not_mutual"] += 1
-                    continue
-                if nn_at.get(t + 1, {}).get(ca) != cb or nn_at.get(t + 1, {}).get(cb) != ca:
-                    stats["not_mutual"] += 1
-                    continue
-            cand_pairs.append((float(np.linalg.norm(p_um[a] - p_um[b])), a, b, ca, cb))
-        cand_pairs.sort()
-        stats["pairs_considered"] += len(cand_pairs)
-
-        for _, a, b, ca, cb in cand_pairs:
-            if len(moved) >= global_cap:
-                break
-            if a in spent or b in spent or ca in spent or cb in spent:
-                continue
-            sister_dist = float(np.linalg.norm(p_um[ca] - p_um[cb]))
-            if sister_dist > max_sister_um:
-                stats["sister_rejected"] += 1
-                continue
-            if require_divergence:
-                g1, g2 = only_child[ca], only_child[cb]
-                if g1 < 0 or g2 < 0 or frame_of[g1] != t + 2 or frame_of[g2] != t + 2:
-                    stats["divergence_rejected"] += 1
-                    continue
-                if float(np.linalg.norm(p_um[g1] - p_um[g2])) - sister_dist < diverge_um:
-                    stats["divergence_rejected"] += 1
-                    continue
-            # Whichever copy sits between the two daughters becomes the fork;
-            # the other is the duplicate that gives its child up.
-            keep, drop = (a, b)
-            da = max(np.linalg.norm(p_um[a] - p_um[ca]), np.linalg.norm(p_um[a] - p_um[cb]))
-            db = max(np.linalg.norm(p_um[b] - p_um[ca]), np.linalg.norm(p_um[b] - p_um[cb]))
-            if db < da:
-                keep, drop = b, a
-            d1 = float(np.linalg.norm(p_um[keep] - p_um[ca]))
-            d2 = float(np.linalg.norm(p_um[keep] - p_um[cb]))
-            if max(d1, d2) > max_parent_um:
-                stats["parent_rejected"] += 1
-                continue
-            if symmetry_tau > 0:
-                denom = max((d1 + d2) / 2.0, 1e-6)
-                if abs(d1 - d2) / denom > symmetry_tau:
-                    stats["symmetry_rejected"] += 1
-                    continue
-            row = int(edge_of_parent[drop])
-            if row < 0:
-                continue
-            moved[row] = keep
-            spent.update((a, b, ca, cb))
-            stats["merged"] += 1
-
-    if moved:
-        edges = edges.copy()
-        for row, keep in moved.items():
-            edges[row, 0] = keep
-            edges[row, 3] = float(np.linalg.norm(
-                p_um[keep] - p_um[int(edges[row, 1])]))
-    return (edges, stats) if return_stats else edges
-
-
-def bridge_tracks(coords, edges, max_um=6.0, drift=None, min_len=2):
-    """Join a chain ending at `u` to one starting at `u + 1`, on geometry alone.
-
-    The assignment declines a link whenever the model scores it below the
-    threshold, and it is right to -- but a *chain* that ends where another
-    begins, one frame apart and with nothing else competing for either end, is
-    a different piece of evidence than a single edge in isolation. This adds
-    exactly those links: both endpoints already belong to a track, both are
-    free, and the drift-corrected distance between them is under `max_um`.
-
-    No new nodes, unlike `recover_nodes` -- this repairs a chain the detector
-    did find and the linker cut.
-    """
-    coords = np.asarray(coords, float)
-    edges = np.asarray(edges, float).reshape(-1, 4)
-    if len(coords) == 0:
-        return edges
-    p_um = pos_um(coords)
-    rows = rows_by_frame(coords)
-    length = track_length(coords, edges)
-
-    has_child = np.zeros(len(coords), bool)
-    has_parent = np.zeros(len(coords), bool)
-    has_child[edges[:, 0].astype(int)] = True
-    has_parent[edges[:, 1].astype(int)] = True
-
-    if drift is None:
-        from recover import drift_table
-        drift = drift_table(coords)
-
-    added = []
-    for u in sorted(rows):
-        if u + 1 not in rows or u not in drift:
-            continue
-        here, there = rows[u], rows[u + 1]
-        ends = here[~has_child[here] & (length[here] >= min_len)]
-        starts = there[~has_parent[there] & (length[there] >= min_len)]
-        if not len(ends) or not len(starts):
-            continue
-        d = np.linalg.norm(
-            p_um[starts][None, :, :] - (p_um[ends] + drift[u])[:, None, :], axis=-1
-        )
-        gated = d > max_um
-        if gated.all():
-            continue
-        ri, ci = linear_sum_assignment(np.where(gated, NO_LINK, d))
-        for i, j in zip(ri, ci, strict=True):
-            if not gated[i, j]:
-                added.append((ends[i], starts[j], 0.5, float(d[i, j])))
-    if not added:
-        return edges
-    return np.vstack([edges, np.asarray(added, float).reshape(-1, 4)])
-
 
 def linefit_smooth(coords, edges, window=2, weight=0.74):
     """Move each node toward a line fitted through its own track.
@@ -1182,7 +791,7 @@ def linefit_smooth(coords, edges, window=2, weight=0.74):
     `pp_public` does this and it is the one part of that module worth its
     runtime here. The point is not that the detector jitters -- smoothing a
     node against its neighbours in *time* was measured and makes the median
-    localisation error worse (`analysis_jitter.py`). The point is the node's
+    localisation error worse. The point is the node's
     own track: a cell that is tracked over five frames gives five readings of a
     trajectory that is locally straight, and the fit averages the detection
     error down without averaging the motion away.
@@ -1258,233 +867,6 @@ def linefit_smooth(coords, edges, window=2, weight=0.74):
     return coords
 
 
-def velocity_link(coords, cand=None, momentum=0.5, max_um=7.0, prob_weight=0.0,
-                  seed_drift=True, drift=None, threshold=0.4):
-    """Serial linear assignment against a per-track velocity, carried with momentum.
-
-    The ASCENT linker's shape -- walk the frames in order, solve one assignment
-    per pair, carry a state forward on the matched tracks -- with the state
-    being the cell's **own motion** rather than its appearance:
-
-        v[track] <- m * v[track] + (1 - m) * (pos_child - pos_parent)
-        predicted =  pos_parent + v[track]
-        cost[i, j] = || pos_next[j] - predicted[i] ||
-
-    This is not the neighbourhood flow `relink.py` corrects by, and not the
-    appearance EMA `CompareCV.ipynb` carries. `postprocessing/README.md` records
-    per-cell velocity as tried and worse ("tracks fragment too often for a
-    cell's own history to be available when it is needed") -- but that was
-    measured against the detector's own links, where a track is a handful of
-    frames. On this graph the median track is 12 nodes and the p75 is 21, so
-    the history the idea needs now exists.
-
-    A track that has just started has no velocity of its own. `seed_drift`
-    gives it the field's, from `recover.drift_table`, which is the right prior:
-    the embryo slides bodily by up to 7 um a frame, so zero is not a neutral
-    guess, it is a wrong one.
-
-    `prob_weight` optionally lets the model buy slack -- microns of distance
-    forgiven per unit of probability -- so the two signals can be traded off.
-    0 is the pure motion model.
-    """
-    coords = np.asarray(coords, float)
-    p_um = pos_um(coords)
-    rows = rows_by_frame(coords)
-    n = len(coords)
-
-    if drift is None and seed_drift:
-        from recover import drift_table
-        drift = drift_table(coords)
-    drift = drift or {}
-
-    by_t = {}
-    if prob_weight and cand is not None and len(cand):
-        cand = np.asarray(cand, float).reshape(-1, 5)
-        cand = cand[cand[:, 4].astype(int) == 1]
-        frame_of = coords[:, 0].astype(int)
-        for a, b, p, _d, _dt in cand:
-            by_t.setdefault(int(frame_of[int(a)]), []).append((int(a), int(b), p))
-
-    vel = np.zeros((n, 3))
-    has_vel = np.zeros(n, bool)
-
-    out = []
-    for t in sorted(rows):
-        if t + 1 not in rows:
-            continue
-        here, there = rows[t], rows[t + 1]
-        if not len(here) or not len(there):
-            continue
-
-        seed = np.asarray(drift.get(t, np.zeros(3)), float)
-        v = np.where(has_vel[here][:, None], vel[here], seed[None, :])
-        predicted = p_um[here] + v
-
-        cost = np.linalg.norm(p_um[there][None, :, :] - predicted[:, None, :],
-                              axis=-1)
-        if prob_weight:
-            cost = cost - prob_weight * _prob_matrix(here, there, by_t.get(t, ()))
-        gated = cost > max_um
-        if gated.all():
-            continue
-        ri, ci = linear_sum_assignment(np.where(gated, NO_LINK, cost))
-        keep = ~gated[ri, ci]
-        ri, ci = ri[keep], ci[keep]
-
-        for i, j in zip(ri, ci, strict=True):
-            s, t_row = int(here[i]), int(there[j])
-            out.append((s, t_row, 1.0, float(np.linalg.norm(p_um[t_row] - p_um[s]))))
-
-        # Only the matched tracks carry a velocity forward; a detection that
-        # started its own track has no history yet and falls back to the seed.
-        moved = p_um[there[ci]] - p_um[here[ri]]
-        vel[there[ci]] = momentum * v[ri] + (1 - momentum) * moved
-        has_vel[there[ci]] = True
-
-    return np.asarray(out, dtype=float).reshape(-1, 4)
-
-
-def ascent_link(coords, emb, cand=None, w_emb=0.5, w_trans=0.5, momentum=0.5,
-                threshold=None, max_um=0.0):
-    """`notebooks/CompareCV.ipynb`'s linker, as a graph builder.
-
-    A different decision rule from `assign`, in four ways that all matter:
-
-    * **Dense.** The cost is `emb_prev @ emb_next.T` over *every* pair in the
-      frame, not just the model's 5 nearest neighbours within 20 um. It can
-      therefore propose a link the candidate graph never contained -- worth
-      0.2% of ground-truth links, by `diag_edge.py`'s count.
-    * **A track state, not a detection.** The parent side of the cost is an EMA
-      along the track, `m * track + (1 - m) * detection`, so a cell is compared
-      against everything it has looked like rather than against one frame.
-    * **A dynamic threshold.** `embeddings.match.dynamic_threshold` puts the
-      cutoff halfway between what a *good* match costs in this frame and what
-      an average one does, so it tracks the frame's own difficulty instead of
-      being a constant the way `assign`'s probability threshold is.
-    * **Segment-wise.** Frames are walked in contiguous runs, so a hole in the
-      detection set ends the tracks rather than linking across it.
-
-    `w_emb` and `w_trans` blend the cosine with the model's probability
-    (`cand`, zero where the model did not score the pair). `w_trans=0` is the
-    notebook's "contrastive" row, `w_emb=0` uses the model alone under this
-    rule, and the default is its "combined".
-
-    `max_um` optionally refuses a link longer than that, which the dense cost
-    otherwise has no reason to: nothing in a cosine knows how far a cell is
-    allowed to move. 0 leaves it off, as the notebook has it.
-    """
-    coords = np.asarray(coords)
-    emb = np.asarray(emb, np.float32)
-    p_um = pos_um(coords)
-    rows = rows_by_frame(coords)
-    frames = sorted(rows)
-
-    # Bucketed by the source frame once: the candidate set has 255k rows and
-    # walking all of it per frame pair would cost more than the matching does.
-    by_t = {}
-    if w_trans and cand is not None and len(cand):
-        cand = np.asarray(cand, float).reshape(-1, 5)
-        cand = cand[cand[:, 4].astype(int) == 1]
-        frame_of = coords[:, 0].astype(int)
-        for a, b, p, _d, _dt in cand:
-            by_t.setdefault(int(frame_of[int(a)]), []).append((int(a), int(b), p))
-
-    out = []
-    for segment in _contiguous(frames):
-        if len(segment) < 2:
-            continue
-        track_emb = emb[rows[segment[0]]].copy()
-        for k in range(len(segment) - 1):
-            here, there = rows[segment[k]], rows[segment[k + 1]]
-            if not len(here) or not len(there):
-                track_emb = emb[there].copy()
-                continue
-
-            sim = track_emb @ emb[there].T
-            if w_trans:
-                sim = w_emb * sim + w_trans * _prob_matrix(
-                    here, there, by_t.get(segment[k], ()))
-            elif w_emb != 1.0:
-                sim = w_emb * sim
-            cost = 1.0 - sim
-            far = None
-            if max_um:
-                far = np.linalg.norm(
-                    p_um[there][None, :, :] - p_um[here][:, None, :], axis=-1) > max_um
-
-            # The threshold is a statistic *of the cost matrix*, so the gated
-            # pairs have to be invisible to it rather than merely expensive:
-            # `dynamic_threshold` drops non-finite entries, but a large finite
-            # stand-in would drag its mean up and let everything through.
-            cut = threshold
-            if cut is None:
-                cut = dynamic_threshold(
-                    cost if far is None else np.where(far, np.inf, cost),
-                    len(track_emb))
-            # The solver needs finite costs, so it gets the stand-in -- and the
-            # gated pairs are dropped again after it has chosen.
-            ri, ci = linear_sum_assignment(
-                cost if far is None else np.where(far, NO_LINK, cost))
-            keep = cost[ri, ci] <= cut
-            if far is not None:
-                keep &= ~far[ri, ci]
-            ri, ci = ri[keep], ci[keep]
-
-            for i, j in zip(ri, ci, strict=True):
-                s, t = int(here[i]), int(there[j])
-                out.append((s, t, float(1.0 - cost[i, j]),
-                            float(np.linalg.norm(p_um[t] - p_um[s]))))
-
-            # The next frame's parents: the matched ones carry their track
-            # forward, the unmatched ones start a track of their own.
-            nxt = emb[there].copy()
-            blended = momentum * track_emb[ri] + (1 - momentum) * emb[there][ci]
-            norm = np.linalg.norm(blended, axis=1, keepdims=True)
-            nxt[ci] = np.where(norm > 0, blended / np.maximum(norm, 1e-8),
-                               emb[there][ci])
-            track_emb = nxt
-
-    return np.asarray(out, dtype=float).reshape(-1, 4)
-
-
-def _contiguous(frames):
-    """`frames` split into runs of consecutive integers."""
-    segments = []
-    for t in frames:
-        if segments and t == segments[-1][-1] + 1:
-            segments[-1].append(t)
-        else:
-            segments.append([t])
-    return segments
-
-
-def _prob_matrix(here, there, triples):
-    """The model's probability for each pair of the frame, 0 where unscored.
-
-    The candidate set is sparse -- 5 per node -- so this fills from the
-    candidates rather than walking the dense pair list.
-    """
-    mat = np.zeros((len(here), len(there)), np.float32)
-    row = {int(a): i for i, a in enumerate(here)}
-    col = {int(b): j for j, b in enumerate(there)}
-    for a, b, p in triples:
-        i, j = row.get(a), col.get(b)
-        if i is not None and j is not None:
-            mat[i, j] = p
-    return mat
-
-
-def drop_long(edges, max_um):
-    """Refuse a link longer than `max_um`, whatever the model scored it.
-
-    The candidate graph reaches 20 um and a cell moves a median 2 um a frame,
-    so the tail of that range is a link between two different cells however
-    confident the model is. `pp_public` cuts at 14.2.
-    """
-    edges = np.asarray(edges, float).reshape(-1, 4)
-    if not max_um or len(edges) == 0:
-        return edges
-    return edges[edges[:, 3] <= max_um]
 
 
 def link_through_isolated(coords, edges, max_gap=2, max_um=5.0, min_len=2,

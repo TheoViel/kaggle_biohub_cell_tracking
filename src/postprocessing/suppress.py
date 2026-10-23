@@ -7,7 +7,7 @@ stages then move nodes: ``recover`` inserts interpolated ones, and
 floor, and between them 14–21% of nodes end up with a neighbour inside 7 um and
 about 1% inside 5 um, down to nodes sitting on top of each other.
 
-That is the failure mode `analysis_worst.py` isolates. When one cell carries two
+That is the failure mode of the worst stacks. When one cell carries two
 detections, the metric ties the annotation to one of them and the track may run
 through the other; the link is then charged as a false positive at both ends
 even though it is physically right. Node recall does not notice — both copies
@@ -36,9 +36,7 @@ postprocessing/README.md, *Cutting the rival density*.
 from __future__ import annotations
 
 import numpy as np
-from scipy.spatial import cKDTree
 
-from dedup import track_labels
 from params import SCALE
 
 SCALE_ARR = np.asarray(SCALE)
@@ -51,101 +49,4 @@ DEFAULTS = dict(
 )
 
 
-def _resolve(coords, edges, radius, position):
-    """Winner per frame, and the map from every suppressed node onto its winner."""
-    pos_um = coords[:, 1:] * SCALE_ARR
-    label = track_labels(len(coords), edges)
-    strength = np.bincount(label, minlength=label.max() + 1)[label]
 
-    t = coords[:, 0].astype(int)
-    merge = np.arange(len(coords))
-    keep = np.ones(len(coords), dtype=bool)
-    new_pos = pos_um.copy()
-
-    for tt in np.unique(t):
-        rows = np.flatnonzero(t == tt)
-        if len(rows) < 2:
-            continue
-        tree = cKDTree(pos_um[rows])
-        # Longest track first: not because it is right — it is a coin flip — but
-        # because it makes the outcome deterministic and keeps the node that has
-        # the most links to preserve.
-        order = rows[np.lexsort((rows, -strength[rows]))]
-        alive = np.ones(len(rows), dtype=bool)
-        local = {int(r): i for i, r in enumerate(rows)}
-        for r in order:
-            i = local[int(r)]
-            if not alive[i]:
-                continue
-            group = [j for j in tree.query_ball_point(pos_um[r], radius)
-                     if alive[j] and j != i]
-            if not group:
-                continue
-            for j in group:
-                alive[j] = False
-                keep[rows[j]] = False
-                merge[rows[j]] = r
-            if position == "centroid":
-                members = [r] + [rows[j] for j in group]
-                new_pos[r] = pos_um[members].mean(axis=0)
-    return keep, merge, new_pos
-
-
-def _rewire(edges, merge, keep, pos_um, max_parents, max_children):
-    """Edges of suppressed nodes moved onto their winner, then capped in degree."""
-    if len(edges) == 0:
-        return edges
-    src = merge[edges[:, 0].astype(int)]
-    tgt = merge[edges[:, 1].astype(int)]
-    prob = edges[:, 2]
-    alive = keep[src] & keep[tgt] & (src != tgt)
-    src, tgt, prob = src[alive], tgt[alive], prob[alive]
-    if not len(src):
-        return np.empty((0, 4))
-
-    # Two copies of a cell can carry the same link twice; keep the better one.
-    order = np.lexsort((-prob, tgt, src))
-    src, tgt, prob = src[order], tgt[order], prob[order]
-    first = np.ones(len(src), dtype=bool)
-    first[1:] = (src[1:] != src[:-1]) | (tgt[1:] != tgt[:-1])
-    src, tgt, prob = src[first], tgt[first], prob[first]
-
-    # The ground truth has no divisions and one parent per cell; a merge can
-    # break both, so re-impose them, best link first.
-    n_par: dict[int, int] = {}
-    n_chi: dict[int, int] = {}
-    out = []
-    for k in np.argsort(-prob):
-        s, g = int(src[k]), int(tgt[k])
-        if n_chi.get(s, 0) >= max_children or n_par.get(g, 0) >= max_parents:
-            continue
-        n_chi[s] = n_chi.get(s, 0) + 1
-        n_par[g] = n_par.get(g, 0) + 1
-        out.append((s, g, float(prob[k]),
-                    float(np.linalg.norm(pos_um[s] - pos_um[g]))))
-    return np.asarray(out, dtype=float).reshape(-1, 4)
-
-
-def suppress_rivals(coords, edges, **kw):
-    """Restore the per-frame spacing floor. Returns (coords, edges), reindexed."""
-    cfg = {**DEFAULTS, **kw}
-    coords = np.asarray(coords, dtype=np.float64)
-    edges = np.asarray(edges, dtype=np.float64).reshape(-1, 4)
-    if cfg["radius"] <= 0 or len(coords) == 0:
-        return coords, edges
-
-    keep, merge, new_pos = _resolve(coords, edges, cfg["radius"], cfg["position"])
-    if keep.all():
-        return coords, edges
-
-    out = coords.copy()
-    out[:, 1:] = new_pos / SCALE_ARR
-    linked = _rewire(edges, merge, keep, new_pos,
-                     cfg["max_parents"], cfg["max_children"])
-
-    index = np.full(len(coords), -1, dtype=int)
-    index[keep] = np.arange(int(keep.sum()))
-    if len(linked):
-        linked[:, 0] = index[linked[:, 0].astype(int)]
-        linked[:, 1] = index[linked[:, 1].astype(int)]
-    return out[keep], linked

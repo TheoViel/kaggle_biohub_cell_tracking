@@ -89,7 +89,7 @@ def get_augs_config(strength):
         "blur_p": 0.,
         "blur_sigma_um": 1.0,
         # Downscale then upscale
-        "lowres_p": 0.,             
+        "lowres_p": 0.,
         "lowres_max_factor": 2.0,
         # Noise
         "noise_p": 0.,
@@ -165,7 +165,7 @@ DEFAULTS = {
     "edge_geom_feats": True,
     "edge_contrastive_feats": False,
     "contrastive_feat_dim": 0,
-    
+
     "edge_drift_correction": True,
     "edge_knn_k": None,  # 16,   # score each child only against its K nearest parents (None = all-vs-all)
     "unet_features": [],  # ["detection", "contrastive"]  # Node features the edge transformer sees
@@ -193,7 +193,7 @@ DEFAULTS = {
 
     # Stage 1 - Synthetic data pretraining
     "synthetic_pretraining": {
-        "enabled": False,
+        "enabled": True,
         "synthetic_dir": INPUT_FOLDER + "synthetic/v5/",
         "synthetic_proportion": 1,
         # Real zebrahub crops
@@ -230,14 +230,14 @@ DEFAULTS = {
         "threshold": 0.25,  # Multiplication factor for the image intensity peak threshold
         "nms_um": 5.0,
         "dir": None,
-        # Weak positives from FOCUS-3D segmentation (pl_focus_3D.py).
+        # Weak positives from FOCUS-3D segmentation (not shipped with this repo).
         # Override the image peaks above; combined with pl_folder when both are
         # set, the pl_folder point winning any duplicate. A stack the folder does
         # not cover or that fails a gate below falls back to the image peaks.
         "use_focus_3d": False,
         "focus_3d_dir": OUTPUT_FOLDER + "focus3d/",
-        "focus_3d_min_recall": 0.5,   # drop a stack that misses annotated cells
-        "focus_3d_max_ratio": 1.25,    # drop a stack predicting far too many cells
+        "focus_3d_min_recall": 0.0,   # drop a stack that misses annotated cells
+        "focus_3d_max_ratio": 1.75,    # drop a stack predicting far too many cells
         # Weak positives from pl_folder: main_predict.py --pl, then main_postprocess.py --pl
         "pl_folder": LOG_FOLDER + "2026-09-01/9/preds_pl_pp/",
         # Ignore regions from a second folder. Run 10 (0.7632) turned this on
@@ -250,22 +250,22 @@ DEFAULTS = {
     # Stage 1.5 - Pretraining
     "pretraining": {
         "enabled": True,
-        # The output of Stage 1 (synthetic_pretraining) of an earlier run.
-        "weights": LOG_FOLDER + "2026-09-13/1/fold_0/ckpt_synthetic.pt",
+        # Starts from Stage 1 when None; else a ckpt_synthetic.pt of an earlier run.
+        "weights": None,
         # Data
         "crop_size": (32, 128, 128),  # (48, 192, 192)
         "aug_strength": 3,
         "synthetic_dir": INPUT_FOLDER + "synthetic/v4/",
         "synthetic_proportion": 0.5,
         "zebrahub_dir": INPUT_FOLDER + "zebrahub_crops/",
-        "zebrahub_embryos": ["ZSNS001_tail", "ZSNS003", "ZSNS004", "ZSNS005"],  # ["ZSNS001", "ZSNS001_tail", "ZSNS003", "ZSNS004", "ZSNS005"]
+        "zebrahub_embryos": ["ZSNS001_tail", "ZSNS003", "ZSNS004", "ZSNS005"],
         "zebrahub_proportion": 0.0,
         # Training
         "iterations": 5000,
         "epochs": None,
         "batch_size": 16,
         # Eval
-        "n_val_videos": 20,
+        "n_val_videos": 5,
         "eval_every": 500,
         # # lr
         # "lr": 1e-4,
@@ -312,7 +312,7 @@ DEFAULTS = {
         "transformer_warmup_prop": 0.,
         # Eval
         "eval_every": 50,
-        "n_val_videos": 20,
+        "n_val_videos": 5,
     },
 
     "optimizer_config": {
@@ -330,7 +330,7 @@ DEFAULTS = {
     "loss_config": {
         "det_use_weak_positives": True,
         "det_loss_weight": 1,
-        "det_neg_weight": 0.05,
+        "det_neg_weight": 1,
         "det_weak_weight": 0.2,        # To balance GT share of positive weight
         "det_weak_smoothing": 0.01,      # smoothing factor for weak positives
         "det_gaussian_sigma": 1.0,
@@ -371,7 +371,7 @@ DEFAULTS = {
     },
 
     # Eval
-    "eval_thresholds": [0.3, 0.4, 0.5],
+    "eval_thresholds": [0.4, 0.5],
     "eval_node_match_um": 3.0,
 
     # Multi-GPU

@@ -200,37 +200,44 @@ def filter_forks(coords, edges, cfg=None, return_stats=False):
             prob = float(edges[k, 2])
             if child_dist > cfg["max_existing_child_um"]:
                 stats["distance_rejected"] += 1
-                drop.add(int(k)); continue
+                drop.add(int(k))
+                continue
             if prob < cfg["min_prob"]:
                 stats["prob_rejected"] += 1
-                drop.add(int(k)); continue
+                drop.add(int(k))
+                continue
             parent_dist = float(np.linalg.norm(p_um[parent] - p_um[q]))
             sister_dist = float(np.linalg.norm(p_um[child] - p_um[q]))
             if parent_dist > cfg["max_parent_um"] or sister_dist > cfg["max_sister_um"]:
                 stats["distance_rejected"] += 1
-                drop.add(int(k)); continue
+                drop.add(int(k))
+                continue
             if cfg["require_mutual_nn"]:
                 rows, tree = trees.get(int(frame_of[q]), (None, None))
                 if tree is None:
-                    drop.add(int(k)); continue
+                    drop.add(int(k))
+                    continue
                 # The sister is a committed child, so it is not in the tree and
                 # k=1 is the proposer's query exactly.
                 _, idx = tree.query(p_um[child])
                 if int(rows[int(idx)]) != q:
                     stats["mutual_nn_rejected"] += 1
-                    drop.add(int(k)); continue
+                    drop.add(int(k))
+                    continue
             if cfg["require_divergence"]:
                 g1, g2 = int(best_child[child]), int(best_child[q])
                 if (g1 < 0 or g2 < 0 or frame_of[g1] != t + 2 or frame_of[g2] != t + 2
                         or float(np.linalg.norm(p_um[g1] - p_um[g2])) - sister_dist
                         < cfg["diverge_um"]):
                     stats["divergence_rejected"] += 1
-                    drop.add(int(k)); continue
+                    drop.add(int(k))
+                    continue
             if cfg["symmetry_tau"] > 0:
                 denom = max((child_dist + parent_dist) / 2.0, 1e-6)
                 if abs(child_dist - parent_dist) / denom > cfg["symmetry_tau"]:
                     stats["symmetry_rejected"] += 1
-                    drop.add(int(k)); continue
+                    drop.add(int(k))
+                    continue
             proposals.append((parent_dist + 0.15 * sister_dist, t, int(k)))
 
     # The caps, applied exactly as the proposer applies them: tightest pairs

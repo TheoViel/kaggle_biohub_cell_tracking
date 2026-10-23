@@ -1,22 +1,23 @@
 # A division classifier from image crops
 
 One question about one annotated cell: **does it divide at this frame?** The
-input is what `notebooks/Divisions.ipynb` plots — a clip of crops centred on the
-cell, `n_frames` frames of time, `patch_z` z-slices each — and the output is one
-logit.
+input is a clip of crops centred on the cell, `n_frames` frames of time,
+`patch_z` z-slices each, and the output is one logit.
 
 ```bash
 cd src
-python main_division.py --iterations 2000
-torchrun --standalone --nproc_per_node=8 main_division.py --iterations 2000
+python main_division.py --iterations 2000                    # annotated cells
+python main_division.py --candidates ../logs/fork_cls/forks.npz --selected_folds '[]'
 ```
+
+The second form is the shipped one (`./train.sh forks division`): it trains on
+the forks the tracking chain proposes, see "In post-processing, part 2".
 
 ## Why this exists
 
 The fold score is `adj_edge_jaccard + 0.1 * division_jaccard`. The tracking
-chain converts about one annotated division in seven, and
-`postprocessing/README_edge.md` records what happened to every attempt at fixing
-that downstream: a hand-tuned geometric gate (+0.0114, shipped), a duplicate
+chain converts about one annotated division in seven. Every attempt at fixing
+that downstream was measured: a hand-tuned geometric gate (+0.0114, shipped), a duplicate
 merge (rejected), a fork inside the assignment (rejected — it finds 85 of 151
 divisions and drowns them in 5 289 false ones), and a classifier over candidate
 pairs (rejected — it wins on one embryo and loses on the other).
@@ -108,7 +109,7 @@ divisions or on 125.
 
 Read validation AP against `chance_ap`, never in absolute terms, and treat a
 fold that disagrees with the other as noise until shown otherwise. That has
-already happened once in this repo: `postprocessing/div_classifier.py` beat its
+already happened once in this repo: an earlier candidate classifier beat its
 baseline trained on 61 positives and collapsed trained on 12, and the pooled
 number averaged one reasonable fit with one hopeless one.
 
@@ -135,11 +136,8 @@ part 2":
 | file | what it is |
 |---|---|
 | `gen_fork_candidates.py` | every fork the chain proposes, labelled against the annotation; `FORK_CFG` is the chain config they are generated under |
-| `score_forks.py` | score them with the out-of-fold model |
-| `merge_fork_scores.py` | combine several models' scores into one table |
-| `tune_fork_threshold.py` | drop forks below tau, reprune, evaluate — this is where the gate is applied |
-| `compare_division_arms.py` | the arm-by-arm table in `logs/fork_cls/` |
-| `eval_fork_model.sh` | the four steps end to end |
+| `infer.py` | loads a trained classifier from its checkpoint |
+| `apply_fork_gate.py` | scores a post-processed graph's forks, deletes the second child of those below `--tau`, and reprunes; the inference notebook's gate |
 
 ---
 
@@ -158,7 +156,7 @@ All numbers are leave-one-embryo-out, against a positive rate (`chance_ap`) of
 
 Nine times chance on one fold, five and a half on the other, and **both folds
 learn** -- including the one with 26 training divisions, which is where the
-candidate classifier in `postprocessing/div_classifier.py` collapsed. At fold
+earlier candidate classifier collapsed. At fold
 1's operating point, 57 of the top 125 ranked cells are real divisions out of
 1 522 candidates.
 
@@ -274,20 +272,6 @@ does not move with prevalence — every setting is inside the seed band. The axi
 measures its own validation split, not the model. Compare `neg_per_pos` settings
 on AUC or not at all.
 
-#### The bug that cost the first night
-
-25 of the 71 jobs never started and left no trace. `worker.sh` expanded the
-job's arguments unquoted, so every job carrying a JSON value was torn apart by
-word-splitting and rejected by argparse *before* `prepare_log_folder` ran — exit
-2, no run directory, queue moves on at one job per second. That is precisely the
-set passing `--augmentations` or `--optimizer_config`: the entire augmentation
-arm above, plus the learning-rate block.
-
-The failure is invisible by construction — a job that fails to *start* looks
-exactly like a queue draining fast. Fixed with `eval "argv=($args)"` and a
-`failed.log` that records any job exiting non-zero inside a minute. The relaunch
-ran 43/43 with `rc=0` and an empty `failed.log`.
-
 ### Tuning found nothing better than the defaults
 
 Ten configurations, ranked by the cross-fold mean AP — but see the noise floor
@@ -316,8 +300,8 @@ The model never needed to see where the daughters landed.
 
 ### In post-processing: helps where the model is strong
 
-`main_division_predict.py` writes a per-node probability and
-`edge_pp.propose_divisions` gates on it. Against the shipped chain's +0.0114:
+A per-node probability from the classifier, scored on every detection, can
+gate `edge_pp.propose_divisions`. Against the shipped chain's +0.0114:
 
 | | 44b6 (fold-0 model, AP 0.705) | 6bba (fold-1 model, AP 0.449) |
 |---|---|---|
@@ -344,9 +328,7 @@ This is the arm that pays, and it supersedes the per-node gate above. Rather
 than scoring annotated cells and gating `propose_divisions`, it scores **the
 forks the chain actually proposes** — the ILP's, harvested with
 `ilp_div_forks` — and deletes the ones it disbelieves. Full numbers, all
-arms and every threshold, in **`logs/fork_cls/division_comparison_reprune.md`**
-(and `division_comparison.md` for the same sweep before repruning), written by
-`compare_division_arms.py` over 199 stacks.
+arms and every threshold, were measured over the 199 out-of-fold stacks.
 
 Macro, both embryos:
 
@@ -382,12 +364,9 @@ forks find 82 of 151 divisions and bring 2 309 false ones. Recall was never
 the constraint.
 
 Caveats. One seed, and the noise floor above applies. The reprune arm is
-measured at a single tau. `Summary.md`'s division section still reports the
-pre-reprune +0.0030 with 6bba flat, so it contradicts this table and is the
-stale copy. And no end-to-end CLI run has written a `scores_pp.json` for this
-variant — the gate lives in `tune_fork_threshold.py`, not in
-`main_edge_postprocess.py`, so it is not yet reachable from the production
-chain.
+measured at a single tau. In production the gate is `apply_fork_gate.py`, run
+after `main_edge_postprocess.py --ilp_div_forks` with `--reprune` set to the
+chain's `min_track`.
 
 ### Synthetic divisions hurt
 
@@ -415,7 +394,6 @@ positives.
 
 **What would make it work.** Measure real dividing cells the way `SISTER_UM` was
 measured: elongation, intensity profile along the division axis, how separated
-the two kernels are at the frame the annotation names.
-`notebooks/Divisions.ipynb` already locates and renders all 151 of them, so the
-population is in hand. Until `_lobe` is driven by that, generated divisions are
+the two kernels are at the frame the annotation names. All 151 are located by
+the annotation, so the population is in hand. Until `_lobe` is driven by that, generated divisions are
 a liability rather than an asset, whatever their count.

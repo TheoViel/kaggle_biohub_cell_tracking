@@ -2,8 +2,8 @@
 
 The modules here import each other by bare name (``from relink import relink``)
 so that every script in this directory can also be run directly. Importing the
-package the ordinary way — ``from postprocessing.pipeline import postprocess``,
-as the notebook would — therefore needs this directory on the path too, which is
+package the ordinary way — ``from postprocessing.pipeline import postprocess``
+— therefore needs this directory on the path too, which is
 what the line below does.
 
 Typical use:
@@ -12,7 +12,7 @@ Typical use:
     coords, edges = postprocess(coords, edges)
 
 or, for the whole tuned chain including tracking.pp_public, see
-``src/main_postprocess.py`` and ``postprocess_npz.py``.
+``src/main_postprocess.py``.
 """
 
 import sys

@@ -16,7 +16,6 @@ to ``<log_folder>/geff_pp``).
 
 import argparse
 import csv
-import sys
 from pathlib import Path
 
 import tracksdata as td

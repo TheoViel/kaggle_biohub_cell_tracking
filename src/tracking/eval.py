@@ -249,14 +249,16 @@ def evaluate(
             names = batch["name"]
             if any(name not in fts_cache for name in names):
                 fresh = encode_nodes(
-                    model, imgs, coords, masks, image_shape, voxel_size, args, nms=args.nms, nms_radius_um=args.nms_radius_um,
+                    model, imgs, coords, masks, image_shape, voxel_size, args,
+                    nms=args.nms, nms_radius_um=args.nms_radius_um,
                 )[0]
                 for b, name in enumerate(names):
                     fts_cache[name] = split_frame_det(fresh, b)
             frame_det = collate_frame_det([fts_cache[n] for n in names])
         else:
             frame_det = encode_nodes(
-                model, imgs, coords, masks, image_shape, voxel_size, args, nms=args.nms, nms_radius_um=args.nms_radius_um,
+                model, imgs, coords, masks, image_shape, voxel_size, args,
+                nms=args.nms, nms_radius_um=args.nms_radius_um,
             )[0]
 
         names = [_sample_name(n) for n in batch["name"]]

@@ -1,10 +1,11 @@
 """Render a short GIF of the pipeline's output on one stack: pick a cell, follow it over time.
 
-    .venv/bin/python scripts/make_pipeline_gif.py --sample 6bba_32db13fc --t0 0 --cell 182,168 --out assets/pipeline_demo.gif
+    .venv/bin/python scripts/make_pipeline_gif.py --sample 6bba_32db13fc --t0 0 \
+        --cell 182,168 --out assets/pipeline_demo.gif
 
-Styled like webapp/trajectory_viewer.py: one z slice, detections within a z
-tolerance drawn as dots faded by their distance to the slice, and the track
-drawn backwards from the current frame. Needs only the stack and a predicted geff.
+One z slice, detections within a z tolerance drawn as dots faded by their
+distance to the slice, and the track drawn backwards from the current frame.
+Needs only the stack and a predicted geff.
 """
 import argparse
 import sys
@@ -80,21 +81,27 @@ class Scene:
         sl = self.stack[k, z].astype(float)
         lo, hi = np.percentile(sl, [1, 99.7])  # per-slice stretch: deeper slices are much dimmer
         im = np.clip((sl - lo) / (hi - lo), 0, 1) ** 0.8
-        return np.round(im * 95) / 95  # 96 gray levels leave room in a GIF's 256-colour palette for the overlay colours
+        # 96 gray levels leave room in a GIF's 256-colour palette for the overlay colours.
+        return np.round(im * 95) / 95
 
-    def frame(self, k, center, half, z=None, rings=True, trail_to=None, selected=True, caption="", label=True, full_track=False):
+    def frame(self, k, center, half, z=None, rings=True, trail_to=None, selected=True,
+              caption="", label=True, full_track=False):
         """Render timepoint index k, cropped to center (y, x) +- half pixels."""
         ax = self.ax
-        ax.clear(); ax.set_facecolor(BG); ax.axis("off")
+        ax.clear()
+        ax.set_facecolor(BG)
+        ax.axis("off")
         z = self.track[k, 0] if z is None else z
         ax.imshow(self.image(k, z), cmap="gray", vmin=0, vmax=1, interpolation="bilinear")
-        ax.set_xlim(center[1] - half, center[1] + half); ax.set_ylim(center[0] + half, center[0] - half)
+        ax.set_xlim(center[1] - half, center[1] + half)
+        ax.set_ylim(center[0] + half, center[0] - half)
         if rings and (self.t0 + k) in self.by_t:
             d = self.by_t[self.t0 + k]
             dz = np.abs(d[:, 0] - z)
             keep = dz <= Z_TOL
             fade = 1 - 0.7 * (dz[keep] / Z_TOL)
-            ax.scatter(d[keep, 2], d[keep, 1], s=34, color=SKY, edgecolors=DODGER, linewidths=0.9, alpha=fade.clip(0.3, 1), zorder=4)
+            ax.scatter(d[keep, 2], d[keep, 1], s=34, color=SKY, edgecolors=DODGER,
+                       linewidths=0.9, alpha=fade.clip(0.3, 1), zorder=4)
         end = k if trail_to is None else trail_to
         if selected:
             tr = self.track[:end + 1]
@@ -102,15 +109,19 @@ class Scene:
                 ax.plot(tr[:, 2], tr[:, 1], color=ORANGE, lw=2.2, alpha=0.45, solid_capstyle="round", zorder=5)
             ax.scatter(*tr[-1, [2, 1]], s=120, color=ORANGE, edgecolors="white", linewidths=1.4, zorder=7)
         # overlays
-        ax.text(0.03, 0.965, f"t = {self.t0 + k}" if label else "", transform=ax.transAxes, color="white", fontsize=15, fontweight="bold", va="top",
+        ax.text(0.03, 0.965, f"t = {self.t0 + k}" if label else "", transform=ax.transAxes,
+                color="white", fontsize=15, fontweight="bold", va="top",
                 bbox=dict(boxstyle="round,pad=0.3", fc="#000000aa", ec="none"))
         if caption:
-            ax.text(0.5, 0.035, caption, transform=ax.transAxes, color="white", fontsize=14, fontweight="bold", ha="center", va="bottom",
+            ax.text(0.5, 0.035, caption, transform=ax.transAxes, color="white", fontsize=14,
+                    fontweight="bold", ha="center", va="bottom",
                     bbox=dict(boxstyle="round,pad=0.45", fc="#000000b8", ec="none"))
         bar_px = 20 / SCALE[1]
-        x1 = 1 - 0.04; x0 = x1 - bar_px / (2 * half)
+        x1 = 1 - 0.04
+        x0 = x1 - bar_px / (2 * half)
         ax.plot([x0, x1], [0.145, 0.145], transform=ax.transAxes, color="white", lw=3)
-        ax.text((x0 + x1) / 2, 0.16, "20 µm", transform=ax.transAxes, color="white", fontsize=10, ha="center", va="bottom")
+        ax.text((x0 + x1) / 2, 0.16, "20 µm", transform=ax.transAxes, color="white",
+                fontsize=10, ha="center", va="bottom")
         self.fig.canvas.draw()
         return np.asarray(self.fig.canvas.buffer_rgba())[..., :3].copy()
 
@@ -126,7 +137,10 @@ def _palette():
     trail = 0.45 * orange + 0.55 * gray            # the trail is drawn at alpha 0.45
     extra = np.array([orange, np.array(to_rgb(SKY)) * 255, np.array(to_rgb(DODGER)) * 255, to_rgb(BG)], dtype=float)
     extra[3] = np.array(to_rgb(BG)) * 255
-    blend = np.concatenate([0.5 * np.array(to_rgb(SKY)) * 255 + 0.5 * gray[::4], 0.5 * np.array(to_rgb(DODGER)) * 255 + 0.5 * gray[::4]])
+    blend = np.concatenate([
+        0.5 * np.array(to_rgb(SKY)) * 255 + 0.5 * gray[::4],
+        0.5 * np.array(to_rgb(DODGER)) * 255 + 0.5 * gray[::4],
+    ])
     pal = np.concatenate([gray, trail, extra, blend])[:256]
     return np.vstack([pal, np.zeros((256 - len(pal), 3))])
 
@@ -163,7 +177,8 @@ def main():
     frames, dur = [], []
 
     def add(img, d):
-        frames.append(img); dur.append(d)
+        frames.append(img)
+        dur.append(d)
 
     z0 = sc.track[0, 0]
     # 1. the raw stack, 2. detections on it
@@ -175,7 +190,9 @@ def main():
         u = (1 - np.cos(np.pi * i / n_zoom)) / 2
         ctr = (1 - u) * np.array(full_c) + u * c0
         half = (1 - u) * full_half + u * a.half
-        add(sc.frame(0, ctr, half, z=z0, rings=True, selected=True, caption="Pick a cell" if i < n_zoom else ""), 1.0 if i == 0 else (0.07 if i < n_zoom else 0.5))
+        caption = "Pick a cell" if i < n_zoom else ""
+        add(sc.frame(0, ctr, half, z=z0, rings=True, selected=True, caption=caption),
+            1.0 if i == 0 else (0.07 if i < n_zoom else 0.5))
     # 4. follow it, centered on the cell
     for k in range(1, a.steps + 1):
         add(sc.frame(k, sc.track[k, 1:], a.half, caption="Follow it over time"), 0.4)
@@ -185,13 +202,18 @@ def main():
         u = (1 - np.cos(np.pi * i / n_zoom)) / 2
         ctr = (1 - u) * sc.track[kk, 1:] + u * np.array(full_c)
         half = (1 - u) * a.half + u * full_half
-        add(sc.frame(kk, ctr, half, rings=True, caption="Its trajectory" if i == n_zoom else ""), 0.07 if i < n_zoom else a.hold / a.slow)
+        caption = "Its trajectory" if i == n_zoom else ""
+        add(sc.frame(kk, ctr, half, rings=True, caption=caption),
+            0.07 if i < n_zoom else a.hold / a.slow)
     if a.preview:
         for i in (1, 2, 11, 25, 40, len(frames) - 1):
-            imageio.imwrite(f"/tmp/claude-0/-data-kaggle-biohub-cell-tracking/d8f3b20c-37c1-4368-bd7e-8f5ecc353d5b/scratchpad/prev_{i}.png", frames[i])
-        print(len(frames), "frames"); return
+            out = Path(a.out)
+            imageio.imwrite(out.with_name(f"{out.stem}_preview_{i}.png"), frames[i])
+        print(len(frames), "frames")
+        return
     pal = [indexed(f) for f in frames]
-    pal[0].save(a.out, save_all=True, append_images=pal[1:], duration=[int(d * a.slow * 1000) for d in dur], loop=0, optimize=False)
+    pal[0].save(a.out, save_all=True, append_images=pal[1:],
+                duration=[int(d * a.slow * 1000) for d in dur], loop=0, optimize=False)
     print(a.out, len(frames), "frames", sum(dur) * a.slow, "s")
 
 

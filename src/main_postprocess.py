@@ -115,12 +115,12 @@ from tracking_cellmot.metrics import (  # noqa: E402
     summarise,
 )
 
-# Tuned on a 10-stack subset spanning the difficulty range; src/postprocessing/exp_pp_public.py.
+# Tuned on a 10-stack subset spanning the difficulty range.
 #
 # safe_divisions is pp_public's own division repair, and it is off because the
 # `divisions` stage below is the same 946 repair with the gates it lacks. Left
 # on it ran 1 true positive against 51 false ones over the 71 stacks of
-# 2026-09-09/2 -- see src/postprocessing/exp_divisions_pp.py.
+# 2026-09-09/2.
 PP_PUBLIC_TUNED = dict(
     filter_short_tracks=1, min_track_len=4, relink_tight_um=6.5, safe_divisions=0,
 )
@@ -449,7 +449,6 @@ def process(job):
     data = np.load(path, allow_pickle=True)
     coords = data["coords"].astype(np.int64)
     edges = data["edges"].astype(np.float64).reshape(-1, 4)
-    n_in = (len(coords), len(edges))
 
     if not cfg["no_pipeline"]:
         coords, edges = run_pipeline(
@@ -599,7 +598,8 @@ def main():
         for i, (sample, row) in enumerate(
             pool.imap_unordered(process, [(str(p), cfg) for p in paths], chunksize=1)
         ):
-            score = f"node_recall={row['node_recall']:.3f}  adj_edge_jaccard={row['adj_edge_jaccard']:.3f}" if row else ""
+            score = (f"node_recall={row['node_recall']:.3f}  "
+                     f"adj_edge_jaccard={row['adj_edge_jaccard']:.3f}") if row else ""
             print(f"[{i + 1:>3d}/{len(paths)}] {sample:<16s} - {score}", flush=True)
             if row:
                 rows.append(row)

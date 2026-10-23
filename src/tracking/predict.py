@@ -7,7 +7,7 @@ import torch
 import zarr
 from tqdm import tqdm
 
-from model_zoo.models_track import UNetNodeTransformer, define_track_model
+from model_zoo.models_track import UNetNodeTransformer
 from tracking.post_process import detect_cells_multi_threshold, pool_kernel_from_um
 from tracking.targets import pos_embed_numpy
 from tracking.data import frame_anchors, resolve_normalization
@@ -197,10 +197,6 @@ def _load_frame_np(zarr_arr, t: int) -> np.ndarray:
     """
     return zarr_arr[t].astype(np.float32)
 
-
-def _load_frame(zarr_arr, t: int) -> torch.Tensor:
-    """Load one full-resolution frame from zarr (no normalisation)."""
-    return torch.from_numpy(_load_frame_np(zarr_arr, t))
 
 
 def _split_prepared_frames(prepared, keys: Sequence[int]) -> dict[int, tuple]:
@@ -475,7 +471,7 @@ def _rescale_coords(
     Multiplying by s alone leaves every detection (s - 1) / 2 voxels short: at
     the configured (1, 4, 4) grid that is a fixed -1.5 voxel (-0.61 um) error
     in y and x, which measures out at -0.59 and -0.54 um against the
-    annotation (postprocessing/check_centring.py). Correcting it moves the
+    annotation. Correcting it moves the
     run-level adjusted Jaccard from 0.8065 to 0.8130.
 
     With an offset head the guess stops being the middle of the span: the

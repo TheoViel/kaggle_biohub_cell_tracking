@@ -13,50 +13,6 @@ import torch.nn.functional as F
 # Segmentation augmentations
 # ---------------------------------------------------------------------------
 
-def random_crop_seg(
-    img: np.ndarray,
-    fg: np.ndarray,
-    heatmap: np.ndarray,
-    offsets: np.ndarray,
-    fg_mask: np.ndarray,
-    patch_size: tuple[int, int, int],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    D, H, W = img.shape[-3:]
-    pd, ph, pw = patch_size
-    z0 = np.random.randint(0, max(1, D - pd))
-    y0 = np.random.randint(0, max(1, H - ph))
-    x0 = np.random.randint(0, max(1, W - pw))
-    s = np.s_[z0:z0+pd, y0:y0+ph, x0:x0+pw]
-    return (
-        img[(slice(None),) + s], fg[s], heatmap[s],
-        offsets[:, z0:z0+pd, y0:y0+ph, x0:x0+pw],
-        fg_mask[s],
-    )
-
-
-def augment_seg(
-    img: np.ndarray,
-    fg: np.ndarray,
-    heatmap: np.ndarray,
-    offsets: np.ndarray,
-    fg_mask: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    for axis in range(3):
-        if np.random.random() > 0.5:
-            img = np.flip(img, axis=axis + 1).copy()
-            fg = np.flip(fg, axis=axis).copy()
-            heatmap = np.flip(heatmap, axis=axis).copy()
-            offsets = np.flip(offsets, axis=axis + 1).copy()
-            fg_mask = np.flip(fg_mask, axis=axis).copy()
-            # Flipping spatial axis flips that offset component's sign
-            offsets[axis] = -offsets[axis]
-
-    scale = 1.0 + 0.15 * np.random.randn()
-    shift = 0.05 * np.random.randn()
-    img = np.clip(img * scale + shift, 0.0, 1.0)
-
-    return img, fg, heatmap, offsets, fg_mask
-
 
 # ---------------------------------------------------------------------------
 # Tracking augmentations
