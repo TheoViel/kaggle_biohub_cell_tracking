@@ -421,18 +421,3 @@ def gen_volume_native(
     return vol, vol_p, cens, cens_p, instance_mask
 
 
-def _cell_radius_um(vol_pooled, dets):
-    """APPARENT radius (half-maximum) of each detected cell, in um."""
-    EFF = VOXEL_NATIVE[0]  # pooled ~ isotropic 1.625 um/voxel
-    out = []
-    for c in np.atleast_2d(dets).astype(int):
-        z, y, x = c[:3]
-        sub = vol_pooled[z, max(0, y - 6):y + 7, max(0, x - 6):x + 7]
-        if sub.size < 9:
-            continue
-        pk = float(sub.max())
-        if pk <= 1e-3:
-            continue
-        area = float((sub > 0.5 * pk).sum())
-        out.append(np.sqrt(area / np.pi) * EFF)
-    return np.array(out, np.float32)

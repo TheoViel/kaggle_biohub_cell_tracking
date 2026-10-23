@@ -8,7 +8,6 @@ from pathlib import Path
 
 from tracking_cellmot.io import open_dataset, invert_time_graph
 
-from tracking.targets import compute_gt_transition_matrix
 
 # ---------------------------------------------------------------------------
 # Data structures (mirrors biohub FrameWindowData / VideoMeta)
@@ -221,23 +220,6 @@ def frame_anchors(frame: np.ndarray, norm: dict) -> tuple[float, float]:
     lo, hi = np.quantile(sub, [float(norm["low_q"]), float(norm["high_q"])])
     return float(lo), float(hi)
 
-
-def normalize_frames(frames, norm: dict, quantiles: dict | None = None) -> np.ndarray:
-    """Normalise raw (N, Z, Y, X) frames per a resolved config.
-
-    The one entry point for anything outside the train/predict loops, so a
-    consumer cannot silently pin a different anchor pair than the model was
-    trained with. `quantiles` is the zarr attr dict, needed only for
-    scope="video".
-    """
-    frames = np.asarray(frames, dtype=np.float32)
-    if norm["scope"] == "frame":
-        return np.stack(
-            [apply_normalization(f, *frame_anchors(f, norm), norm) for f in frames]
-        )
-    lo = float(quantiles[norm["low_q"]])
-    hi = float(quantiles[norm["high_q"]])
-    return apply_normalization(frames, lo, hi, norm)
 
 
 def apply_normalization(arr, lo: float, hi: float, norm: dict):

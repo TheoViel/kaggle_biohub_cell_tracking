@@ -47,10 +47,10 @@ from utils.logger import create_logger, prepare_log_folder
 
 DEFAULTS = {
     # Global
-    # Detections + NETr embeddings: scripts/ensemble_detectors.py, then
+    # Detections + NETr embeddings: scripts/merge_detectors.py, then
     # inference_contrastive.py over the same folder.
-    "nodes_folder": "../ensemble/v16_2026-09-26_1_eduardo_current_mean3_append_b0.45_a0.35_d7",
-    "embeddings_key": "embeddings_contrastive_2026-09-26_0",
+    "nodes_folder": "../ensemble/v4_2026-09-13_1_2026-09-24_5_append_b0.45_a0.40_d7",
+    "embeddings_key": "embeddings_contrastive_2026-09-09_1",
 
     "data_dir": TRAIN_DIR,
     "selected_folds": [0, 1],
@@ -100,7 +100,9 @@ DEFAULTS = {
     "use_edge_feats": True,         # distance / similarity / rank features
     # Rotary positions
     "pos_scale": 20.0,  # unit the coordinates are divided by;
-    "min_wavelength_um": 4.0,  # the frequency set is initialised to span these two wavelengths and is learnable from there.
+    # The frequency set is initialised to span these two wavelengths, and is
+    # learnable from there.
+    "min_wavelength_um": 4.0,
     "max_wavelength_um": 200.0,
     "attn_max_distance_um": 40.0,  # Wider than the candidate radius - an edge should see the neighbourhood
     # The published model's Householder reflection on q and k. The same

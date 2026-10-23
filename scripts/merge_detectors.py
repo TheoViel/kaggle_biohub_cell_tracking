@@ -9,13 +9,13 @@ Distances are physical (``params.SCALE``). ``d_add`` should not go below the
 NMS radius the predictions were made at: appending a node closer than that
 recreates exactly the pair the base model's own NMS removed.
 
-The node set the shipped edge model was trained on (v16):
+The node set the shipped edge model was trained on (v4):
 
     python scripts/merge_detectors.py \
-        --base logs/2026-09-26/1/preds_r6_0.30 \
-        --add logs/eduardo_current_mean3/preds_r6_0.05 \
-        --cfg 0.45 0.35 7 \
-        --out ensemble/v16_2026-09-26_1_eduardo_current_mean3_append_b0.45_a0.35_d7
+        --base logs/2026-09-13/1/preds_r6_0.30 \
+        --add logs/2026-09-24/5/preds_r6_0.30 \
+        --cfg 0.45 0.40 7 \
+        --out ensemble/v4_2026-09-13_1_2026-09-24_5_append_b0.45_a0.40_d7
 
 Every per-node array present in both sources (node_probs, annot_probs,
 coords_f, ...) is carried over from whichever model contributed the node.

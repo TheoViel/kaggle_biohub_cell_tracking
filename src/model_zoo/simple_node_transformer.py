@@ -6,8 +6,6 @@ import warnings
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint as grad_ckpt
 
 
 @torch.no_grad()
@@ -344,7 +342,6 @@ class SimpleNodeTransformer(nn.Module):
         the physical voxel size threaded in here.
         """
         B, n_t = coords_t.shape[:2]
-        n_t1 = coords_t1.shape[1]
         k = min(self.knn_k, n_t)
 
         d = torch.cdist(coords_t1.float(), coords_t.float())   # (B, N_t1, N_t)

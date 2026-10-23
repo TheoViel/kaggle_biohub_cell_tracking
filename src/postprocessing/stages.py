@@ -13,7 +13,6 @@ import os
 
 import numpy as np
 import tracksdata as td
-from scipy.optimize import linear_sum_assignment
 
 from common import to_graph
 from params import SCALE
@@ -25,56 +24,6 @@ SCALE_ARR = np.asarray(SCALE)
 # --------------------------------------------------------------------------
 # zero-division prior
 # --------------------------------------------------------------------------
-
-def cap_children(coords, edges, mode="best"):
-    """Leave every node at most one child.
-
-    The annotation contains 26 dividing nodes in 19 826 edges across the whole
-    validation set, so forbidding divisions can cost at most 0.13% of the
-    recoverable links — while 7.7% of predicted edges are second children, and
-    every one of those that touches an annotated cell is a false positive.
-
-    mode="best"   : keep each parent's most confident child.
-    mode="assign" : solve each frame pair as a one-to-one assignment on
-                    probability, so a child whose only good parent is taken can
-                    still keep it and the loser falls to its own second choice.
-    """
-    edges = np.asarray(edges, dtype=float).reshape(-1, 4)
-    if len(edges) == 0:
-        return coords, edges
-
-    if mode == "best":
-        order = np.argsort(-edges[:, 2], kind="stable")
-        seen = set()
-        keep = np.zeros(len(edges), bool)
-        for i in order:
-            src = int(edges[i, 0])
-            if src not in seen:
-                seen.add(src)
-                keep[i] = True
-        return coords, edges[keep]
-
-    coords = np.asarray(coords)
-    src_t = coords[edges[:, 0].astype(int), 0].astype(int)
-    keep = np.zeros(len(edges), bool)
-    for t in np.unique(src_t):
-        idx = np.flatnonzero(src_t == t)
-        parents = np.unique(edges[idx, 0].astype(int))
-        children = np.unique(edges[idx, 1].astype(int))
-        pi = {p: i for i, p in enumerate(parents)}
-        ci = {c: i for i, c in enumerate(children)}
-        # Maximise total probability; absent pairs must never be chosen.
-        cost = np.full((len(parents), len(children)), 1.0)
-        where = {}
-        for i in idx:
-            a, b = pi[int(edges[i, 0])], ci[int(edges[i, 1])]
-            cost[a, b] = -edges[i, 2]
-            where[(a, b)] = i
-        rows, cols = linear_sum_assignment(cost)
-        for a, b in zip(rows, cols):
-            if (a, b) in where:
-                keep[where[(a, b)]] = True
-    return coords, edges[keep]
 
 
 # --------------------------------------------------------------------------
@@ -130,7 +79,6 @@ PP_PUBLIC_ENV = {
     "linefit": "BIOHUB_OUTPUT_LINEFIT_SMOOTH",
     "linefit_weight": "BIOHUB_OUTPUT_LINEFIT_WEIGHT",
     "edge_max_um": "BIOHUB_OUTPUT_EDGE_MAX_UM",
-    "gap_refine": "BIOHUB_GAP_REFINE_SYNTHETIC",
     "prune_isolated": "BIOHUB_OUTPUT_PRUNE_ISOLATED",
     "relink_tight_um": "BIOHUB_MOTION_RELINK_TIGHT_UM",
     "relink_relaxed_um": "BIOHUB_MOTION_RELINK_RELAXED_UM",
@@ -162,7 +110,7 @@ PP_PUBLIC_DEFAULTS = {
     "gap_close": 1, "gap2": 1, "safe_divisions": 1,
     "division_geometry_filter": 0, "filter_short_tracks": 0, "min_track_len": 4,
     "linefit": 1, "linefit_weight": 0.74, "edge_max_um": 14.2,
-    "gap_refine": 0, "prune_isolated": 1,
+    "prune_isolated": 1,
     "relink_tight_um": 5.95, "relink_relaxed_um": 10.0, "relink_learned_bonus": 0.76,
     "gap_close_um": 5.9, "gap_close_reuse_um": 3.1, "gap_close_max_gap": 1,
     "gap2_max_step_um": 4.0, "gap2_max_total_um": 9.5, "gap2_require_context": 1,
@@ -241,7 +189,3 @@ def run_divisions(coords, edges, cand=None, **kw):
     return coords, propose_divisions(coords, edges, cand, **kw)
 
 
-def run_suppress(coords, edges, **kw):
-    """Restore the detector's per-frame spacing floor; see suppress.py."""
-    from suppress import suppress_rivals
-    return suppress_rivals(coords, edges, **kw)

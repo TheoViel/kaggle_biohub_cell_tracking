@@ -52,8 +52,7 @@ PERSISTENCE = 0.30
 # value here was 7.24 and produced a median of 6.82, with 54% of pairs closer
 # than the detector's 7 um NMS radius against 15% in the real data -- so over
 # half of the generated divisions were teaching a configuration that cannot
-# survive its own detector. See the "Divisions" section of
-# notebooks/SyntheticData.ipynb.
+# survive its own detector.
 # 12.4, not the 10.57 measured: the collision check rejects the widest draws
 # (a daughter placed further out is likelier to overlap a neighbour), so the
 # realised median comes out ~15% below the drawn one. At 10.6 the generated

@@ -1,8 +1,7 @@
 """
 Run tracking inference over every validation stack of a fold, in parallel.
 
-Mirrors notebooks/TrackingInf.ipynb up to (not including) the "ILP PP"
-section: predict_video -> build_graph -> evaluate, per sample.
+predict_video -> build_graph -> evaluate, per sample.
 
 Predictions land in <log_folder>/preds/<sample>.npz (coords + edges), with
 per-sample metrics in <log_folder>/preds/metrics.csv and a run-level summary
@@ -35,7 +34,6 @@ Multi-GPU (one process per GPU, videos sharded across ranks):
 
 import argparse
 import contextlib
-import glob
 import io
 import json
 import os
@@ -219,98 +217,6 @@ def _jsonable(obj):
         return float(obj)
     return obj
 
-
-def _reconcile_arch(cfg, state, verbose=False):
-    """Infer architecture switches from the weights themselves.
-
-    args.json only records the flags that existed when the run was launched,
-    so a checkpoint trained before a flag was added would be rebuilt with
-    today's default and fail to load. The layer shapes are unambiguous, so
-    read them instead of trusting the defaults.
-    """
-    hidden = getattr(cfg, "transformer_hidden", 128)
-
-    w = state.get("transformer.pair_mlp.0.weight")
-    if w is not None:
-        n_extra = w.shape[1] - (2 * hidden + 3)
-        geom = n_extra >= 4
-        if geom != getattr(cfg, "edge_geom_feats", True):
-            if verbose:
-                print(f"-> edge_geom_feats={geom} (inferred from pair_mlp "
-                      f"in_features={w.shape[1]})")
-            cfg.edge_geom_feats = geom
-
-    # Whether the contrastive branch exists is unambiguous in the weights, and
-    # it decides how wide the node features are — so reconcile it before using
-    # that width to infer pos_feat_dim.
-    has_embed = any(k.startswith("embed_unet.") for k in state)
-    features = list(getattr(cfg, "unet_features", ["detection"]) or [])
-    if has_embed and "contrastive" not in features:
-        features.append("contrastive")
-    elif not has_embed and "contrastive" in features:
-        features.remove("contrastive")
-    if features != list(getattr(cfg, "unet_features", ["detection"]) or []):
-        if verbose:
-            print(f"-> unet_features={features} (embed_unet weights "
-                  f"{'present' if has_embed else 'absent'})")
-        cfg.unet_features = features
-
-    contrastive = getattr(cfg, "contrastive", None) or {}
-    widths = {
-        "detection": getattr(cfg, "unet_out_channels", 32),
-        "contrastive": contrastive.get("embed_dim", 32),
-    }
-    node_feat_dim = sum(widths[f] for f in features)
-
-    w = state.get("transformer.proj.weight")
-    if w is not None:
-        pos_dim = w.shape[1] - node_feat_dim
-        if pos_dim < 0:
-            raise ValueError(
-                f"transformer.proj expects {w.shape[1]} inputs but unet_features "
-                f"{features} account for {node_feat_dim}; the checkpoint was "
-                "trained with a different node-feature composition"
-            )
-        if pos_dim != getattr(cfg, "pos_feat_dim", 0):
-            if verbose:
-                print(f"-> pos_feat_dim={pos_dim} (inferred from proj "
-                      f"in_features={w.shape[1]} minus node features {node_feat_dim})")
-            cfg.pos_feat_dim = pos_dim
-
-    # The offset head is a later addition, so a checkpoint predating it has no
-    # such weights and must be rebuilt without one. Its radius is not in the
-    # weights — it only bounds the output — so args.json stays the source for
-    # that, defaulting to what the head was introduced with.
-    has_offset = any(k.startswith("offset_head.") for k in state)
-    if has_offset != bool(getattr(cfg, "offset_head", False)):
-        if verbose:
-            print(f"-> offset_head={has_offset} (offset_head weights "
-                  f"{'present' if has_offset else 'absent'})")
-        cfg.offset_head = has_offset
-
-    # The annotation head is a later addition too, and it is optional, so a
-    # checkpoint from before it existed has no such weights and must be rebuilt
-    # without one.
-    has_annot = any(k.startswith("annot_head.") for k in state)
-    if has_annot != bool(getattr(cfg, "annot_head", False)):
-        if verbose:
-            print(f"-> annot_head={has_annot} (annot_head weights "
-                  f"{'present' if has_annot else 'absent'})")
-        cfg.annot_head = has_annot
-
-    # Likewise for the extra decoder branch feeding the fine detection head. The
-    # count is the number of blocks that were built, which the weights name
-    # directly (unet.fine_decoder_blocks.<i>...), so it is read rather than
-    # trusted from args.json.
-    n_extra = len({
-        k.split(".")[2] for k in state if k.startswith("unet.fine_decoder_blocks.")
-    })
-    if n_extra != int(getattr(cfg, "unet_n_extra_decode_steps", 0) or 0):
-        if verbose:
-            print(f"-> unet_n_extra_decode_steps={n_extra} (inferred from "
-                  f"unet.fine_decoder_blocks weights)")
-        cfg.unet_n_extra_decode_steps = n_extra
-    return cfg
 
 
 def _print_sweep(summaries: dict, per_embryo: dict | None = None):

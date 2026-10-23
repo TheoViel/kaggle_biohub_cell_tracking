@@ -11,27 +11,8 @@ main_precompute_weak.py) rather than recomputed for every sampled window.
 
 from __future__ import annotations
 
-import numpy as np
 import torch
-import torch.nn.functional as F
 
-
-def _box_max_pool(x: torch.Tensor, kernel: tuple[int, int, int]) -> torch.Tensor:
-    """Box max-pool, stride 1, applied as three 1-D passes.
-
-    max over a box factorises into max over each axis in turn, which costs
-    kz+ky+kx comparisons per voxel instead of kz*ky*kx. For the (3, 13, 13)
-    kernel a 5 um radius implies at full resolution that is ~17x less work,
-    and it dominates dataloader time.
-    """
-    kz, ky, kx = kernel
-    if kx > 1:
-        x = F.max_pool3d(x, (1, 1, kx), stride=1, padding=(0, 0, kx // 2))
-    if ky > 1:
-        x = F.max_pool3d(x, (1, ky, 1), stride=1, padding=(0, ky // 2, 0))
-    if kz > 1:
-        x = F.max_pool3d(x, (kz, 1, 1), stride=1, padding=(kz // 2, 0, 0))
-    return x
 
 
 def greedy_nms(

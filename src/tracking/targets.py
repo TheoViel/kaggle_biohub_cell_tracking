@@ -9,7 +9,6 @@ Provides:
 from __future__ import annotations
 
 import numpy as np
-import polars as pl
 import torch
 
 from tracking.post_process import pool_kernel_from_um
@@ -73,26 +72,6 @@ def pos_embed_torch(
         parts.extend([angles.sin(), angles.cos()])
     return torch.cat(parts, dim=-1)
 
-
-def compute_gt_transition_matrix(
-    gt_ids_t: np.ndarray,
-    gt_ids_t1: np.ndarray,
-    edge_attrs: pl.DataFrame,
-) -> torch.Tensor:
-    """Build GT transition matrix as a float32 torch tensor.
-
-    Returns
-    -------
-    torch.Tensor  shape (N_t, N_t1), float32 binary.
-    """
-    t_to_row = {nid: i for i, nid in enumerate(gt_ids_t)}
-    t1_to_col = {nid: i for i, nid in enumerate(gt_ids_t1)}
-
-    matrix = torch.zeros(len(gt_ids_t), len(gt_ids_t1), dtype=torch.float32)
-    for source_id, target_id in zip(edge_attrs["source_id"], edge_attrs["target_id"]):
-        if source_id in t_to_row and target_id in t1_to_col:
-            matrix[t_to_row[source_id], t1_to_col[target_id]] = 1.0
-    return matrix
 
 
 def build_detection_target(
@@ -400,7 +379,6 @@ def detect_and_match(
                 if not gt_taken[gi]:
                     matched[idx] = gi
                     gt_taken[gi] = True
-                    # print('ok ( gi: ', gi, ' idx: ', idx, ' min_d: ', min_d[idx], ' max_match_distance: ', max_match_distance, ')')
 
         sample_matches.append(matched)
         sample_coords.append(det_b)

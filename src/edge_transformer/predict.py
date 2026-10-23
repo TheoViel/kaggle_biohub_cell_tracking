@@ -41,7 +41,7 @@ def fuse_directions(
     Averaging happens twice, and the two are not the same question. Several
     windows may cover the same frame pair (``window_size > 2``), and those are
     the same model asked the same way under different context -- so they are
-    meaned within a direction. The two *directions* are the model asked
+    averaged within a direction. The two *directions* are the model asked
     differently, and how to combine those is the choice ``mode`` makes:
 
     ``"mean"``      the weighted arithmetic mean, which is what plain averaging
@@ -150,7 +150,7 @@ def score_video(
     was_training = model.training
     model.eval()
     # Forward and reversed readings kept apart: several windows may cover one
-    # frame pair and those are meaned within a direction, while the two
+    # frame pair and those are averaged within a direction, while the two
     # directions are combined by `fuse_directions`, which is a different rule.
     total: dict[tuple[int, int], tuple[list[float], list[float]]] = {}
     dist_of: dict[tuple[int, int], float] = {}

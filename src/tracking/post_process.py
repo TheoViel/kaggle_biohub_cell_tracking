@@ -196,34 +196,6 @@ def _stamp_time(peak_idx: torch.Tensor, t: int) -> np.ndarray:
     return np.concatenate([t_col, coords], axis=1).astype(np.int16)
 
 
-def detect_cells_pooled(
-    probas: torch.Tensor,   # (1, Z, Y, X) or (Z, Y, X) raw probabilities
-    t: int,
-    det_threshold: float = 0.5,
-    nms: str = "maxpool",
-    pool_kernel: tuple[int, ...] | None = None,
-    voxel_size: tuple[float, float, float] | None = None,
-    nms_radius_um: float | None = None,
-) -> np.ndarray:
-    """Extract cell coordinates via local-max suppression, prefixed with time.
-
-    ``nms="maxpool"`` uses the stride-1 max-pool kernel; ``nms="greedy"`` runs
-    greedy NMS at an exact ``nms_radius_um`` instead, which needs
-    ``voxel_size`` for the detection grid.
-
-    Returns
-    -------
-    np.ndarray  (N, 4) int16 with columns [t, z, y, x] in downsampled space.
-    """
-    if probas.dim() == 4:
-        probas = probas[0]
-
-    peak_idx = _peak_indices(
-        probas, det_threshold, nms=nms, pool_kernel=pool_kernel,
-        voxel_size=voxel_size, nms_radius_um=nms_radius_um,
-    )
-    return _stamp_time(peak_idx, t)
-
 
 def detect_cells_multi_threshold(
     probas: torch.Tensor,   # (1, Z, Y, X) or (Z, Y, X) raw probabilities

@@ -244,11 +244,12 @@ def print_table(real, synth):
     w = max(len(k) for k in keys)
     print(f"{'statistic':<{w}}  {'real p25/p50/p75':<26}  synthetic")
     print("-" * (w + 56))
+    def fmt(v):
+        if isinstance(v, list):
+            return " / ".join(f"{x:g}" for x in v)
+        return "-" if v is None else f"{v:g}"
+
     for k in keys:
-        fmt = lambda v: (
-            " / ".join(f"{x:g}" for x in v) if isinstance(v, list)
-            else ("-" if v is None else f"{v:g}")
-        )
         print(f"{k:<{w}}  {fmt(real.get(k)):<26}  {fmt(synth.get(k))}")
 
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Retrain every model the kernel (notebooks/biohub-ens-edu.ipynb) loads, end to end.
+# Retrain every model the kernel (notebooks/Inference.ipynb) loads, end to end.
 #
 #   ./train.sh                      # every step, in order
 #   ./train.sh netr edge            # some steps; earlier runs come from $STATE
@@ -7,7 +7,8 @@
 #                                   # a few iterations per stage, in input_smoke/
 #                                   # and logs_smoke/ -- checks that it runs
 #
-# Steps: detector_r0 pseudo_labels detector merge netr edge forks division package.
+# Steps: detector_r0 pseudo_labels detector detector_add merge netr edge forks
+# division package.
 # Each training step appends the run folder it created to $STATE, which later
 # steps read, so a step can be rerun on its own. See README.md for what each
 # step does and what it needs.
@@ -26,11 +27,9 @@ else
     INPUT=${INPUT:-input}
     LOGS=${LOGS:-logs}
 fi
-# The teammate's out-of-fold detections (README, "Data").
-EDU_PREDS=${EDU_PREDS:-$LOGS/eduardo_current_mean3/preds_r6_0.05}
 # The merged node set. The kernel checks that the edge model was trained on a
-# folder whose name contains "v16_".
-NODES=${NODES:-$LOGS/ensemble/v16_retrain}
+# folder whose name contains "v4_".
+NODES=${NODES:-$LOGS/ensemble/v4_retrain}
 STATE=$REPO/$LOGS/pipeline_runs.env
 
 # Paths the training code resolves relative to src/ (src/params.py).
@@ -132,30 +131,64 @@ pseudo_labels() {
     cd "$REPO"
 }
 
-# The shipped detector recipe (main_track.py defaults), on the bootstrap's
-# pretraining checkpoint and pseudo-labels; then out-of-fold detections.
+# The base detector: the shipped recipe (main_track.py defaults, synthetic
+# pretraining included) on the bootstrap's pseudo-labels; then out-of-fold
+# detections.
 detector() {
     need DET0
     log "detector"
     cd "$REPO/src"
     trained DET "$LOGS" $TORCHRUN main_track.py \
         --synthetic_pretraining "$(json '{}' "$S_TRACK")" \
-        --pretraining "$(json "{\"weights\": \"$DET0/fold_0/ckpt_synthetic.pt\"}" "$S_TRACK")" \
+        --pretraining "$(json '{}' "$S_TRACK")" \
         --edge "$(json '{}' "$S_TRACK")" \
         --weak_positives "{\"pl_folder\": \"$DET0/preds_pl_pp/\"}" \
         "${S_TRACK_ARGS[@]}"
-    # 0.30 feeds the merge (thresholded at 0.45 there), 0.60 trains NETr.
-    $TORCHRUN main_predict.py --log_folder "$DET/" --det_threshold 0.30,0.60 --nms_radius_um 6
+    # 0.30 feeds the merge (thresholded at 0.45 there), 0.40 trains NETr.
+    $TORCHRUN main_predict.py --log_folder "$DET/" --det_threshold 0.30,0.40 --nms_radius_um 6
     cd "$REPO"
 }
 
-# Our detections >= 0.45, plus the teammate's >= 0.35 further than 7 um away.
+# The add detector: the same network, retrained from the base detector's
+# synthetic checkpoint with a lighter synthetic share, fewer iterations and a
+# heavier weight on the pseudo-labels.
+detector_add() {
+    need DET0 DET
+    log "detector_add"
+    cd "$REPO/src"
+    trained DET_ADD "$LOGS" $TORCHRUN main_track.py \
+        --synthetic_pretraining "$(json '{"enabled": false}' "$S_TRACK")" \
+        --pretraining "$(json "{\"weights\": \"$DET/fold_0/ckpt_synthetic.pt\",
+            \"iterations\": 3000, \"synthetic_proportion\": 0.4, \"n_val_videos\": 20}" "$S_TRACK")" \
+        --edge "$(json '{"n_val_videos": 20}' "$S_TRACK")" \
+        --loss_config '{"det_neg_weight": 0.05, "det_weak_weight": 0.5}' \
+        --weak_positives "{\"pl_folder\": \"$DET0/preds_pl_pp/\"}" \
+        "${S_TRACK_ARGS[@]}"
+    $TORCHRUN main_predict.py --log_folder "$DET_ADD/" --det_threshold 0.30 --nms_radius_um 6
+    cd "$REPO"
+}
+
+# Base detections >= 0.45, plus add detections >= 0.40 further than 7 um away.
 merge() {
-    need DET
+    need DET DET_ADD
     log "merge"
-    "$PY" scripts/merge_detectors.py \
-        --base "$(from_root "$DET")/preds_0.30" --add "$EDU_PREDS" \
-        --cfg 0.45 0.35 7 --out "$NODES"
+    local base add
+    base=$(from_root "$DET")/preds_0.30
+    add=$(from_root "$DET_ADD")/preds_0.30
+    if [ "$SMOKE" = 1 ]; then
+        # 4-iteration detectors find nothing; merge the shipped detectors'
+        # predictions for the smoke stacks instead. They go inside the smoke
+        # runs, which the merge records as its detectors for packaging.
+        base=$(from_root "$DET")/preds_shipped_0.30
+        add=$(from_root "$DET_ADD")/preds_shipped_0.30
+        mkdir -p "$base" "$add"
+        for f in "$(from_root "$DET")"/preds_0.30/*.npz; do
+            ln -sf "$REPO/logs/2026-09-13/1/preds_r6_0.30/$(basename "$f")" "$base/"
+            ln -sf "$REPO/logs/2026-09-24/5/preds_r6_0.30/$(basename "$f")" "$add/"
+        done
+    fi
+    "$PY" scripts/merge_detectors.py --base "$base" --add "$add" \
+        --cfg 0.45 0.40 7 --out "$NODES"
 }
 
 # NETr on the detector's own detections, then one embedding per merged node,
@@ -164,9 +197,9 @@ netr() {
     need DET
     log "netr"
     cd "$REPO/src"
-    # Smoke mode: a 4-iteration detector finds nothing at 0.60, so NETr crops
-    # around the merged nodes instead.
-    local coords="$DET/preds_0.60/"
+    # Smoke mode: a 4-iteration detector finds nothing, so NETr crops around
+    # the merged nodes instead.
+    local coords="$DET/preds_0.40/"
     [ "$SMOKE" = 1 ] && coords="../$NODES/"
     trained NETR "$LOGS/contrastive" $TORCHRUN main_contrastive.py \
         --coords_log_folder "$coords" "${S_NETR[@]}"
@@ -191,68 +224,48 @@ edge() {
     cd "$REPO"
 }
 
-# The three fork pools the division classifiers train on.
+# The forks the chain proposes (the ILP's own), labelled against the annotation.
 forks() {
     need EDGE
     log "forks"
-    local pools=$REPO/$LOGS/fork_cls
     local preds="$EDGE/preds_0.45/"
-    mkdir -p "$pools"
+    mkdir -p "$LOGS/fork_cls"
     if [ "$SMOKE" = 1 ]; then
         # A 4-iteration edge model proposes no forks; harvest the smoke stacks
         # from the shipped edge run's candidates instead.
         preds=../$LOGS/edge_preds_shipped/
         mkdir -p "$LOGS/edge_preds_shipped"
         for f in "$(from_root "$EDGE")"/preds_0.45/*.npz; do
-            ln -sf "$REPO/logs/edge_run/2026-09-28/0/preds_0.45/$(basename "$f")" "$LOGS/edge_preds_shipped/"
+            ln -sf "$REPO/logs/edge_run/2026-09-24/4/preds_0.45/$(basename "$f")" "$LOGS/edge_preds_shipped/"
         done
     fi
     cd "$REPO/src"
-    # The ILP's own forks.
     "$PY" division_cls/gen_fork_candidates.py --preds_dir "$preds" \
-        --out "$pools/pool_ours.npz" --pp_overrides '{"recover_max_gap": 2}'
-    # The geometric proposer with the ILP off.
-    "$PY" division_cls/gen_fork_candidates.py --preds_dir "$preds" \
-        --out "$pools/pool_edu.npz" --pp_overrides '{"ilp": 0, "ilp_div_forks": 0,
-            "div_min_prob": 0.15, "div_require_mutual_nn": 0, "div_require_divergence": 0,
-            "div_symmetry_tau": 0.0, "div_frame_frac_cap": 1.0, "div_global_frac_cap": 1.0,
-            "div_max_parent_um": 11.0, "div_max_existing_child_um": 10.0,
-            "div_max_sister_um": 14.0, "recover_max_gap": 3, "recover_max_residual": 5.0,
-            "recover_min_dup": 3.0, "threshold": 0.4, "min_track": 5, "linefit": 0.6,
-            "linefit_window": 3}'
-    "$PY" ../scripts/union_pools.py --out "$pools/pool_union.npz" \
-        "$pools/pool_ours.npz" "$pools/pool_edu.npz"
+        --out "$REPO/$LOGS/fork_cls/forks.npz"
     cd "$REPO"
 }
 
-# One fold_fullfit classifier per pool; that is what the kernel loads.
+# The division classifier, fold_fullfit only; that is what the kernel loads.
 division() {
     log "division"
-    local pools=$REPO/$LOGS/fork_cls
     cd "$REPO/src"
-    for pool in ours edu union; do
-        local var="DIV_${pool^^}"
-        trained "$var" "$LOGS/division" "$PY" main_division.py \
-            --candidates "$pools/pool_$pool.npz" --selected_folds '[]' "${S_DIV[@]}"
-    done
+    trained DIV "$LOGS/division" "$PY" main_division.py \
+        --candidates "$REPO/$LOGS/fork_cls/forks.npz" --selected_folds '[]' "${S_DIV[@]}"
     cd "$REPO"
 }
 
 # Everything the kernel loads, into dataset/ (or $LOGS/dataset in smoke mode).
 package() {
-    need EDGE DIV_OURS DIV_EDU DIV_UNION
+    need EDGE DIV
     log "package"
     local dest=dataset
     [ "$SMOKE" = 1 ] && dest=$LOGS/dataset
     "$PY" scripts/copy_to_dataset.py "$(from_root "$EDGE")" --dest "$dest" \
-        --division "pool28_ours=$(from_root "$DIV_OURS")" \
-        --division "pool28_edu=$(from_root "$DIV_EDU")" \
-        --division "pool28_union=$(from_root "$DIV_UNION")"
+        --division "$(from_root "$DIV")"
 }
 
 # --------------------------------------------------------------------------
-# Smoke data: 3 stacks per embryo, a few synthetic sequences, the teammate's
-# detections for those stacks.
+# Smoke data: 3 stacks per embryo and a few synthetic sequences.
 # --------------------------------------------------------------------------
 smoke_data() {
     [ -d "$INPUT/train" ] && return
@@ -269,14 +282,9 @@ smoke_data() {
     "$PY" scripts/make_synthetic.py --input "$INPUT" --version 5 \
         --n_sequences 8 --n_calib_videos 2 --jobs 8
     ln -s v5 "$INPUT/synthetic/v4"
-    mkdir -p "$EDU_PREDS"
-    for z in "$INPUT"/train/*.zarr; do
-        name=$(basename "$z" .zarr)
-        ln -s "$REPO/logs/eduardo_current_mean3/preds_r6_0.05/$name.npz" "$EDU_PREDS/"
-    done
 }
 
-STEPS=(detector_r0 pseudo_labels detector merge netr edge forks division package)
+STEPS=(detector_r0 pseudo_labels detector detector_add merge netr edge forks division package)
 [ "$SMOKE" = 1 ] && smoke_data
 [ $# -gt 0 ] || set -- "${STEPS[@]}"
 for step in "$@"; do

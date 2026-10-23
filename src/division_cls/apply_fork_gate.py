@@ -1,13 +1,13 @@
 """Drop the forks the division classifier disbelieves, from a finished chain.
 
     python division_cls/apply_fork_gate.py \
-        --preds_dir /tmp/preds_pp/ --data_dir /kaggle/.../test/ \
-        --run_dir  /kaggle/.../division_2026-09-16_0/ \
-        --out_dir /tmp/preds_pp_gated/ --geff_dir /tmp/preds_pp_gated_geff/
+        --preds_dir ../output/inference/preds_pp/ --data_dir ../input/test/ \
+        --run_dir ../logs/division/2026-09-16/0/ --fold fullfit --reprune 5 \
+        --out_dir ../output/inference/preds_pp_gated/ \
+        --geff_dir ../output/inference/preds_pp_gated_geff/
 
-`tune_fork_threshold.py` does this inside a sweep -- it rebuilds the graph per
-threshold and scores it against the annotation. This is the production form of
-the same step: read a post-processed folder, delete the second-child edge of
+The threshold was chosen by rebuilding the graph per threshold and scoring it
+against the annotation. This is the production form of the same step: read a post-processed folder, delete the second-child edge of
 every fork the classifier scores below `--tau`, and write the npz and geff back
 out in `main_edge_postprocess.py`'s format so `submission.py` reads them
 unchanged.
@@ -100,7 +100,7 @@ def build_candidates(preds_dir, out_path):
 def rank_per_stack(stems, score):
     """`score` replaced by its within-stack rank in [0, 1], NaN preserved.
 
-    Identical to `merge_fork_scores.py --mode rank`, and for its reasons: the
+    Rank averaging, for this reason: the
     models are calibrated differently -- one saturates at 0/1, another does not
     -- so averaging probabilities lets the confident-but-wrong model decide.
     Ranks carry only the ordering, which is all the threshold uses. Per stack,
@@ -270,6 +270,10 @@ def score_candidates(cand_path, data_dir, run_dirs, device, batch_size, workers,
                 f"dataset has {len(ds.samples)} rows against {n} candidates; "
                 "they must be the same rows in the same order")
         shards = np.array_split(np.arange(n), len(devices))
+        # Starting a DataLoader forks its workers, and filelock >= 3.30 refuses
+        # a fork while another thread is in the middle of one. The shards start
+        # theirs one at a time; scoring itself stays parallel.
+        fork_lock = threading.Lock()
 
         def work(dev, rows):
             if not len(rows):
@@ -281,8 +285,10 @@ def score_candidates(cand_path, data_dir, run_dirs, device, batch_size, workers,
                 batch_size=batch_size, shuffle=False,
                 num_workers=workers, pin_memory=True)
             acc = {rd: [] for rd, _, _ in members}
+            with fork_lock:
+                batches = iter(loader)
             with torch.no_grad():
-                for batch in loader:
+                for batch in batches:
                     clip = batch["clip"].to(dev, non_blocking=True)
                     feat = batch.get("feat")
                     feat = (feat.to(dev, non_blocking=True)

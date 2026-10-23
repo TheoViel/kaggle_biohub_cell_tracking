@@ -4,8 +4,8 @@
 
 The generator is calibrated against the real acquisition: cell counts and
 tissue geometry are measured from real volumes (``real_stats``), and motion
-from the real lineages. See ``notebooks/SyntheticData.ipynb`` for the pipeline
-that builds a dataset with it.
+from the real lineages. ``scripts/make_synthetic.py`` builds a dataset with it,
+and ``python -m data_gen.calibrate`` measures one against the real data.
 """
 
 from data_gen.acquisition import Palette, Regime

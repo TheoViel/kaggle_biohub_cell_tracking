@@ -113,8 +113,7 @@ def edge_targets(
     # model has no reason to learn them, and it does not: measured on the
     # predictions, the *true* second child of a division scores a median 0.368
     # where an ordinary link clears 0.45, which is why the assignment drops it
-    # and why post-processing has to put divisions back by hand
-    # (postprocessing/README_edge.md, "Divisions"). Both links are already
+    # and why post-processing has to put divisions back by hand. Both links are already
     # labelled 1.0 above -- nothing here teaches "one child only" -- this only
     # says the rare case is worth more when it is wrong.
     #

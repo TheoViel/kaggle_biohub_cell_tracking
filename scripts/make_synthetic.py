@@ -9,8 +9,9 @@ on real volumes of the first embryo: cell counts and tissue shell from a blob
 detector, motion from the real lineages. Sequence ``i`` is seeded with
 ``500000 + i``, so a run is reproducible.
 
-notebooks/SyntheticData.ipynb runs the same generation interactively and adds
-visual checks of the output and of the training loader.
+To compare a generated set with the real data, run from src/:
+
+    python -m data_gen.calibrate --real 40 --synth ../input/synthetic/v5
 """
 from __future__ import annotations
 

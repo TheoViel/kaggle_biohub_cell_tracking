@@ -22,10 +22,8 @@ os.chdir(ROOT / "src")
 sys.path.insert(0, str(ROOT / "src"))
 warnings.filterwarnings("ignore")
 
-import pandas as pd  # noqa: E402
-import tracksdata as td  # noqa: E402
 
-from params import INPUT_FOLDER, SCALE, TRAIN_DIR  # noqa: E402
+from params import SCALE  # noqa: E402
 from tracking.post_process import build_graph  # noqa: E402
 from tracking_cellmot.metrics import (  # noqa: E402
     evaluate,
@@ -43,33 +41,6 @@ PRED_NPZ = ROOT / "output" / "predictions" / EXPERIMENT / f"{SAMPLE}.npz"
 RESULTS = ROOT / "output" / "pp_experiments"
 
 
-def load_prediction(path: Path | None = None):
-    """The raw tracker output: (N, 4) [t, z, y, x] coords and (M, 4) edges.
-
-    Edges are (source row, target row, probability, distance), indexing coords.
-    """
-    data = np.load(path or PRED_NPZ, allow_pickle=True)
-    coords = data["coords"].astype(np.int64)
-    edges = data["edges"].astype(np.float64).reshape(-1, 4)
-    return coords, edges
-
-
-def load_gt_graph(sample: str):
-    """The ground-truth graph and the sample's estimated total node count.
-
-    Matching mutates the graph, so load a fresh one per scored candidate.
-    """
-    result = td.graph.IndexedRXGraph.from_geff(Path(TRAIN_DIR) / f"{sample}.geff")
-    gt_graph = result[0] if isinstance(result, tuple) else result
-
-    meta = pd.read_csv(INPUT_FOLDER + "metadata.csv")
-    n_total = float(meta.loc[meta["sample_name"] == sample, "estimated_number_of_nodes"].iloc[0])
-    return gt_graph, n_total
-
-
-def load_gt():
-    """``load_gt_graph`` for the sample under study."""
-    return load_gt_graph(SAMPLE)
 
 
 def to_graph(coords, edges):

@@ -8,13 +8,13 @@ Multi-GPU (DDP):
     torchrun --standalone --nproc_per_node=8 main_division.py --iterations 2000
 
 Asks one question about an annotated cell: **does it divide at this frame?**
-The input is what `notebooks/Divisions.ipynb` plots -- a short clip of crops
+The input is a short clip of crops
 centred on the cell, `n_frames` frames of time, `patch_z` z-slices each -- and
 the output is one logit.
 
 Why a separate model rather than a term in the edge transformer. The score is
 `adj_edge_jaccard + 0.1 * division_jaccard` and the chain converts about one
-annotated division in seven; `postprocessing/README_edge.md` shows that no
+annotated division in seven, and no
 geometric post-processing recovers the rest, because the *probabilities* do not
 separate a true second daughter from a free neighbour. Divisions are 0.13% of
 the links, so the edge model has little reason to learn them. A classifier that
@@ -26,7 +26,7 @@ divisions across both embryos, and the honest split is by embryo, so a fold
 trains on 26 or 125 of them. Read the validation AP against `chance_ap`
 (the positive rate) rather than in absolute terms, and treat a fold that
 disagrees with the other as noise -- that has already happened once here, with
-the candidate classifier in `postprocessing/div_classifier.py`.
+an earlier candidate classifier.
 """
 
 import argparse

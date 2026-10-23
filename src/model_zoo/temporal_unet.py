@@ -775,7 +775,8 @@ class TemporalUNet3D(nn.Module):
                 fine = up(fine)
 
                 if self.verbose >= 1:
-                    print(f"TemporalUNet3D - Fine Decoder Block {j} upsampled shape: {fine.shape} - skip shape: {skip.shape}")
+                    print(f"TemporalUNet3D - Fine Decoder Block {j} upsampled shape: "
+                          f"{fine.shape} - skip shape: {skip.shape}")
 
                 if fine.shape[2:] != skip.shape[2:]:
                     fine = F.interpolate(

@@ -176,7 +176,7 @@ def forks_table(coords, edges):
     """`(coords, edges)` -> one row per (parent, non-top child), label column 0.
 
     Split out of `_one` so that anything re-deriving the pool under a different
-    chain config -- `sweep_candidates.py` -- enumerates forks the same way this
+    chain config enumerates forks the same way this
     does. Two implementations of "what counts as a fork" would be two different
     datasets wearing one name, and the classifier's scores are keyed on the
     rows this produces.
@@ -317,11 +317,8 @@ def _one(stem_pred):
     cfg.update(out_dir="", geff_dir="", no_score=True, assign=1)
     cfg.update(FORK_CFG)
     if pp_overrides:
-        # The pool is whatever chain proposes it, and FORK_CFG is only *our*
-        # chain. A partner's branch reaches div_J 0.4146 against our 0.2557 on
-        # the same annotation with the ILP off and the geometric proposer wide
-        # open, so the pool has to be expressible here or it cannot be trained
-        # on or compared against.
+        # The pool is whatever chain proposes it, and FORK_CFG is only one
+        # chain: overrides harvest the forks of another configuration.
         cfg.update(pp_overrides)
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         coords, edges = MEP.postprocess(

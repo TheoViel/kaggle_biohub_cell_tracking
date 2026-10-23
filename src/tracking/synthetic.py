@@ -68,7 +68,7 @@ def find_embryo_sequences(
 ) -> list[Path]:
     """Crops for each named embryo under ``root``, one subdirectory per embryo.
 
-    ``scripts/make_zebrahub_crops.py`` writes ``<root>/<embryo>/sequences/seq_*.npz``
+    Zebrahub crops (not shipped with this repo) are ``<root>/<embryo>/sequences/seq_*.npz``
     beside a ``metadata.json`` recording how they were generated. These are real
     images in the synthetic set's format, so they load through the same dataset.
 

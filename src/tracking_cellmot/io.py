@@ -24,15 +24,6 @@ class Dataset:
     zarr_path: Path | None = None
     quantiles: dict[str, float] = field(default_factory=dict)
 
-    def napari_tracks(self) -> tuple[np.ndarray, dict[int, int]]:
-        return td.functional.to_napari_format(
-            self.tracks,
-            self.image.shape,
-            solution_key=None,
-            output_tracklet_id_key="track_id",
-            mask_key=None,
-        )
-
 
 def open_dataset(ds_path: Path | str,
                 target_scale: tuple[float, float, float] | None = None,
@@ -217,7 +208,6 @@ def _process_on_gpu(
         zoom_factors = scale_arr / target_scale_val
 
         # For 4D input (T, Z, Y, X), reshape to (T, 1, Z, Y, X) for interpolate
-        T = tensor.shape[0]
         new_spatial_shape = (np.array(tensor.shape[1:]) * zoom_factors).astype(int).tolist()
         tensor = tensor[:, None]  # (T, 1, Z, Y, X)
         tensor = torch.nn.functional.interpolate(
@@ -283,47 +273,6 @@ def invert_time_graph(tracks: td.graph.IndexedRXGraph, max_t: int = 100) -> td.g
 
     return tracks
 
-
-def rescale_graph_to_original(
-    graph: td.graph.BaseGraph,
-    original_scale: tuple[float, float, float],
-) -> td.graph.BaseGraph:
-    """
-    Rescale graph coordinates from isotropic space back to original anisotropic space.
-
-    This inverts the isotropic resampling transformation applied during dataset loading.
-
-    Parameters
-    ----------
-    graph : td.graph.BaseGraph
-        Graph with coordinates in isotropic space.
-    original_scale : tuple[float, float, float]
-        Original (z, y, x) voxel scale before isotropic resampling.
-
-    Returns
-    -------
-    td.graph.BaseGraph
-        Graph with coordinates scaled back to original space.
-    """
-    scale_arr = np.array(original_scale)
-    target_scale = scale_arr.min()
-    zoom_factors = scale_arr / target_scale
-
-    # Invert the zoom by dividing coordinates
-    inverse_zoom = 1.0 / zoom_factors
-
-    node_attrs = graph.node_attrs()
-    node_attrs = node_attrs.with_columns(
-        (pl.col("z") * inverse_zoom[0]),
-        (pl.col("y") * inverse_zoom[1]),
-        (pl.col("x") * inverse_zoom[2]),
-    )
-    graph.update_node_attrs(
-        attrs=node_attrs.select("z", "y", "x").to_dict(),
-        node_ids=node_attrs[td.DEFAULT_ATTR_KEYS.NODE_ID].to_list(),
-    )
-
-    return graph
 
 
 def save_graph(graph: td.graph.BaseGraph, output_path: Path | str, overwrite: bool = True) -> None:

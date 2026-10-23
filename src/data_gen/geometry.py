@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
-from scipy.ndimage import distance_transform_edt as _dist_map, gaussian_filter
+from scipy.ndimage import gaussian_filter
 
 from data_gen.acquisition import reserved_um, sample_aniso
 from data_gen.constants import (

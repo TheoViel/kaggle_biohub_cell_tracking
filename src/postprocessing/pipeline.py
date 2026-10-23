@@ -50,7 +50,7 @@ from relink import relink
 
 SCALE_ARR = np.asarray(SCALE)
 
-# Tuned on all 71 validation stacks (src/postprocessing/tune.py), not on the one hard
+# Tuned on all 71 validation stacks, not on the one hard
 # sample: settings picked on that sample alone gain 0.13 there and lose 0.02
 # across the run. Note where they landed — the two confidence gates are all but
 # off. Nearly all of the gain is the re-linking; the gates trade true positives

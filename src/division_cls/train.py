@@ -143,7 +143,7 @@ def fit(model, train_loader, args, ctx, train_sampler=None, val_loader=None):
     if val_loader is not None:
         m = evaluate(model, val_loader, device, use_fp16)
         if m and ctx.is_main:
-            log(f"\nfinal val: " + "  ".join(f"{k} {v:.4f}" if isinstance(v, float)
+            log("\nfinal val: " + "  ".join(f"{k} {v:.4f}" if isinstance(v, float)
                                              else f"{k} {v}" for k, v in m.items()))
         return m
     return {}

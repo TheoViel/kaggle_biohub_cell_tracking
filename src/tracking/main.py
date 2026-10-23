@@ -14,8 +14,8 @@ from torch.utils.data import DataLoader, DistributedSampler, SubsetRandomSampler
 
 from model_zoo.models_track import define_track_model
 from params import EMBRYOS
-from tracking.data import resolve_normalization
-from tracking.dataset import TrackDataset, load_dataset_windows
+from tracking.data import load_dataset_windows, resolve_normalization
+from tracking.dataset import TrackDataset
 from tracking.synthetic import (
     MixedDataset,
     SyntheticDataset,

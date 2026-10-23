@@ -177,7 +177,8 @@ def fit(
                     m = evaluate(core, val_loader, device,
                                  threshold=float(getattr(args, "link_threshold", 0.5)),
                                  fp16=use_amp)
-                    val_msg += f"   val_loss={m['loss']:.4f}  AP={m['ap']:.4f}  P={m['precision']:.3f} R={m['recall']:.3f}"
+                    val_msg += (f"   val_loss={m['loss']:.4f}  AP={m['ap']:.4f}  "
+                                f"P={m['precision']:.3f} R={m['recall']:.3f}")
                     model.train()
 
                 video_due = (

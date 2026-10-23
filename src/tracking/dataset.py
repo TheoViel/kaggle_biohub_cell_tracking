@@ -16,7 +16,6 @@ from tracking.data import (
     FrameWindowData,
     apply_normalization,
     frame_anchors,
-    load_dataset_windows,
     _pad_window,
 )
 from tracking.weak_positives import compute_weak_positives
@@ -156,7 +155,8 @@ class TrackDataset(Dataset):
     def _load_focus3d(self, sample_name: str) -> np.ndarray | None:
         """FOCUS-3D pseudo-labels as (N, 4) [t, z, y, x], or None if unusable.
 
-        ``pl_focus_3D.py`` writes one json per stack holding ``nodes`` keyed by
+        FOCUS-3D inference (not shipped with this repo) writes one json per
+        stack holding ``nodes`` keyed by
         frame index, plus the two sanity numbers this gate reads: ``recall``
         against the sparse annotation and ``ratio``, predicted cells over the
         organiser's estimate. A stack that misses annotated cells or that

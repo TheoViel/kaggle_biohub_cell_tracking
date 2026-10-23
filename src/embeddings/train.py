@@ -7,7 +7,6 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DistributedSampler
 
 from embeddings.eval import evaluate_retrieval
@@ -163,7 +162,7 @@ def fit(
                         msg += f"   top1_{key}={avg[f'top1_{key}'] / avg[f'n_{key}']:.4f}"
                 interval = zero_interval()
                 steps = 0
-                
+
                 eval_due = (
                     val_embryos and args.eval_every > 0
                     and (global_step % args.eval_every == 0 or is_last_step)

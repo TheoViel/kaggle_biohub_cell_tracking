@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 from data.mix import Mixup
 from tracking.losses import TrackingLoss
-from tracking.targets import detect_and_match, build_matched_edge_targets
+from tracking.targets import build_matched_edge_targets
 from tracking.eval import evaluate, evaluate_videos
 from tracking.fit_utils import (
     collate_frame_det,
@@ -204,12 +204,7 @@ def fit(
             n_shard = len(train_loader.sampler or train_loader.dataset)
             if len(fts_cache) >= n_shard:
                 train_loader = loader_without_images(train_loader)
-                path = save_fts_cache(fts_cache, cache_dir, "train", args, ctx)
-            #     log(f"- Transformer-only: {len(fts_cache)} windows cached, "
-            #         f"image loading disabled, saved to {path}")
-            # elif epoch == 1:
-            #     log(f"- Transformer-only: only {len(fts_cache)}/{n_shard} windows "
-            #         "cached after one epoch, keeping image loading on")
+                save_fts_cache(fts_cache, cache_dir, "train", args, ctx)
 
         # SubsetRandomSampler (the stable-shard path) reshuffles on its own.
         if train_sampler is not None and hasattr(train_sampler, "set_epoch"):

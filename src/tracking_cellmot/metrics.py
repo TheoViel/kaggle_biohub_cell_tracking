@@ -17,13 +17,6 @@ class EvaluationResult(NamedTuple):
     num_pred_nodes: int
 
 
-class DatasetsResult(NamedTuple):
-    """Cumulative (micro-averaged) Jaccards plus the combined score."""
-
-    edge_jaccard: float
-    division_jaccard: float
-    score: float
-
 
 # Penalty coefficient for the adjusted edge Jaccard:
 #   J_adj = max(0, J · (1 - ADJUSTMENT_ALPHA · total_node_ratio))
@@ -289,8 +282,7 @@ def evaluate(
         that only wants the numbers can turn it off. It is not free: it maps a
         Python dict over every GT edge and rewrites the attribute, which on a
         parameter sweep is the bulk of this function for a result nothing looks
-        at. Leave it on for a viewer or an error breakdown (`diagnose.py`,
-        `analysis_flow.py`, `explore.py`).
+        at. Leave it on for a viewer or an error breakdown.
 
     Returns
     -------
@@ -328,57 +320,6 @@ def evaluate(
         num_pred_nodes=graph.num_nodes(),
     )
 
-
-def evaluate_datasets(
-    graph_pairs: list[tuple[td.graph.BaseGraph, td.graph.BaseGraph]],
-    scale: tuple[float, ...] | None = None,
-    max_distance: float = 7.0,
-) -> DatasetsResult:
-    """Run :func:`evaluate` on each (pred, gt) pair and return cumulative
-    (micro-averaged) edge and division Jaccard.
-
-    Per-pair TP/FP/FN counts are summed across the whole list before the
-    Jaccard is computed, so larger datasets dominate the score naturally.
-
-    Parameters
-    ----------
-    graph_pairs : list of (pred_graph, gt_graph)
-        Predicted / ground-truth graph pairs. Both graphs of each pair are
-        mutated in place by matching (same side effect as :func:`evaluate`).
-    scale : tuple[float, ...] | None, optional
-        Physical voxel scale used for centroid-distance matching.
-    max_distance : float, optional
-        Maximum centroid distance for a match.
-
-    Returns
-    -------
-    DatasetsResult
-        Named tuple with ``edge_jaccard``, ``division_jaccard``, and the
-        combined ``score = edge_jaccard + SCORE_DIVISION_WEIGHT *
-        division_jaccard``. If no divisions exist anywhere in the input
-        the division term is dropped and ``score = edge_jaccard``.
-    """
-    edge_tp = edge_fp = edge_fn = 0
-    div_tp = div_fp = div_fn = 0
-    for pred, gt in graph_pairs:
-        r = evaluate(pred, gt, scale=scale, max_distance=max_distance)
-        edge_tp += r.edge_tp
-        edge_fp += r.edge_fp
-        edge_fn += r.edge_fn
-        div_tp += r.division_tp
-        div_fp += r.division_fp
-        div_fn += r.division_fn
-
-    edge_jaccard = _jaccard(edge_tp, edge_fp, edge_fn)
-    has_divisions = (div_tp + div_fp + div_fn) > 0
-    division_jaccard = _jaccard(div_tp, div_fp, div_fn) if has_divisions else float("nan")
-    score = edge_jaccard + SCORE_DIVISION_WEIGHT * division_jaccard if has_divisions else edge_jaccard
-
-    return DatasetsResult(
-        edge_jaccard=edge_jaccard,
-        division_jaccard=division_jaccard,
-        score=score,
-    )
 
 
 def _matched_node_ids(graph: td.graph.BaseGraph) -> pl.DataFrame:
